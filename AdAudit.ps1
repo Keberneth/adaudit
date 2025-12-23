@@ -11,11 +11,13 @@
             * Tested on Windows Server 2008R2/2012/2012R2/2016/2019/2022
             * All languages (you may need to adjust $AdministratorTranslation variable)
         o Changelog :
-            [x] Version 6.2 - 15/11/2024
-                * Fixes for Get-Acl not working on Server 2016
-                * Commented out section in Get-SPN that was taking forever to complete
-            [ ] Version 6.1 - 26/02/2024
-                * Added Server 2012 to End of Life list
+            [X] Version 7.0.1 - 20/11/2025
+                Added explination for "These accounts are susceptible to the Kerberoasting attack"
+            [ ] Version 7.0 - 20/11/2025
+                Added offline installation of DSInternals and NuGet.
+                Added comments for Password audit files and kerberos and ciphers checks.
+                Added Audit reports ffor deilgated permissions.
+                Now posinble to run Audit from an other server with RSAT tools installed. (Need to run powershell using domain admin account)
             [ ] Version 6.0 - 22/12/2023
                 * Fix "BUILTIN\$Administrators" quoting, in order to use $Administrators variable when script enumerates Default Domain Controllers Policy
                 * Fix RDP logon policy check in the same function above
@@ -206,7 +208,7 @@ Function Get-Variables() {
     Write-Both "    [+] Domain Controllers           : $DomainControllers"
     Write-Both "    [+] Schema Admins                : $SchemaAdmins"
     Write-Both "    [+] Enterprise Admins            : $EnterpriseAdmins"
-    Write-Both "    [+] Everyone                     : $EveryOne"
+    Write-Both "    [+] Every One                    : $EveryOne"
     Write-Both "    [+] Entreprise Domain Controllers: $EntrepriseDomainControllers"
     Write-Both "    [+] Authenticated Users          : $AuthenticatedUsers"
     Write-Both "    [+] System                       : $System"
@@ -235,22 +237,88 @@ Function Write-Nessus-Footer() {
     Add-Content -Path "$outputdir\adaudit.nessus" -Value "</ReportHost></Report></AdAudit>"
 }
 Function Get-DNSZoneInsecure {
-    #Check DNS zones allowing insecure updates
-    if ($OSVersion -notlike "Windows Server 2008*") {
-        $count = 0
-        $progresscount = 0
-        $insecurezones = Get-DnsServerZone | Where-Object { $_.DynamicUpdate -like '*nonsecure*' }
-        $totalcount = ($insecurezones | Measure-Object | Select-Object Count).count
-        if ($totalcount -gt 0) {
-            foreach ($insecurezone in $insecurezones ) {
-                Add-Content -Path "$outputdir\insecure_dns_zones.txt" -Value "The DNS Zone $($insecurezone.ZoneName) allows insecure updates ($($insecurezone.DynamicUpdate))"
+    # Check DNS zones allowing insecure updates on all DNS servers in the domain
+
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        Import-Module DnsServer -ErrorAction Stop
+    }
+    catch {
+        Write-Both "    [!] Could not load required modules (ActiveDirectory/DnsServer). $_"
+        return
+    }
+
+    # Get all domain controllers; we'll probe each one to see if DNS is installed
+    try {
+        $dcList = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+    }
+    catch {
+        Write-Both "    [!] Failed to enumerate domain controllers from AD. $_"
+        return
+    }
+
+    if (-not $dcList -or $dcList.Count -eq 0) {
+        Write-Both "    [-] No domain controllers found."
+        return
+    }
+
+    $globalInsecureZonesFile = "$outputdir\insecure_dns_zones.txt"
+    if (Test-Path $globalInsecureZonesFile) {
+        Remove-Item $globalInsecureZonesFile -Force
+    }
+
+    $totalcount = 0
+
+    foreach ($dnsServer in $dcList) {
+
+        Write-Both "    [*] Checking potential DNS server: $dnsServer"
+
+        # Optional: check remote OS version to skip 2008 if needed
+        $skipServer = $false
+        try {
+            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $dnsServer -ErrorAction Stop
+            $osCaption = $os.Caption
+            if ($osCaption -like "Windows Server 2008*") {
+                Write-Both "        [-] $dnsServer is Windows Server 2008, skipping Get-DNSZoneInsecure check on this server."
+                $skipServer = $true
             }
-            Write-Both "    [!] There were $totalcount DNS zones configured to allow insecure updates (KB842)"
-            Write-Nessus-Finding "InsecureDNSZone" "KB842" ([System.IO.File]::ReadAllText("$outputdir\insecure_dns_zones.txt"))
+        }
+        catch {
+            Write-Both "        [!] Could not determine OS version for $dnsServer, continuing anyway. $_"
+        }
+
+        if ($skipServer) { continue }
+
+        # Try to query DNS zones; if DNS role is not installed, this will fail and we skip
+        try {
+            $insecurezones = Get-DnsServerZone -ComputerName $dnsServer -ErrorAction Stop |
+                             Where-Object { $_.DynamicUpdate -like '*nonsecure*' }
+        }
+        catch {
+            Write-Both "        [-] $dnsServer does not appear to have the DNS role (or access failed), skipping. $_"
+            continue
+        }
+
+        if ($insecurezones) {
+            foreach ($insecurezone in $insecurezones) {
+                Add-Content -Path $globalInsecureZonesFile -Value (
+                    "The DNS Zone {0} on DNS server {1} allows insecure updates ({2})" -f `
+                    $insecurezone.ZoneName, $dnsServer, $insecurezone.DynamicUpdate
+                )
+                $totalcount++
+            }
+        }
+        else {
+            Write-Both "        [-] No insecure DNS zones found on $dnsServer."
         }
     }
+
+    if ($totalcount -gt 0) {
+        Write-Both "    [!] There were $totalcount DNS zones configured to allow insecure updates (KB842) across all DNS servers."
+        Write-Nessus-Finding "InsecureDNSZone" "KB842" ([System.IO.File]::ReadAllText($globalInsecureZonesFile))
+    }
     else {
-        Write-Both "    [-] Not Windows 2012 or above, skipping Get-DNSZoneInsecure check."
+        Write-Both "    [-] No insecure DNS zones found on any discovered DNS server."
     }
 }
 Function Get-OUPerms {
@@ -264,7 +332,7 @@ Function Get-OUPerms {
         $progresscount++
         Write-Progress -Activity "Searching for non standard permissions for authenticated users..." -Status "Currently identifed $count" -PercentComplete ($progresscount / $totalcount * 100)
         if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
-            $output = (Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$object").Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
+            $output = (Get-Acl "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$object").Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
         }
         else {
             $output = (Get-Acl AD:$object).Access                                                                    | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
@@ -536,7 +604,7 @@ Function Get-UserPasswordNotChangedRecently {
     $totalcount = ($accountsoldpasswords | Measure-Object | Select-Object Count).count
     foreach ($account in $accountsoldpasswords) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for passwords older than 90days..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for passwords older than 90days..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
         if ($account.PasswordLastSet) {
             $datelastchanged = $account.PasswordLastSet
         }
@@ -631,6 +699,12 @@ Function Get-InactiveAccounts {
     $progresscount = 0
     $inactiveaccounts = Search-ADaccount -AccountInactive -Timespan (New-TimeSpan -Days 180) -UsersOnly | Where-Object { $_.Enabled -eq $true }
     $totalcount = ($inactiveaccounts | Measure-Object | Select-Object Count).count
+
+    if ($totalcount -gt 0) {
+        # Header (overwrite any existing file)
+        "Accounts inactive (no logon) for the past 180 days" | Set-Content -Path "$outputdir\accounts_inactive.txt"
+    }
+
     foreach ($account in $inactiveaccounts) {
         if ($totalcount -eq 0) { break }
         $progresscount++
@@ -730,7 +804,7 @@ Function Get-AccountPassDontExpire {
 Function Get-OldBoxes {
     #Lists 2000/2003/XP/Vista/7/2008 machines
     $count = 0
-    $oldboxes = Get-ADComputer -Filter { OperatingSystem -Like "*2003*" -and Enabled -eq "true" -or OperatingSystem -Like "*XP*" -and Enabled -eq "true" -or OperatingSystem -Like "*2000*" -and Enabled -eq "true" -or OperatingSystem -like '*Windows 7*' -and Enabled -eq "true" -or OperatingSystem -like '*vista*' -and Enabled -eq "true" -or OperatingSystem -like '*2008*' -and Enabled -eq "true" -or OperatingSystem -like '*2012*' -and Enabled -eq "true"} -Property OperatingSystem
+    $oldboxes = Get-ADComputer -Filter { OperatingSystem -Like "*2003*" -and Enabled -eq "true" -or OperatingSystem -Like "*XP*" -and Enabled -eq "true" -or OperatingSystem -Like "*2000*" -and Enabled -eq "true" -or OperatingSystem -like '*Windows 7*' -and Enabled -eq "true" -or OperatingSystem -like '*vista*' -and Enabled -eq "true" -or OperatingSystem -like '*2008*' -and Enabled -eq "true" } -Property OperatingSystem
     $totalcount = ($oldboxes | Measure-Object | Select-Object Count).count
     foreach ($machine in $oldboxes) {
         if ($totalcount -eq 0) { break }
@@ -1076,21 +1150,60 @@ Function Get-DCEval {
         Write-Both "    [!] DC $($ADs | Where-Object {$_.OperationMasterRoles -ne $null} | select -ExpandProperty Hostname) holds all FSMO roles!"
     }
     #DCs with weak Kerberos algorithm (*CH* Changed below to look for msDS-SupportedEncryptionTypes to work with 2008R2)
-    $ADcomputers = $ADs | ForEach-Object { Get-ADComputer $_.Name -Properties msDS-SupportedEncryptionTypes }
-    $WeakKerberos = $false
-    foreach ($DC in $ADcomputers) {
-        #Value 8 stands for AES-128, value 16 stands for AES-256 and value 24 stands for AES-128 & AES-256
-        #Values 0 to 7, 9 to 15, 17 to 23 and 25 to 31 include RC4 and/or DES
-        #See https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/decrypting-the-selection-of-supported-kerberos-encryption-types/ba-p/1628797
-        if ($DC."msDS-SupportedEncryptionTypes" -ne 8 -and $DC."msDS-SupportedEncryptionTypes" -ne 16 -and $DC."msDS-SupportedEncryptionTypes" -ne 24) {
-            $WeakKerberos = $true
-            Add-Content -Path "$outputdir\dcs_weak_kerberos_ciphersuite.txt" -Value "$($DC.DNSHostName) $($dc."msDS-SupportedEncryptionTypes")"
-        }
+$ADcomputers = $ADs | ForEach-Object { Get-ADComputer $_.Name -Properties msDS-SupportedEncryptionTypes }
+$WeakKerberos = $false
+
+# Mapping of encryption types
+$encryptionTypes = @{
+    0  = "Not defined - defaults to RC4_HMAC_MD5"
+    1  = "DES_CBC_CRC"
+    2  = "DES_CBC_MD5"
+    3  = "DES_CBC_CRC, DES_CBC_MD5"
+    4  = "RC4"
+    5  = "DES_CBC_CRC, RC4"
+    6  = "DES_CBC_MD5, RC4"
+    7  = "DES_CBC_CRC, DES_CBC_MD5, RC4"
+    8  = "AES 128"
+    9  = "DES_CBC_CRC, AES 128"
+    10 = "DES_CBC_MD5, AES 128"
+    11 = "DES_CBC_CRC, DES_CBC_MD5, AES 128"
+    12 = "RC4, AES 128"
+    13 = "DES_CBC_CRC, RC4, AES 128"
+    14 = "DES_CBC_MD5, RC4, AES 128"
+    15 = "DES_CBC_CRC, DES_CBC_MD5, RC4, AES 128"
+    16 = "AES 256"
+    17 = "DES_CBC_CRC, AES 256"
+    18 = "DES_CBC_MD5, AES 256"
+    19 = "DES_CBC_CRC, DES_CBC_MD5, AES 256"
+    20 = "RC4, AES 256"
+    21 = "DES_CBC_CRC, RC4, AES 256"
+    22 = "DES_CBC_MD5, RC4, AES 256"
+    23 = "DES_CBC_CRC, DES_CBC_MD5, RC4, AES 256"
+    24 = "AES 128, AES 256"
+    25 = "DES_CBC_CRC, AES 128, AES 256"
+    26 = "DES_CBC_MD5, AES 128, AES 256"
+    27 = "DES_CBC_MD5, DES_CBC_MD5, AES 128, AES 256"
+    28 = "RC4, AES 128, AES 256"
+    29 = "DES_CBC_CRC, RC4, AES 128, AES 256"
+    30 = "DES_CBC_MD5, RC4, AES 128, AES 256"
+    31 = "DES_CBC_CRC, DES_CBC_MD5, RC4-HMAC, AES128-CTS-HMAC-SHA1-96, AES256-CTS-HMAC-SHA1-96"
+}
+
+foreach ($DC in $ADcomputers) {
+    $encType = $DC."msDS-SupportedEncryptionTypes"
+    if ($encType -ne 8 -and $encType -ne 16 -and $encType -ne 24) {
+        $WeakKerberos = $true
+        $hexValue = "0x{0:X}" -f $encType
+        $supportedTypes = $encryptionTypes[$encType]
+        Add-Content -Path "$outputdir\dcs_weak_kerberos_ciphersuite.txt" -Value "$($DC.DNSHostName)`nDecimal Value: $encType`nHex Value: $hexValue`nSupported Encryption Types: $supportedTypes`n"
     }
-    if ($WeakKerberos) {
-        Write-Both "    [!] You have DCs with RC4 or DES allowed for Kerberos!!!"
-        Write-Nessus-Finding "WeakKerberosEncryption" "KB995" ([System.IO.File]::ReadAllText("$outputdir\dcs_weak_kerberos_ciphersuite.txt"))
-    }
+}
+
+if ($WeakKerberos) {
+    Add-Content -Path "$outputdir\dcs_weak_kerberos_ciphersuite.txt" -Value "`nLink: https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/decrypting-the-selection-of-supported-kerberos-encryption-types/1628797`n"
+    Write-Both "    [!] You have DCs with RC4 or DES allowed for Kerberos!!!"
+    Write-Nessus-Finding "WeakKerberosEncryption" "KB995" ([System.IO.File]::ReadAllText("$outputdir\dcs_weak_kerberos_ciphersuite.txt"))
+}
     #Check where newly joined computers go
     $newComputers = (Get-ADDomain).ComputersContainer
     $newUsers = (Get-ADDomain).UsersContainer
@@ -1226,11 +1339,13 @@ Function Get-RecentChanges() {
     $totalcountUsers = ($newUsers  | Measure-Object | Select-Object Count).count
     $totalcountGroups = ($newGroups | Measure-Object | Select-Object Count).count
     if ($totalcountUsers -gt 0) {
+        # Add header line (overwrite any existing file)
+        "User Created within the last 30 days" | Set-Content -Path "$outputdir\new_users.txt"
         foreach ($newUser in $newUsers ) { Add-Content -Path "$outputdir\new_users.txt" -Value "Account $($newUser.SamAccountName) was created $($newUser.whenCreated)" }
         Write-Both "    [!] $totalcountUsers new users were created last 30 days, see $outputdir\new_users.txt"
     }
     if ($totalcountGroups -gt 0) {
-        foreach ($newGroup in $newGroups ) { Add-Content -Path "$outputdir\new_groups.txt" -Value "Group $($newGroup.SamAccountName) was created $($newGroup.whenCreated)" }
+        foreach ($newGroup in $newGroups ) { Add-Content -Path $outputdir\new_groups.txt -Value "Group $($newGroup.SamAccountName) was created $($newGroup.whenCreated)" }
         Write-Both "    [!] $totalcountGroups new groups were created last 30 days, see $outputdir\new_groups.txt"
     }
 }
@@ -1359,13 +1474,13 @@ Function Install-Dependencies {
         $count = 0
         $totalcount = 3
         Write-Progress -Activity "Installing dependencies..." -Status "Currently installing NuGet Package Provider" -PercentComplete ($count / $totalcount * 100)
-        if (!(Get-PackageProvider -ListAvailable -Name Nuget -ErrorAction SilentlyContinue)) { Install-PackageProvider -Name NuGet -Force | Out-Null }
+        #if (!(Get-PackageProvider -ListAvailable -Name Nuget -ErrorAction SilentlyContinue)) { Install-PackageProvider -Name NuGet -Force | Out-Null }
         $count++
         Write-Progress -Activity "Installing dependencies..." -Status "Currently adding PSGallery to trusted Repositories" -PercentComplete ($count / $totalcount * 100)
         if ((Get-PSRepository -Name PSGallery).InstallationPolicy -eq "Untrusted") { Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted }
         $count++
         Write-Progress -Activity "Installing dependencies..." -Status "Currently installing module DSInternals" -PercentComplete ($count / $totalcount * 100)
-        if (!(Get-Module -ListAvailable -Name DSInternals)) { Install-Module -Name DSInternals -Force }
+        #if (!(Get-Module -ListAvailable -Name DSInternals)) { Install-Module -Name DSInternals -Force }
         Write-Progress -Activity "Installing dependencies..." -Status "Ready" -Completed
         Import-Module DSInternals
     }
@@ -1373,28 +1488,186 @@ Function Install-Dependencies {
         Write-Both "    [!] PowerShell 5 or greater is needed, see https://www.microsoft.com/en-us/download/details.aspx?id=54616"
     }
 }
+
 Function Remove-StringLatinCharacters {
     #Removes latin characters
     PARAM ([string]$String)
     [Text.Encoding]::ASCII.GetString([Text.Encoding]::GetEncoding("Cyrillic").GetBytes($String))
 }
+
+function Add-KerberoastExplanationToPasswordQualityReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReportPath,
+        [Parameter(Mandatory = $false)]
+        [string]$DomainController
+    )
+
+    if (-not (Test-Path -LiteralPath $ReportPath)) { return }
+
+    $lines = Get-Content -LiteralPath $ReportPath
+    $header = 'These accounts are susceptible to the Kerberoasting attack:'
+
+    # Find the simple list block under the header
+    $headerIndex = [array]::IndexOf($lines, $header)
+    if ($headerIndex -lt 0) { return }
+
+    # Collect the simple list items that follow the header (until a blank line)
+    $simpleList = @()
+    for ($i = $headerIndex + 1; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i].Trim()
+        if (-not $line) { break }
+        $simpleList += $lines[$i]
+    }
+
+    if ($simpleList.Count -eq 0) { return }
+
+    # Normalize SAM names
+    $kerberoastAccounts = @()
+    foreach ($l in $simpleList) {
+        $trimmed = $l.Trim()
+        if ($trimmed) { $kerberoastAccounts += $trimmed }
+    }
+
+    # Split into krbtgt vs service accounts
+    $krbtgtAccounts  = @()
+    $serviceAccounts = @()
+    foreach ($acct in $kerberoastAccounts) {
+        $sam = $acct
+        if ($acct -like '*\*') {
+            $parts = $acct.Split('\', 2)
+            $sam   = $parts[1]
+        }
+        if ($sam -ieq 'krbtgt') { $krbtgtAccounts += $acct } else { $serviceAccounts += $acct }
+    }
+
+    # Optional: krbtgt details
+    $krbtgtInfo = $null
+    if ($krbtgtAccounts.Count -gt 0 -and $DomainController) {
+        try {
+            $krbtgtInfo = Get-ADUser -Server $DomainController -Filter { SamAccountName -eq 'krbtgt' } -Properties PasswordLastSet -ErrorAction Stop
+        } catch { }
+    }
+
+    # Build replacement
+    $replacement = New-Object System.Collections.Generic.List[string]
+    $replacement.Add($header)
+
+    if ($krbtgtAccounts.Count -gt 0) {
+        $replacement.Add('  Password not changed in at least 180 days for the built-in krbtgt account (Golden Ticket / ticket-forgery risk):')
+        foreach ($acct in $krbtgtAccounts) { $replacement.Add(("    {0}" -f $acct)) }
+        $replacement.Add('  Reference: Microsoft guidance "Reset the krbtgt account password".')
+        $replacement.Add('')
+    }
+
+    if ($serviceAccounts.Count -gt 0) {
+        $replacement.Add('  The account is a user or service account with a password that could be weak / brute-forceable (Kerberoastable due to SPN / service ticket exposure):')
+        foreach ($acct in $serviceAccounts) { $replacement.Add(("    {0}" -f $acct)) }
+        $replacement.Add('  Reference: Microsoft security guidance on mitigating Kerberoasting.')
+        $replacement.Add('')
+    }
+
+    # Splice into file
+    $endOfBlock = $headerIndex + 1 + $simpleList.Count
+    $newContent = @()
+    if ($headerIndex -gt 0) { $newContent += $lines[0..($headerIndex-1)] }
+    $newContent += $replacement
+    if ($endOfBlock -lt $lines.Count) { $newContent += $lines[$endOfBlock..($lines.Count-1)] }
+
+    Set-Content -LiteralPath $ReportPath -Value $newContent
+}
+
 Function Get-PasswordQuality {
-    #Use DSInternals to evaluate password quality
+    # Use DSInternals to evaluate password quality (supports remote execution)
     if (Get-Module -ListAvailable -Name DSInternals) {
-        $totalSite = (Get-ADObject -Filter { objectClass -like "site" } -SearchBase (Get-ADRootDSE).ConfigurationNamingContext | measure).Count
-        $count = 0
-        Get-ADObject -Filter { objectClass -like "site" } -SearchBase (Get-ADRootDSE).ConfigurationNamingContext | ForEach-Object {
-            if ($_.Name -eq $(Remove-StringLatinCharacters $_.Name)) { $count++ }
+        try {
+            $cfgNC = (Get-ADRootDSE).ConfigurationNamingContext
+
+            $sites = Get-ADObject `
+                -LDAPFilter '(objectClass=site)' `
+                -SearchBase $cfgNC `
+                -ErrorAction Stop
+
+            $totalSite = ($sites | Measure-Object).Count
+            $count = 0
+
+            foreach ($site in $sites) {
+                if ($site.Name -eq (Remove-StringLatinCharacters $site.Name)) {
+                    $count++
+                }
+            }
+
+            if ($count -ne $totalSite) {
+                Write-Both "    [!] One or more sites have illegal characters in their name, can't get password quality!"
+                return
+            }
         }
-        if ($count -ne $totalSite) {
-            Write-Both "    [!] One or more site have illegal characters in their name, can't get password quality!"
+        catch {
+            Write-Both "    [!] Failed to enumerate AD sites for password quality test: $($_.Exception.Message)"
+            return
         }
-        else {
-            Get-ADReplAccount -All -Server $env:ComputerName -NamingContext $(Get-ADDomain | select -ExpandProperty DistinguishedName) | Test-PasswordQuality -IncludeDisabledAccounts | Out-File "$outputdir\password_quality.txt"
-            Write-Both "    [!] Password quality test done, see $outputdir\password_quality.txt"
+
+        # Determine a single DC to query (fallback chain to ensure we get a plain string)
+        $dcObj = Get-ADDomainController -Discover
+        $dc = $dcObj.DNSHostName
+        if (-not $dc) { $dc = $dcObj.HostName }
+        if (-not $dc) { $dc = $dcObj.Name }
+        if (-not $dc -or [string]::IsNullOrWhiteSpace($dc)) {
+            Write-Both "    [!] Could not determine a domain controller hostname for password quality test."
+            return
+        }
+        $dc = [string]$dc
+
+        try {
+            $domain = Get-ADDomain
+            $domainDN = $domain.DistinguishedName
+
+            $accounts = Get-ADReplAccount `
+                -All `
+                -Server $dc `
+                -NamingContext $domainDN `
+                -ErrorAction Stop
+
+            if ($accounts) {
+                $passwordQualityPath = Join-Path $outputdir 'password_quality.txt'
+
+                $accounts |
+                    Test-PasswordQuality -IncludeDisabledAccounts |
+                    Out-File -FilePath $passwordQualityPath
+
+                if (Test-Path $passwordQualityPath) {
+                    Write-Both "    [!] Password quality test done, see $passwordQualityPath"
+
+                    # Post-process the DSInternals report to clarify why accounts are marked as Kerberoastable
+                    try {
+                        Add-KerberoastExplanationToPasswordQualityReport `
+                            -ReportPath $passwordQualityPath `
+                            -DomainController $dc
+                    }
+                    catch {
+                        Write-Both "    [*] Failed to append Kerberoast clarification to password quality report: $($_.Exception.Message)"
+                    }
+                }
+                else {
+                    Write-Both "    [!] Password quality test ran but output file was not created."
+                }
+            }
+            else {
+                Write-Both "    [!] No replication accounts retrieved from DC $dc; skipping password quality test."
+            }
+        }
+        catch {
+            # Delimit $dc to avoid $dc: being parsed as an (invalid) scope qualifier
+            Write-Both "    [!] Failed password quality test on DC ${dc}: $($_.Exception.Message)"
         }
     }
+    else {
+        Write-Both "    [!] DSInternals module not available; skipping password quality test."
+    }
 }
+
+
 Function Check-Shares {
     #Check SYSVOL and NETLOGON share exists
     $dcList = @()
@@ -1542,83 +1815,166 @@ Function Get-ADCSVulns {
 }
 
 Function Get-SPNs {
-    $default_groups = @("Domain Admins", "Domain Admins", "Enterprise Admins", "Schema Admins", "Domain Controllers", "Backup Operators", "Account Operators", "Server Operators", "Print Operators", "Remote Desktop Users", "Network Configuration Operators", "Exchange Organization Admins", "Exchange View-Only Admins", "Exchange Recipient Admins", "Exchange Servers", "Exchange Trusted Subsystem", "Exchange Public Folder Admins", "Exchange UM Management")
-    $base_groups = @()
-    foreach ($group in $default_groups) {
+    [CmdletBinding()]
+    param(
+        # Optional: explicitly target a DC when running from a jump server
+        [string]$Server
+    )
+
+    # Ensure AD module is available (required on JUMP/RSAT host)
+    if (-not (Get-Module -Name ActiveDirectory -ListAvailable)) {
+        throw "The ActiveDirectory module is not available. Install RSAT / AD DS tools on this host."
+    }
+
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    # If no DC specified, let AD pick one
+    if (-not $Server) {
         try {
-            $ADGrp = Get-ADGroup -Identity $group -ErrorAction SilentlyContinue
-            $base_groups += $ADGrp.Name
+            $Server = (Get-ADDomainController -Discover -ErrorAction Stop).HostName
         }
         catch {
-            $base_groups = $base_groups | Where-Object { $_ -ne $group }
+            throw "Unable to discover a domain controller. Specify -Server explicitly or check network/credentials."
         }
     }
 
-    $all_groups = $base_groups
+    Write-both "    [+] Using domain controller: $Server"
+
+    # Default/high-value groups we care about
+    $default_groups = @(
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Domain Controllers",
+        "Backup Operators",
+        "Account Operators",
+        "Server Operators",
+        "Print Operators",
+        "Remote Desktop Users",
+        "Network Configuration Operators",
+        "Exchange Organization Admins",
+        "Exchange View-Only Admins",
+        "Exchange Recipient Admins",
+        "Exchange Servers",
+        "Exchange Trusted Subsystem",
+        "Exchange Public Folder Admins",
+        "Exchange UM Management"
+    )
+
+    $base_groups = @()
+
     foreach ($group in $default_groups) {
         try {
-            $ADGrp = Get-ADGroup -Identity $group -ErrorAction SilentlyContinue
-            $QueryResult = Get-ADGroup -LDAPFilter "(&(objectCategory=group)(memberof=$($ADGrp.DistinguishedName)))"
-            foreach ($result in $QueryResult) {
-                $all_groups += $result.Name
+            $ADGrp = Get-ADGroup -Identity $group -Server $Server -ErrorAction Stop
+            if ($ADGrp) {
+                $base_groups += $ADGrp.Name
             }
         }
-        catch {}
+        catch {
+            # Ignore missing groups in this environment
+            Write-both "    [*] Skipping non-existent group '$group' on $Server."
+        }
     }
 
-#    while ($base_groups.count -gt 0) {
-#        $new_groups = @()
-#        foreach ($group in $base_groups) {
-#            # I dont want to see errors if a group is not found
-#            try {
-#                $ADGrp = Get-ADGroup -Identity $group -ErrorAction SilentlyContinue
-#                $QueryResult = Get-ADGroup -LDAPFilter "(&(objectCategory=group)(memberof=$($ADGrp.DistinguishedName)))"
-#                foreach ($result in $QueryResult) {
-#                    $all_groups += $result.Name
-#                    $new_groups += $result.Name
-#                }
-#            }
-#            catch {
-#                # Remove group from all_groups
-#                $all_groups = $all_groups | Where-Object { $_ -ne $group }
-#            }
-#        }
-#        $base_groups = $new_groups
-#    }
-#    
-    $SPNs = Get-ADObject -Filter { serviceprincipalname -like "*" } -Properties MemberOf |
-    Where-Object { $_.ObjectClass -eq "user" } |
-    ForEach-Object {
-        $groups = $_.MemberOf | Get-ADObject | Where-Object { $_.ObjectClass -eq "group" }
-        $_ | Select-Object Name, @{ Name = "Groups"; Expression = { $groups.Name -join ',' } }
+    $all_groups = @()
+    $all_groups += $base_groups
+
+    # Single-level nested groups
+    foreach ($group in $base_groups) {
+        try {
+            $ADGrp = Get-ADGroup -Identity $group -Server $Server -ErrorAction Stop
+            $QueryResult = Get-ADGroup -LDAPFilter "(&(objectCategory=group)(memberof=$($ADGrp.DistinguishedName)))" -Server $Server
+            foreach ($result in $QueryResult) {
+                if ($all_groups -notcontains $result.Name) {
+                    $all_groups += $result.Name
+                }
+            }
+        }
+        catch {
+            # Non-fatal; just continue
+        }
     }
 
-    # for spn in spns check if a group in spn.groups is in all_groups
+    # Recursively walk nested groups
+    while ($base_groups.Count -gt 0) {
+        $new_groups = @()
+        foreach ($group in $base_groups) {
+            try {
+                $ADGrp = Get-ADGroup -Identity $group -Server $Server -ErrorAction Stop
+                $QueryResult = Get-ADGroup -LDAPFilter "(&(objectCategory=group)(memberof=$($ADGrp.DistinguishedName)))" -Server $Server
+                foreach ($result in $QueryResult) {
+                    if ($all_groups -notcontains $result.Name) {
+                        $all_groups += $result.Name
+                        $new_groups += $result.Name
+                    }
+                }
+            }
+            catch {
+                # Ignore failures
+            }
+        }
+        $base_groups = $new_groups
+    }
+
+    # Prepare output file on *local* machine (DC or jump host)
+    $spnFile = Join-Path $outputdir 'SPNs.txt'
+    New-Item -Path $spnFile -ItemType File -Force | Out-Null
+    Clear-Content -Path $spnFile -ErrorAction SilentlyContinue
+
+    Write-both "    [+] Enumerating SPN-bearing user accounts from DC: $Server"
+
+    # Get all objects with SPNs, restrict to users
+    $SPNs = Get-ADObject -Server $Server -Filter { serviceprincipalname -like "*" } -Properties MemberOf,objectClass |
+            Where-Object { $_.ObjectClass -eq "user" } |
+            ForEach-Object {
+                $groups = @()
+                if ($_.MemberOf) {
+                    $groups = $_.MemberOf | Get-ADObject -Server $Server | Where-Object { $_.ObjectClass -eq "group" }
+                }
+                $_ | Select-Object Name, @{
+                    Name       = "Groups"
+                    Expression = { $groups.Name -join ',' }
+                }
+            }
+
     $high_value_users = @()
+
     foreach ($spn in $SPNs) {
-        $spn_groups = $spn.Groups.Split(',')
+        if (-not $spn.Groups) {
+            continue
+        }
+
+        $spn_groups = $spn.Groups.Split(',') | Where-Object { $_ -and $_.Trim() -ne "" }
         $name = $spn.Name
+
         foreach ($spn_group in $spn_groups) {
             if ($all_groups -contains $spn_group) {
-                # Create object with user and group
-                # Add object to high_value_users if the user.name is not already in the list
-                $user = New-Object -TypeName PSObject -Property @{
-                    Name  = $name
-                    Group = $spn_group
-                }
                 if ($high_value_users.Name -notcontains $name) {
+                    $user = [PSCustomObject]@{
+                        Name  = $name
+                        Group = $spn_group
+                    }
                     $high_value_users += $user
                 }
             }
         }
     }
 
-    foreach ($user in $high_value_users) {
-        $kerbuser = '    [!] High value kerberoastable user: ' + $user.Name + ' in groups: ' + $user.Group
-        Write-both $kerbuser
-        add-content -path $outputdir\SPNs.txt -value $user.Name
+    if ($high_value_users.Count -eq 0) {
+        Write-both "    [+] No high value kerberoastable user accounts identified."
+        Add-Content -Path $spnFile -Value "No high value kerberoastable user accounts identified."
     }
-    Write-Nessus-Finding  "Kerberoast Attack - Services Configured With a Weak Password" "KB611" ([System.IO.File]::ReadAllText("$outputdir\SPNs.txt"))
+    else {
+        foreach ($user in $high_value_users) {
+            $kerbuser = '    [!]' + $user.Name + ' in groups: ' + $user.Group
+            Write-both $kerbuser
+            Add-Content -Path $spnFile -Value $user.Name
+        }
+    }
+
+    # Safe ReadAllText regardless of DC vs jump server
+    $spnContent = [System.IO.File]::ReadAllText($spnFile)
+    Write-Nessus-Finding "Kerberoast Attack - Services Configured With a Weak Password" "KB611" $spnContent
 }
 
 function Get-ADUsersWithoutPreAuth {
@@ -1648,7 +2004,7 @@ function Get-LDAPSecurity {
             Write-both "    [+] LDAP signing is enabled on $computerName"
         }
         else {
-            Write-Both "    [!] Issue identified LDAP signing is not enabled on $computerName, the registry value is currently set to $ldapSigning."
+            Write-both "    [!] Issue identified LDAP signing is not enabled on $computerName, the registry value is currently set to $ldapSigning."
             Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAP signing is not enabled on $computerName, the registry key does not exist"
             Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP signing is not enabled on $computerName, the registry key does not exist"
         }
@@ -1736,9 +2092,13 @@ function Find-DangerousACLPermissions {
     # Find dangerous permissions on Computers
     $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties *
     $computerResults = foreach ($computer in $computers) {
-        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
-	$acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($computer.DistinguishedName)"} else {
-	$acl = Get-Acl AD:\$computer}
+        try {
+            $acl = Get-Acl -Path "AD:\$($computer.DistinguishedName)"
+        }
+        catch {
+            Write-Warning "Could not retrieve ACL for computer '$computer': $_"
+            continue
+        }
 
         $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
 
@@ -1759,9 +2119,13 @@ function Find-DangerousACLPermissions {
     # Find dangerous permissions on groups
     $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties *
     $groupResults = foreach ($group in $groups) {
-        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
-	$acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($group.DistinguishedName)"} else {
-	$acl = Get-Acl AD:\$group}
+        try {
+            $acl = Get-Acl -Path "AD:\$($group.DistinguishedName)"
+        }
+        catch {
+            Write-Warning "Could not retrieve ACL for group '$group': $_"
+            continue
+        }
 
         $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
 
@@ -1783,11 +2147,7 @@ function Find-DangerousACLPermissions {
 
     $userResults = foreach ($user in $users) {
         $acl = $null
-
-        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
-	$acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($user.DistinguishedName)"} else {
-	$acl = Get-Acl AD:\$user}
-
+        $acl = Get-Acl -Path "AD:\$($user.DistinguishedName)"
         if ($acl) {
             $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
             if ($dangerousRules) {
@@ -1835,7 +2195,6 @@ function Find-DangerousACLPermissions {
         Write-Host "    [+] No dangerous ACL permissions were found on any user."
     }
 }
-
 $outputdir = (Get-Item -Path ".\").FullName + "\" + $env:computername
 $starttime = Get-Date
 $scriptname = $MyInvocation.MyCommand.Name
