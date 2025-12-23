@@ -1,12 +1,12 @@
 # Fork Explination
-Copy the ADAudit folder to the DC Server or a server with the RSAT tools installed and can manage active directory. The account running the script need to be Domain Admin to run the full audit. 
+Copy the ADAudit folder to the DC Server or a server with the RSAT tools installed and can manage active directory. The account running the script need to be Domain Admin to run the full audit. <br><br>
 
-Download NuGet and DSInternals modules from PowerShell Gallery before using this script and place in the same folder as the script.
-https://www.powershellgallery.com/packages/NuGet/
-https://www.powershellgallery.com/packages/DSInternals/
-Chose Manual Download. You will get two .nuplkg files. Plase them in the ADAudit folder.
+Download NuGet and DSInternals modules from PowerShell Gallery before using this script and place in the same folder as the script.<br>
+https://www.powershellgallery.com/packages/NuGet/<br>
+https://www.powershellgallery.com/packages/DSInternals/<br>
+Chose Manual Download. You will get two .nuplkg files. Plase them in the ADAudit folder.<br><br>
 
-To install the required modules, run the powershell script AdAudit-Run.ps1 and chose option 2 for offline installation.
+To install the required modules, run the powershell script AdAudit-Run.ps1 and chose option 2 for offline installation.<br><br>
 
 Changes to this fork:<br>
 Offline installation for dependencies<br>
@@ -19,7 +19,7 @@ Can run on an other server then AD DC as long as:<br>
  Powershell can run using domain admin account<br>
 <br>
 
-DNS-ZoneReport.ps1 - standalone script<br>
+DNS-ZoneReport.ps1 - standalone script<br><br>
 
 # adaudit
 This PowerShell script is designed to conduct a comprehensive audit of Microsoft Active Directory, focusing on identifying common security vulnerabilities and weaknesses. Its execution facilitates the pinpointing of critical areas that require reinforcement, thereby fortifying your infrastructure against prevalent tactics used in lateral movement or privilege escalation attacks targeting Active Directory.
