@@ -12,11 +12,12 @@ Changes to this fork:<br>
 Offline installation for dependencies<br>
 Added explainations to some of the report files<br>
 Deligated AD permissions report<br>
+Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)<br>
 Can run on an other server then AD DC as long as:<br>
  RSAT tools is installed<br>
  Server can manage AD<br>
  Powershell can run using domain admin account<br>
-Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)<br><br>
+<br>
 
 DNS-ZoneReport.ps1 - standalone script<br>
 
