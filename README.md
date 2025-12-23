@@ -18,6 +18,7 @@ Can run on an other server then AD DC as long as:
  Powershell can run using domain admin account
 Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)
 
+DNS-ZoneReport.ps1 - standalone script
 
 # adaudit
 This PowerShell script is designed to conduct a comprehensive audit of Microsoft Active Directory, focusing on identifying common security vulnerabilities and weaknesses. Its execution facilitates the pinpointing of critical areas that require reinforcement, thereby fortifying your infrastructure against prevalent tactics used in lateral movement or privilege escalation attacks targeting Active Directory.
