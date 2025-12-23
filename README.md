@@ -1,3 +1,24 @@
+# Fork Explination
+Copy the ADAudit folder to the DC Server or a server with the RSAT tools installed and can manage active directory. The account running the script need to be Domain Admin to run the full audit. 
+
+Download NuGet and DSInternals modules from PowerShell Gallery before using this script and place in the same folder as the script.
+https://www.powershellgallery.com/packages/NuGet/
+https://www.powershellgallery.com/packages/DSInternals/
+Chose Manual Download. You will get two .nuplkg files. Plase them in the ADAudit folder.
+
+To install the required modules, run the powershell script AdAudit-Run.ps1 and chose option 2 for offline installation.
+
+Changes to this fork:
+Offline installation for dependencies
+Added explainations to some of the report files
+Deligated AD permissions report
+Can run on an other server then AD DC as long as:
+ RSAT tools is installed
+ Server can manage AD
+ Powershell can run using domain admin account
+Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)
+
+
 # adaudit
 This PowerShell script is designed to conduct a comprehensive audit of Microsoft Active Directory, focusing on identifying common security vulnerabilities and weaknesses. Its execution facilitates the pinpointing of critical areas that require reinforcement, thereby fortifying your infrastructure against prevalent tactics used in lateral movement or privilege escalation attacks targeting Active Directory.
 ```
