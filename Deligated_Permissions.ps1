@@ -380,22 +380,29 @@ foreach ($g in $byScope) {
 }
 
 # HTML index
-$index = @()
-$index += "<h1>AD Delegated Permissions Report</h1>"
-$index += "<p>Generated: $(Get-Date -Format 'u')</p>"
-$index += "<h2>Scopes</h2><ul>"
+$index = New-Object System.Collections.Generic.List[string]
+$index.Add('<!doctype html>')
+$index.Add('<html><head><meta charset="utf-8" />')
+$index.Add('<title>AD Delegated Permissions Report</title>')
+$index.Add('<style>body{font-family:Segoe UI,Arial,sans-serif} code{background:#f3f3f3;padding:2px 4px;border-radius:3px}</style>')
+$index.Add('</head><body>')
+$index.Add('<h1>AD Delegated Permissions Report</h1>')
+$index.Add("<p>Generated: $(Get-Date -Format 'u')</p>")
+$index.Add('<h2>Scopes</h2><ul>')
 foreach ($dn in $scopes) {
   $safe = ($dn -replace '[=,]','_') -replace '[^\w\.-]','_'
-  $index += "<li><code>$dn</code> — <a href='OUs/ADAudit_$safe.csv'>CSV</a> | <a href='OUs/ADAudit_$safe.txt'>TXT</a></li>"
+  $index.Add("<li><code>$dn</code> - <a href='OUs/ADAudit_$safe.csv'>CSV</a> | <a href='OUs/ADAudit_$safe.txt'>TXT</a></li>")
 }
-$index += "</ul>"
-$index += "<h2>Summary</h2><ul>"
-$index += "<li><a href='All/ADAudit_AllScopes_$ts.csv'>Master CSV</a></li>"
-$index += "<li><a href='All/ADAudit_HighRisk_$ts.csv'>High-Risk CSV</a></li>"
-$index += "<li><a href='ADAudit_RiskAssessment.txt'>Risk Assessment</a></li>"
-$index += "<li><a href='ADAudit_Recommendations.txt'>Recommendations</a></li>"
-$index += "</ul>"
+$index.Add('</ul>')
+$index.Add('<h2>Summary</h2><ul>')
+$index.Add("<li><a href='All/ADAudit_AllScopes_$ts.csv'>Master CSV</a></li>")
+$index.Add("<li><a href='All/ADAudit_HighRisk_$ts.csv'>High-Risk CSV</a></li>")
+$index.Add("<li><a href='ADAudit_RiskAssessment.txt'>Risk Assessment</a></li>")
+$index.Add("<li><a href='ADAudit_Recommendations.txt'>Recommendations</a></li>")
+$index.Add('</ul></body></html>')
 $indexPath = Join-Path $base 'index.html'
+$index | Out-File -Encoding UTF8 -FilePath $indexPath
+Write-Host "Index: $indexPath"
 $index -join "`r`n" | Out-File -Encoding UTF8 -FilePath $indexPath
 Write-Host "Index: $indexPath"
 
