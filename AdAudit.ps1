@@ -10,14 +10,25 @@
             * PowerShell v2.0 (PowerShell 5.0 needed if you intend to use DSInternals PowerShell module)
             * Tested on Windows Server 2008R2/2012/2012R2/2016/2019/2022
             * All languages (you may need to adjust $AdministratorTranslation variable)
+        o Requirements :
+            * ActiveDirectory PowerShell module (installed with RSAT tools)
+            * DnsServer PowerShell module (installed with DNS Server role)
+            * AdmPwd.PS PowerShell module (optional, installed with LAPS)
+            * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
+              Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.0.1 - 20/11/2025
+            [X] Version 7.1.0 - 24/12/2025
+                Added Get-DNSZoneInsecure function to check for DNS zones allowing insecure updates.
+                Added DNS zone report.
+                Added deligated permissions report.
+                Improved reporting
+            [] Version 7.0.1 - 20/11/2025
                 Added explination for "These accounts are susceptible to the Kerberoasting attack"
             [ ] Version 7.0 - 20/11/2025
                 Added offline installation of DSInternals and NuGet.
                 Added comments for Password audit files and kerberos and ciphers checks.
-                Added Audit reports ffor deilgated permissions.
-                Now posinble to run Audit from an other server with RSAT tools installed. (Need to run powershell using domain admin account)
+                Added Audit reports for delegated permissions as separate script.
+                Now posible to run Audit from an other server with RSAT tools installed. (Need to run powershell using domain admin account)
             [ ] Version 6.0 - 22/12/2023
                 * Fix "BUILTIN\$Administrators" quoting, in order to use $Administrators variable when script enumerates Default Domain Controllers Policy
                 * Fix RDP logon policy check in the same function above
@@ -159,12 +170,23 @@ Param (
     [switch]$laps = $false,
     [switch]$authpolsilos = $false,
     [switch]$insecurednszone = $false,
+    [Alias('dns-zone')][switch]$dnszone = $false,
+    [string]$DnsZoneOutputRoot,
+    [switch]$DnsIncludeRecordCounts = $false,
+    [switch]$DnsIncludeSystemZones = $false,
     [switch]$recentchanges = $false,
     [switch]$adcs = $false,
     [switch]$spn = $false,
     [switch]$asrep = $false,
     [switch]$acl = $false,
     [switch]$ldapsecurity = $false,
+    [switch]$dataextract = $false,
+    [Alias('delegated-permissions','delegated')][switch]$delegatedpermissions = $false,
+    [string]$DelegatedOutputRoot,
+    [switch]$DelegIncludeSystemTrustees = $false,
+    [switch]$DelegIncludeDeny = $false,
+    [switch]$DelegIncludeInherited = $false,
+    [string]$DelegServer,
     [switch]$all = $false,
     [string[]]$exclude = @(),
     [string]$select
@@ -302,7 +324,7 @@ Function Get-DNSZoneInsecure {
         if ($insecurezones) {
             foreach ($insecurezone in $insecurezones) {
                 Add-Content -Path $globalInsecureZonesFile -Value (
-                    "The DNS Zone {0} on DNS server {1} allows insecure updates ({2})" -f `
+"@The DNS Zone {0} on DNS server {1} allows insecure updates ({2})" -f `
                     $insecurezone.ZoneName, $dnsServer, $insecurezone.DynamicUpdate
                 )
                 $totalcount++
@@ -376,7 +398,7 @@ Function Get-LAPSStatus {
             $today = Get-Date
             if ($expiration -lt $today) {
                 $count++
-                "$($computer.Name) password is expired since $expiration" | Add-Content -Path $outputdir\laps_expired-passwords.txt
+"@$($computer.Name) password is expired since $expiration" | Add-Content -Path $outputdir\laps_expired-passwords.txt
             }
         }
         if ($count -gt 0) {
@@ -386,7 +408,7 @@ Function Get-LAPSStatus {
         Get-ADOrganizationalUnit -Filter * | Find-AdmPwdExtendedRights -PipelineVariable OU | foreach {
             $_.ExtendedRightHolders | foreach {
                 if ($_ -ne $System) {
-                    "$_ can read password attribute of $($Ou.ObjectDN)" | Add-Content -Path $outputdir\laps_read-extendedrights.txt
+"@$_ can read password attribute of $($Ou.ObjectDN)" | Add-Content -Path $outputdir\laps_read-extendedrights.txt
                 }
             }
         }
@@ -702,7 +724,7 @@ Function Get-InactiveAccounts {
 
     if ($totalcount -gt 0) {
         # Header (overwrite any existing file)
-        "Accounts inactive (no logon) for the past 180 days" | Set-Content -Path "$outputdir\accounts_inactive.txt"
+"@Accounts inactive (no logon) for the past 180 days" | Set-Content -Path "$outputdir\accounts_inactive.txt"
     }
 
     foreach ($account in $inactiveaccounts) {
@@ -1340,7 +1362,7 @@ Function Get-RecentChanges() {
     $totalcountGroups = ($newGroups | Measure-Object | Select-Object Count).count
     if ($totalcountUsers -gt 0) {
         # Add header line (overwrite any existing file)
-        "User Created within the last 30 days" | Set-Content -Path "$outputdir\new_users.txt"
+"@User Created within the last 30 days" | Set-Content -Path "$outputdir\new_users.txt"
         foreach ($newUser in $newUsers ) { Add-Content -Path "$outputdir\new_users.txt" -Value "Account $($newUser.SamAccountName) was created $($newUser.whenCreated)" }
         Write-Both "    [!] $totalcountUsers new users were created last 30 days, see $outputdir\new_users.txt"
     }
@@ -1732,14 +1754,14 @@ Function Get-ADCSVulns {
                 }
                 # Create object with details. Objectg name is TemplatePropCommonName
                 $template = New-Object -TypeName PSObject -Property @{
-                    "SuppliesSubjectCheck"         = $SuppliesSubjectCheck
-                    "ClientAuthCheck"              = $ClientAuthCheck
-                    "AllowEnrollCheck"             = $AllowEnrollCheck
-                    "AnyPurposeCheck"              = $AnyPurposeCheck
-                    "AllowWriteCheck"              = $AllowWriteCheck
-                    "AllowFullControl"             = $AllowFullControl
-                    "TemplatePropCommonName"       = $TemplatePropCommonName
-                    "CertificateRequestAgentCheck" = $CertificateRequestAgentCheck
+"@SuppliesSubjectCheck"         = $SuppliesSubjectCheck
+"@ClientAuthCheck"              = $ClientAuthCheck
+"@AllowEnrollCheck"             = $AllowEnrollCheck
+"@AnyPurposeCheck"              = $AnyPurposeCheck
+"@AllowWriteCheck"              = $AllowWriteCheck
+"@AllowFullControl"             = $AllowFullControl
+"@TemplatePropCommonName"       = $TemplatePropCommonName
+"@CertificateRequestAgentCheck" = $CertificateRequestAgentCheck
                 }
             }
             $templates += $template
@@ -1842,23 +1864,23 @@ Function Get-SPNs {
 
     # Default/high-value groups we care about
     $default_groups = @(
-        "Domain Admins",
-        "Enterprise Admins",
-        "Schema Admins",
-        "Domain Controllers",
-        "Backup Operators",
-        "Account Operators",
-        "Server Operators",
-        "Print Operators",
-        "Remote Desktop Users",
-        "Network Configuration Operators",
-        "Exchange Organization Admins",
-        "Exchange View-Only Admins",
-        "Exchange Recipient Admins",
-        "Exchange Servers",
-        "Exchange Trusted Subsystem",
-        "Exchange Public Folder Admins",
-        "Exchange UM Management"
+"@Domain Admins",
+"@Enterprise Admins",
+"@Schema Admins",
+"@Domain Controllers",
+"@Backup Operators",
+"@Account Operators",
+"@Server Operators",
+"@Print Operators",
+"@Remote Desktop Users",
+"@Network Configuration Operators",
+"@Exchange Organization Admins",
+"@Exchange View-Only Admins",
+"@Exchange Recipient Admins",
+"@Exchange Servers",
+"@Exchange Trusted Subsystem",
+"@Exchange Public Folder Admins",
+"@Exchange UM Management"
     )
 
     $base_groups = @()
@@ -2084,6 +2106,30 @@ function Get-LDAPSecurity {
     }
 }
 
+function Get-ADObjectAclSafe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DistinguishedName,
+        [string]$Server
+    )
+    # Prefer AD: provider; fall back to ADSI if DN contains characters the AD provider struggles with.
+    try {
+        if (-not (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
+            Import-Module ActiveDirectory -ErrorAction Stop | Out-Null
+            try { New-PSDrive -Name AD -PSProvider ActiveDirectory -Root "//RootDSE/" -ErrorAction Stop | Out-Null } catch {}
+        }
+        return Get-Acl -Path ("AD:\" + $DistinguishedName) -ErrorAction Stop
+    } catch {
+        try {
+            $ldapPath = if ($Server) { "LDAP://$Server/$DistinguishedName" } else { "LDAP://$DistinguishedName" }
+            $entry = [ADSI]$ldapPath
+            return $entry.psbase.ObjectSecurity
+        } catch {
+            throw $_
+        }
+    }
+}
+
 function Find-DangerousACLPermissions {
     #Specify the ACLs and Groups to check against
     $dangerousAces = @('GenericAll', 'GenericWrite', 'ForceChangePassword', 'WriteDacl', 'WriteOwner', 'Delete')
@@ -2093,7 +2139,7 @@ function Find-DangerousACLPermissions {
     $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties *
     $computerResults = foreach ($computer in $computers) {
         try {
-            $acl = Get-Acl -Path "AD:\$($computer.DistinguishedName)"
+            $acl = Get-ADObjectAclSafe -DistinguishedName $computer.DistinguishedName
         }
         catch {
             Write-Warning "Could not retrieve ACL for computer '$computer': $_"
@@ -2120,7 +2166,7 @@ function Find-DangerousACLPermissions {
     $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties *
     $groupResults = foreach ($group in $groups) {
         try {
-            $acl = Get-Acl -Path "AD:\$($group.DistinguishedName)"
+            $acl = Get-ADObjectAclSafe -DistinguishedName $group.DistinguishedName
         }
         catch {
             Write-Warning "Could not retrieve ACL for group '$group': $_"
@@ -2147,7 +2193,7 @@ function Find-DangerousACLPermissions {
 
     $userResults = foreach ($user in $users) {
         $acl = $null
-        $acl = Get-Acl -Path "AD:\$($user.DistinguishedName)"
+        $acl = Get-ADObjectAclSafe -DistinguishedName $user.DistinguishedName
         if ($acl) {
             $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
             if ($dangerousRules) {
@@ -2195,6 +2241,1720 @@ function Find-DangerousACLPermissions {
         Write-Host "    [+] No dangerous ACL permissions were found on any user."
     }
 }
+#region AD raw data extract (Get-ADAuditData style)
+function New-ZipFile {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$True, Position=0)]
+        [string]$Path,
+        [Parameter(Mandatory=$True, Position=1)]
+        [ValidateScript({Test-Path $_ -PathType 'Container'})]
+        [string]$Source
+    )
+    try {
+        $rel = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -Name Release -ErrorAction Stop).Release
+        if ($rel -ge 394802) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($Source, $Path, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+            return $true
+        }
+    } catch { }
+    return $false
+}
+
+function Remove-InvalidFileNameChars {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
+        [AllowEmptyString()]
+        [string]$Name
+    )
+    $invalidChars = [IO.Path]::GetInvalidFileNameChars() -join ''
+    $re = "[{0}]" -f [RegEx]::Escape($invalidChars)
+    return ($Name -replace $re,'#')
+}
+
+function ConvertFrom-UAC {
+    param([Parameter(ValueFromPipeline=$true)]$Value)
+    $uacOptions = @{
+        512='Enabled';514='Disabled';528='Enabled - Locked Out';530='Disabled - Locked Out'
+        4096='Enabled - Workstation Trust Account';4098='Disabled - Workstation Trust Account'
+        8192='Enabled - Server Trust Account';8194='Disabled - Server Trust Account'
+        66048='Enabled - Password Does Not Expire';66050='Disabled - Password Does Not Expire'
+        1049088='Enabled - Not Delegated';1049090='Disabled - Not Delegated'
+        2097664='Enabled - Use DES Key Only';4194816='Enabled - PreAuthorization Not Required'
+        16781312='Enabled - Workstation Trust Account - Trusted to Authenticate For Delegation'
+    }
+    if ($null -eq $Value) { return "Unknown User Account Type - No Value Available" }
+    if ($uacOptions.ContainsKey([int]$Value)) { return [string]$uacOptions[[int]$Value] }
+    return "Unknown User Account Type - $Value"
+}
+
+function ConvertFrom-UACComputed {
+    param([Parameter(ValueFromPipeline=$true)]$Value)
+    $uacComputed = @{
+        0='Refer to userAccountControl Field';16='Locked Out';8388608='Password Expired'
+        8388624='Locked Out - Password Expired';67108864='Partial Secrets Account';2147483648='Use AES Keys'
+    }
+    if ($null -eq $Value) { return "Unknown User Account Type - No Value Available" }
+    if ($uacComputed.ContainsKey([int64]$Value)) { return [string]$uacComputed[[int64]$Value] }
+    return "Unknown User Account Type - $Value"
+}
+
+function ConvertFrom-PasswordExpiration {
+    param([Parameter(ValueFromPipeline=$true)]$Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -eq 0 -or $Value -ge 922337203685477000) { return '' }
+    try { return ([datetime]::FromFileTime([int64]$Value)).ToString("M/d/yyyy h:mm:ss tt") } catch { return '' }
+}
+
+function ConvertFrom-trustDirection {
+    param([Parameter(ValueFromPipeline=$true)]$Value)
+    $trustDirect = @{
+        0='Disabled (Trust exists but disabled)'
+        1='Inbound (One-Way Trust) (TrustING Domain)'
+        2='Outbound (One-Way Trust) (TrustED Domain)'
+        3='Bidirectional (Two-Way Trust)'
+    }
+    if ($null -eq $Value) { return "Unknown Trust Direction - No Value Available" }
+    if ($trustDirect.ContainsKey([int]$Value)) { return $trustDirect[[int]$Value] }
+    return "Unknown Trust Direction - $Value"
+}
+
+function ConvertFrom-trustType {
+    param([Parameter(ValueFromPipeline=$true)]$Value)
+    $trustType = @{
+        1='Downlevel Trust (Windows NT / External)'
+        2='Uplevel Trust (Windows 2000+ / AD)'
+        3='MIT Kerberos v5 Realm'
+        4='DCE Realm'
+    }
+    if ($null -eq $Value) { return "Unknown Trust Type - No Value Available" }
+    if ($trustType.ContainsKey([int]$Value)) { return [string]$trustType[[int]$Value] }
+    return "Unknown Trust Type - $Value"
+}
+
+function ConvertFrom-trustAttribute {
+    param([Parameter(Mandatory=$true, ValueFromPipeline=$true)]$Value)
+    $trustAttribute = @{
+        0='Non-Verifiable Trust'
+        1='Non-Transitive Trust'
+        2='Up-level Trust'
+        4='Quarantined Domain External Trust (SID Filtering Enabled)'
+        8='Forest Transitive Trust'
+        16='Selective Authentication'
+        20='Intra-Forest Trust'
+        32='Forest-Internal'
+        64='SIDHistory enabled'
+        80='Uses RC4 Encryption'
+        400='PIM Trust'
+    }
+    if ($null -eq $Value) { return "Unknown Trust Attribute - No Value Available" }
+    if ($trustAttribute.ContainsKey([int]$Value)) { return [string]$trustAttribute[[int]$Value] }
+    return "Unknown Trust Attribute - $Value"
+}
+
+function Export-ADAuditDataExtract {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        [ValidateScript({Test-Path $_ -PathType 'Container'})]
+        [string]$Path = (Join-Path $outputdir 'ADExtract'),
+        [Parameter(Mandatory=$false)]
+        [string]$SearchBase = (Get-ADRootDSE | Select-Object -ExpandProperty defaultNamingContext)
+    )
+
+    try { Import-Module ActiveDirectory -ErrorAction Stop } catch { Write-Both "    [!] ActiveDirectory module missing. $_"; return }
+    try { Import-Module GroupPolicy -ErrorAction Stop } catch { Write-Both "    [!] GroupPolicy module missing. $_"; return }
+
+    $domainInfo = Get-ADDomain -Current LocalComputer
+    $domainDN   = $domainInfo.DistinguishedName
+    $outRoot    = Join-Path $Path $domainDN
+
+    if (Test-Path $outRoot) { Remove-Item $outRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $outRoot | Out-Null
+
+    $log = Join-Path $outRoot 'consoleOutput.txt'
+"@Starting AD data extract at $(Get-Date -Format G)" | Out-File -FilePath $log -Encoding utf8
+"@Path parameter: '$outRoot'" | Out-File -FilePath $log -Append -Encoding utf8
+"@SearchBase parameter: '$SearchBase'" | Out-File -FilePath $log -Append -Encoding utf8
+
+    # OS info
+    $sysInfo = Get-CimInstance -ClassName Win32_OperatingSystem
+    $PSVersionTable | Out-File -FilePath (Join-Path $outRoot "$env:COMPUTERNAME-sysinfo.txt") -Append -Encoding utf8
+    $sysInfo | Select-Object BuildNumber,Caption,InstallDate,LastBootUpTime,LocalDateTime,OSArchitecture,Version |
+        Out-File -FilePath (Join-Path $outRoot "$env:COMPUTERNAME-sysinfo.txt") -Append -Encoding utf8
+
+    # Domain / DC / Forest
+    $domainInfo | Select-Object @{Name='ChildDomains';Expression={$_.ChildDomains -join ';'}},ComputersContainer,DeletedObjectsContainer,
+        DistinguishedName,DNSRoot,DomainControllersContainer,DomainMode,DomainSID,Forest,InfrastructureMaster,Name,NetBIOSName,
+        ParentDomain,PDCEmulator,RIDMaster,SystemsContainer,UsersContainer |
+        ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+        Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-Info.csv") -Append
+
+    Get-ADDomainController -Filter * -Server $domainInfo.DnsRoot |
+        Select-Object ComputerObjectDN,DefaultPartition,Domain,Enabled,Forest,HostName,IsGlobalCatalog,IsReadOnly,Name,
+            OperatingSystem,OperatingSystemVersion,@{Name='OperationMasterRoles';Expression={$_.OperationMasterRoles -join ';'}},ServerObjectDN,Site |
+        ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+        Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-domainControllerInfo.csv") -Append
+
+    Get-ADForest -Current LocalComputer |
+        Select-Object DomainNamingMaster,@{Name='Domains';Expression={$_.Domains -join ';'}},ForestMode,
+            @{Name='GlobalCatalogs';Expression={$_.GlobalCatalogs -join ';'}},Name,RootDomain,SchemaMaster,
+            @{Name='UPNSuffixes';Expression={$_.UPNSuffixes -join ';'}} |
+        ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+        Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-ForestInfo.csv") -Append
+
+    # Users
+    $delimiter='|'; $eol="`r`n"
+    $userProps = @('accountExpirationDate','adminCount','canonicalName','cn','comment','company','department','description','displayName',
+        'distinguishedName','employeeID','employeeNumber','employeeType','givenName','info','LastLogonDate','mail','managedObjects',
+        'manager','memberOf','middleName','msDS-AllowedToDelegateTo','msDS-PSOApplied','msDS-ResultantPSO',
+        'msDS-User-Account-Control-Computed','msDS-UserPasswordExpiryTimeComputed','name','objectSid','PasswordExpired',
+        'PasswordLastSet','primaryGroupID','sAMAccountName','servicePrincipalName','sIDHistory','sn','title','uid','uidNumber',
+        'userAccountControl','userWorkstations','whenChanged','whenCreated')
+    $userHeader = $userProps + @('relativeIdentifier')
+    $users = Get-ADUser -SearchBase $SearchBase -Filter * -Properties $userProps
+    $w = [System.IO.StreamWriter](Join-Path $outRoot "$($domainInfo.DNSRoot)-Users.csv")
+    $w.Write(($userHeader -join $delimiter) + $eol)
+    foreach ($u in $users) {
+        $managed = ($u.managedObjects | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
+        $memberof = ($u.memberOf | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
+        $psoApplied = (($u.'msDS-PSOApplied' -join ';') -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=',''
+        $psoRes = (($u.'msDS-ResultantPSO' -join ';') -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=',''
+        $line = @(
+            [string]$u.accountExpirationDate
+            $u.adminCount
+            (Remove-InvalidFileNameChars $u.canonicalName)
+            (Remove-InvalidFileNameChars $u.cn)
+            (Remove-InvalidFileNameChars $u.comment)
+            $u.company
+            $u.department
+            (Remove-InvalidFileNameChars $u.description)
+            (Remove-InvalidFileNameChars $u.displayName)
+            $u.distinguishedName
+            $u.employeeID
+            $u.employeeNumber
+            $u.employeeType
+            (Remove-InvalidFileNameChars $u.givenName)
+            (Remove-InvalidFileNameChars $u.info)
+            [string]$u.LastLogonDate
+            $u.mail
+            $managed
+            $u.manager
+            $memberof
+            (Remove-InvalidFileNameChars $u.middleName)
+            ($u.'msDS-AllowedToDelegateTo' -join ';')
+            $psoApplied
+            $psoRes
+            (ConvertFrom-UACComputed $u.'msDS-User-Account-Control-Computed')
+            (ConvertFrom-PasswordExpiration $u.'msDS-UserPasswordExpiryTimeComputed')
+            (Remove-InvalidFileNameChars $u.name)
+            $u.objectSid
+            $u.PasswordExpired
+            [string]$u.PasswordLastSet
+            $u.primaryGroupID
+            $u.sAMAccountName
+            ($u.servicePrincipalName -join ';')
+            ($u.sIDHistory -join ';')
+            (Remove-InvalidFileNameChars $u.sn)
+            $u.title
+            ($u.uid -join ';')
+            $u.uidNumber
+            (ConvertFrom-UAC $u.userAccountControl)
+            $u.userWorkstations
+            [string]$u.whenChanged
+            [string]$u.whenCreated
+            (($u.SID.Value).Split('-')[-1])
+        ) -join $delimiter
+        $w.Write($line + $eol)
+    }
+    $w.Close()
+
+    # Groups
+    $groupProps = @('CN','description','displayName','distinguishedName','GroupCategory','GroupScope','ManagedBy','memberOf','msDS-PSOApplied','name','objectSID','sAMAccountName','whenCreated','whenChanged')
+    $groupHeader = $groupProps + @('relativeIdentifier')
+    $groups = Get-ADGroup -SearchBase $SearchBase -Filter * -Properties $groupProps
+    $w = [System.IO.StreamWriter](Join-Path $outRoot "$($domainInfo.DNSRoot)-Groups.csv")
+    $w.Write(($groupHeader -join $delimiter) + $eol)
+    foreach ($g in $groups) {
+        $memberof = ($g.memberOf | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
+        $pso = (($g.'msDS-PSOApplied' -join ';') -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=',''
+        $line = @(
+            (Remove-InvalidFileNameChars $g.CN)
+            (Remove-InvalidFileNameChars $g.description)
+            (Remove-InvalidFileNameChars $g.displayName)
+            $g.distinguishedName
+            $g.GroupCategory
+            $g.GroupScope
+            $g.ManagedBy
+            $memberof
+            $pso
+            (Remove-InvalidFileNameChars $g.name)
+            $g.objectSid
+            $g.sAMAccountName
+            [string]$g.whenCreated
+            [string]$g.whenChanged
+            (($g.SID.Value).Split('-')[-1])
+        ) -join $delimiter
+        $w.Write($line + $eol)
+    }
+    $w.Close()
+
+    # Computers
+    $computerProps = @('cn','description','displayName','distinguishedName','LastLogonDate','name','objectSid','operatingSystem','operatingSystemServicePack','operatingSystemVersion','primaryGroupID','PasswordLastSet','userAccountControl','whenCreated','whenChanged')
+    $computers = Get-ADComputer -SearchBase $SearchBase -Filter * -Properties $computerProps
+    $computers | Select-Object $computerProps | ForEach-Object {
+        $_.userAccountControl = ConvertFrom-UAC $_.userAccountControl
+        $_
+    } | ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+        Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-Computers.csv") -Append
+
+    # OUs
+    $ouProps = @('CanonicalName','Description','DisplayName','DistinguishedName','ManagedBy','Name','whenChanged','whenCreated')
+    Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * -Properties $ouProps |
+        Select-Object CanonicalName,Description,DisplayName,DistinguishedName,ManagedBy,Name,whenChanged,whenCreated |
+        ForEach-Object {
+            $_.CanonicalName = Remove-InvalidFileNameChars $_.CanonicalName
+            $_.Description   = Remove-InvalidFileNameChars $_.Description
+            $_.DisplayName   = Remove-InvalidFileNameChars $_.DisplayName
+            $_.Name          = Remove-InvalidFileNameChars $_.Name
+            $_
+        } | ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+        Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-OUs.csv") -Append
+
+    # GPO Reports + inheritance
+    $gpRoot = Join-Path $outRoot 'GroupPolicy'
+    New-Item -ItemType Directory -Path (Join-Path $gpRoot 'Reports') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $gpRoot 'Inheritance') -Force | Out-Null
+
+    $gpos = Get-GPO -All
+    foreach ($gpo in $gpos) {
+        $name = Remove-InvalidFileNameChars $gpo.DisplayName
+        Get-GPOReport -Guid $gpo.Id -ReportType Html -Path (Join-Path (Join-Path $gpRoot 'Reports') "$name.html")
+    }
+
+    $domainGPI = Get-GPInheritance -Target $domainDN
+    $domainGPI | Select-Object Name,ContainerType,Path,GpoInheritanceBlocked | Format-List |
+        Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$domainDN.txt")
+    $domainGPI | Select-Object -ExpandProperty InheritedGpoLinks |
+        Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$domainDN.txt") -Append
+
+    $adOUs = Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter *
+    foreach ($ou in $adOUs) {
+        $fn = Remove-InvalidFileNameChars $ou.DistinguishedName
+        $gpi = Get-GPInheritance -Target $ou.DistinguishedName
+        $gpi | Select-Object Name,ContainerType,Path,GpoInheritanceBlocked | Format-List |
+            Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$fn.txt")
+        $gpi | Select-Object -ExpandProperty InheritedGpoLinks |
+            Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$fn.txt") -Append
+    }
+
+    # OU ACLs (full dump)
+    New-Item -ItemType Directory -Path (Join-Path $outRoot 'OU\ACLs') -Force | Out-Null
+    $schemaIDGUID = @{}
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'SilentlyContinue'
+    Get-ADObject -SearchBase (Get-ADRootDSE).schemaNamingContext -LDAPFilter '(schemaIDGUID=*)' -Properties name,schemaIDGUID |
+        ForEach-Object { $schemaIDGUID[[Guid]$_.schemaIDGUID] = $_.name }
+    Get-ADObject -SearchBase "CN=Extended-Rights,$((Get-ADRootDSE).configurationNamingContext)" -LDAPFilter '(objectClass=controlAccessRight)' -Properties name,rightsGUID |
+        ForEach-Object { $schemaIDGUID[[Guid]$_.rightsGUID] = $_.name }
+    $ErrorActionPreference = $eap
+
+    $ouDns = @()
+    if ($SearchBase -eq (Get-ADRootDSE).defaultNamingContext) {
+        $ouDns += (Get-ADDomain).DistinguishedName
+        $ouDns += Get-ADOrganizationalUnit -Filter * | Select-Object -ExpandProperty DistinguishedName
+        $ouDns += Get-ADObject -SearchBase (Get-ADDomain).DistinguishedName -SearchScope OneLevel -LDAPFilter '(objectClass=container)' | Select-Object -ExpandProperty DistinguishedName
+    } else {
+        $ouDns += Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * | Select-Object -ExpandProperty DistinguishedName
+    }
+
+    foreach ($ouDN in $ouDns) {
+        $fn = Remove-InvalidFileNameChars $ouDN
+        $csvPath = Join-Path (Join-Path $outRoot 'OU\ACLs') "$fn.csv"
+        Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$ouDN" |
+            Select-Object -ExpandProperty Access |
+            Select-Object @{n='organizationalUnit';e={$ouDN}},
+                @{n='objectTypeName';e={ if ($_.ObjectType -eq [Guid]::Empty) {'All'} else { $schemaIDGUID[$_.ObjectType] } }},
+                @{n='inheritedObjectTypeName';e={ $schemaIDGUID[$_.InheritedObjectType] }}, * |
+            ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+            Out-File -FilePath $csvPath -Append
+    }
+
+    # Confidentiality bit
+    try {
+        Get-ADObject -SearchBase "CN=Schema,CN=Configuration,$domainDN" -LDAPFilter '(searchFlags:1.2.840.113556.1.4.803:=128)' |
+            Select-Object DistinguishedName,Name |
+            ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+            Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-confidentialBit.csv") -Append
+    } catch {
+"@Problem exporting confidentiality bit: $_" | Out-File -FilePath $log -Append -Encoding utf8
+    }
+
+    # Default password policy + FGPP
+    Get-ADDefaultDomainPasswordPolicy |
+        Select-Object ComplexityEnabled,DistinguishedName,LockoutDuration,LockoutObservationWindow,LockoutThreshold,MaxPasswordAge,
+            MinPasswordAge,MinPasswordLength,PasswordHistoryCount,ReversibleEncryptionEnabled |
+        ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+        Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-defaultDomainPasswordPolicy.csv") -Append
+
+    Get-ADFineGrainedPasswordPolicy -Filter * -Properties appliesTo |
+        Select-Object ComplexityEnabled,DistinguishedName,LockoutDuration,LockoutObservationWindow,LockoutThreshold,MaxPasswordAge,
+            MinPasswordAge,MinPasswordLength,
+            @{Name='msDS-PSOAppliesTo';Expression={(($_.appliesTo -split "," | Select-String -AllMatches "CN=") -join ", ") -replace "CN=" -replace "" }},
+            Name,PasswordHistoryCount,Precedence,ReversibleEncryptionEnabled |
+        ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+        Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-fgppDetails.csv") -Append
+
+    # Trusts (Get-ADTrust if available, else netdom text)
+    if (Get-Command Get-ADTrust -ErrorAction SilentlyContinue) {
+        Get-ADTrust -Filter * -Properties * |
+            Select-Object CanonicalName,CN,Created,Deleted,Description,DisallowTransivity,DisplayName,DistinguishedName,flatName,
+                ForestTransitive,IntraForest,Name,SelectiveAuthentication,Source,Target,TGTDelegation,
+                @{Name='TrustAttributes';Expression={ConvertFrom-trustAttribute $_.TrustAttributes}},
+                @{Name='trustDirection';Expression={ConvertFrom-trustDirection $_.trustDirection}},
+                @{Name='TrustType';Expression={ConvertFrom-trustType $_.TrustType}},
+                TrustingPolicy,trustPartner,UplevelOnly,UsesAESKeys,UsesRC4Encryption,whenChanged,whenCreated |
+            ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
+            Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-trustedDomains.csv") -Append
+    } else {
+        & netdom query trust > (Join-Path $outRoot "$($domainInfo.DNSRoot)-trustedDomains-netdom.txt")
+    }
+
+"@Finished AD data extract at $(Get-Date -Format G)" | Out-File -FilePath $log -Append -Encoding utf8
+
+    # Zip output (best-effort)
+    $zip = Join-Path $Path ("$domainDN.zip")
+    if (New-ZipFile -Path $zip -Source $outRoot) {
+"@Compressed output: $zip" | Out-File -FilePath $log -Append -Encoding utf8
+    } else {
+"@.NET 4.5.2+ not detected - skipping zip" | Out-File -FilePath $log -Append -Encoding utf8
+    }
+
+    Write-Both "    [+] AD raw data export complete: $outRoot"
+}
+#endregion AD raw data extract
+
+#region DNS Zone Posture Report (merged)
+function Invoke-DnsZonePostureReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$OutputRoot,
+        [switch]$IncludeRecordCounts,
+        [switch]$IncludeSystemZones
+    )
+
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+
+    # ----------------------------
+    # Config (function args)
+    # ----------------------------
+    $script:IncludeRecordCounts  = [bool]$IncludeRecordCounts
+    $script:PreferZoneStatistics = $true
+    $script:RecordCountMaxRecords= 250000
+    $script:IncludeSystemZones   = [bool]$IncludeSystemZones
+    $script:FailSoft             = $true
+    $script:WriteErrorReport     = $true
+
+    # ----------------------------
+    # Error bucket
+    # ----------------------------
+    $script:CollectionErrors = @()
+    $script:ZoneFailures     = @()
+
+    function Add-Err {
+        param([string]$Context, [object]$Err)
+        $script:CollectionErrors += [pscustomobject]@{
+            Time    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Context = $Context
+            Error   = ($Err.Exception.Message)
+            Type    = ($Err.Exception.GetType().FullName)
+        }
+    }
+
+    function Safe-Get {
+        param(
+            [Parameter(Mandatory)] [scriptblock]$Script,
+            [object]$Default = $null,
+            [string]$Context = $null
+        )
+        try { & $Script }
+        catch {
+            if ($Context) { Add-Err -Context $Context -Err $_ }
+            $Default
+        }
+    }
+
+    function Get-Prop {
+        param(
+            [Parameter(Mandatory)] [object]$Obj,
+            [Parameter(Mandatory)] [string]$Name,
+            [object]$Default = $null
+        )
+        if (-not $Obj) { return $Default }
+        $p = $Obj.PSObject.Properties[$Name]
+        if ($p) { return $p.Value }
+        $Default
+    }
+
+    function Format-TimeSpan {
+        param([Nullable[TimeSpan]]$Ts)
+        if (-not $Ts) { return $null }
+        ("{0}d {1}h {2}m" -f $Ts.Days, $Ts.Hours, $Ts.Minutes)
+    }
+
+    function Convert-ServerListToString {
+        param([object]$Value)
+        if (-not $Value) { return $null }
+
+        $items = @()
+        foreach ($o in @($Value)) {
+            if ($null -eq $o) { continue }
+
+            $ipProp = $o.PSObject.Properties['IPAddressToString']
+            if ($ipProp -and $ipProp.Value) { $items += [string]$ipProp.Value; continue }
+
+            $found = $false
+            foreach ($p in @('IPAddress','Address','ServerName','Name')) {
+                $pp = $o.PSObject.Properties[$p]
+                if ($pp -and $pp.Value) { $items += [string]$pp.Value; $found = $true; break }
+            }
+            if (-not $found) { $items += [string]$o }
+        }
+
+        $items = $items | Where-Object { $_ -and $_.Trim() } | Sort-Object -Unique
+        if (-not $items) { return $null }
+        ($items -join ', ')
+    }
+
+    function Ensure-Folder {
+        param([string]$Path)
+        if (-not (Test-Path -Path $Path)) { New-Item -Path $Path -ItemType Directory | Out-Null }
+        $Path
+    }
+
+function New-ReportsFolder {
+        param([string]$Root, [string]$ServerName)
+        $safeServer = ($ServerName -replace '[\\/:*?"<>| ]','_')
+        $rootLeaf = Split-Path -Path $Root -Leaf
+
+        # If Root already ends with the hostname, do not append it again
+        if ($rootLeaf -ieq $safeServer) {
+            $base = $Root
+        }
+        else {
+            $base = Join-Path -Path $Root -ChildPath $safeServer
+        }
+
+        Ensure-Folder $base | Out-Null
+        $reports = Join-Path -Path $base -ChildPath 'DNS-Reports'
+        Ensure-Folder $reports
+    }
+
+    # ----------------------------
+    # Detect target DNS server (no args)
+    # ----------------------------
+    function Get-TargetDnsServer {
+        $localOk = Safe-Get -Context "Detect: Get-DnsServer local" -Default $false -Script {
+            Import-Module DnsServer -ErrorAction Stop
+            $null = Get-DnsServer -ComputerName $env:COMPUTERNAME -ErrorAction Stop
+            $true
+        }
+        if ($localOk) { return $env:COMPUTERNAME }
+
+        $dnsIps = Safe-Get -Context "Detect: Get-DnsClientServerAddress" -Default @() -Script {
+            $addrs = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop
+            $active = $addrs | Where-Object { $_.InterfaceAlias -and $_.ServerAddresses -and $_.ServerAddresses.Count -gt 0 }
+            ($active | ForEach-Object { $_.ServerAddresses } | Select-Object -Unique)
+        }
+
+        if (-not $dnsIps -or $dnsIps.Count -eq 0) {
+            throw "Could not detect a DNS server from local NIC DNS settings, and local host does not appear to be a DNS server."
+        }
+
+        foreach ($ip in $dnsIps) {
+            $ok = Safe-Get -Context "Detect: Test-NetConnection $ip:53" -Default $false -Script {
+                (Test-NetConnection -ComputerName $ip -Port 53 -InformationLevel Quiet -WarningAction SilentlyContinue)
+            }
+            if ($ok) { return $ip }
+        }
+
+        $dnsIps[0]
+    }
+
+    # ----------------------------
+    # Preflight module
+    # ----------------------------
+    $dnsModule = Safe-Get -Context "Preflight: Get-Module DnsServer" -Default $null -Script {
+        Get-Module -ListAvailable -Name DnsServer | Sort-Object Version -Descending | Select-Object -First 1
+    }
+    if (-not $dnsModule) { throw "DnsServer module not found. Install DNS role tools / RSAT DNS (DnsServer) on this host." }
+
+    Import-Module DnsServer -ErrorAction Stop
+
+    $ComputerName = Get-TargetDnsServer
+
+    $serverInfo = Safe-Get -Context "Preflight: Get-DnsServer -ComputerName $ComputerName" -Default $null -Script {
+        Get-DnsServer -ComputerName $ComputerName -ErrorAction Stop
+    }
+    if (-not $serverInfo) {
+        throw "Unable to query DNS server '$ComputerName'. Check connectivity, firewall/RPC, permissions, and that DNS Server role is present."
+    }
+
+    # ----------------------------
+    # Output paths (Reports + type subfolders)
+    # ----------------------------
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $outDir    = New-ReportsFolder -Root $OutputRoot -ServerName $ComputerName
+
+    $txtDir  = Ensure-Folder (Join-Path $outDir 'txt')
+    $htmlDir = Ensure-Folder (Join-Path $outDir 'html')
+
+    $csvPath     = Join-Path $outDir  "DNSAudit-$timestamp.csv"
+    $jsonPath    = Join-Path $outDir  "DNSAudit-$timestamp.json"
+    $htmlPath    = Join-Path $htmlDir "DNSAudit-$timestamp.html"
+    $errJsonPath = Join-Path $outDir  "DNSAudit-Errors-$timestamp.json"
+    $recHtmlPath = Join-Path $htmlDir "DNS-Recommendations-$timestamp.html"
+    $recTxtPath  = Join-Path $txtDir  "DNS-Recommendations-$timestamp.txt"
+
+    # ----------------------------
+    # Server posture
+    # ----------------------------
+    $serverSettings = Safe-Get -Context "Server: Get-DnsServerSetting" -Default $null -Script {
+        Get-DnsServerSetting -ComputerName $ComputerName -ErrorAction Stop
+    }
+    $serverScavenging = Safe-Get -Context "Server: Get-DnsServerScavenging" -Default $null -Script {
+        Get-DnsServerScavenging -ComputerName $ComputerName -ErrorAction Stop
+    }
+    $serverForwarders = Safe-Get -Context "Server: Get-DnsServerForwarder" -Default $null -Script {
+        Get-DnsServerForwarder -ComputerName $ComputerName -ErrorAction Stop
+    }
+    $serverDiagnostics = Safe-Get -Context "Server: Get-DnsServerDiagnostics" -Default $null -Script {
+        Get-DnsServerDiagnostics -ComputerName $ComputerName -ErrorAction Stop
+    }
+    $serverCache = Safe-Get -Context "Server: Get-DnsServerCache" -Default $null -Script {
+        Get-DnsServerCache -ComputerName $ComputerName -ErrorAction Stop
+    }
+
+    $serverPosture = [pscustomobject]@{
+        TargetDnsServer        = $ComputerName
+        Generated              = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        RunAs                  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        PowerShellVersion      = $PSVersionTable.PSVersion.ToString()
+        OSVersion              = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Version -ErrorAction SilentlyContinue)
+        DnsServerModuleVersion = $dnsModule.Version.ToString()
+
+        IsDsAvailable          = Get-Prop $serverInfo 'DsAvailable' $null
+        Recursion              = Get-Prop $serverSettings 'EnableRecursion' (Get-Prop $serverInfo 'EnableRecursion' $null)
+
+        Forwarders             = Convert-ServerListToString (Get-Prop $serverForwarders 'IPAddress' (Get-Prop $serverForwarders 'IPAddresses' $null))
+        ForwarderTimeoutSec    = Get-Prop $serverForwarders 'Timeout' $null
+        ForwarderUseRootHints  = Get-Prop $serverForwarders 'UseRootHint' $null
+
+        ScavengingEnabled      = Get-Prop $serverScavenging 'ScavengingState' $null
+        ScavRefreshInterval    = Safe-Get -Context "Server: Scav RefreshInterval stringify" -Default $null -Script { [string](Get-Prop $serverScavenging 'RefreshInterval' $null) }
+        ScavNoRefreshInterval  = Safe-Get -Context "Server: Scav NoRefreshInterval stringify" -Default $null -Script { [string](Get-Prop $serverScavenging 'NoRefreshInterval' $null) }
+
+        CacheMaxTTL            = Safe-Get -Context "Server: Cache MaxTTL stringify" -Default $null -Script { [string](Get-Prop $serverCache 'MaxTTL' $null) }
+        CacheMaxNegativeTTL    = Safe-Get -Context "Server: Cache MaxNegativeTTL stringify" -Default $null -Script { [string](Get-Prop $serverCache 'MaxNegativeTTL' $null) }
+
+        Diagnostics            = if ($serverDiagnostics) { "Available" } else { "Not available" }
+    }
+
+    function Get-ServerIssuesAndRisk {
+        param([pscustomobject]$Posture)
+
+        $issues = @()
+        $reco   = @()
+        $riskScore = 0
+
+        if ($Posture.Recursion -eq $true) {
+            $issues += "Server recursion: enabled (review exposure)."
+            $reco   += "Confirm the server is not exposed to untrusted networks. Restrict access via firewall/interface binding/allow-lists."
+            $riskScore += 2
+        }
+        if (-not $Posture.Forwarders) {
+            $issues += "Forwarders: none detected."
+            $reco   += "If external resolution is required, configure forwarders to approved resolvers; otherwise document intent."
+            $riskScore += 1
+        }
+        if ($Posture.ScavengingEnabled -ne $true) {
+            $issues += "Server scavenging: disabled or unknown."
+            $reco   += "If using dynamic zones, enable scavenging at server level and validate zone aging intervals."
+            $riskScore += 1
+        }
+
+        $riskLevel = if ($riskScore -ge 5) { 'High' } elseif ($riskScore -ge 2) { 'Medium' } else { 'Low' }
+
+        [pscustomobject]@{
+            RiskScore       = $riskScore
+            RiskLevel       = $riskLevel
+            Issues          = $issues
+            Recommendations = $reco
+        }
+    }
+
+    # ----------------------------
+    # Zone helpers
+    # ----------------------------
+    function Get-ZoneAgingSummary {
+        param([string]$ZoneName)
+
+        $aging = Safe-Get -Context "Zone '$ZoneName': Get-DnsServerZoneAging" -Default $null -Script {
+            Get-DnsServerZoneAging -ComputerName $ComputerName -ZoneName $ZoneName -ErrorAction Stop
+        }
+
+        if (-not $aging) {
+            return [pscustomobject]@{
+                AgingEnabled         = $null
+                RefreshInterval      = $null
+                NoRefreshInterval    = $null
+                AvailForScavengeTime = $null
+                ScavengeServers      = $null
+                AgingNote            = "Aging/Scavenging info not available."
+            }
+        }
+
+        [pscustomobject]@{
+            AgingEnabled         = Get-Prop $aging 'AgingEnabled' $null
+            RefreshInterval      = Format-TimeSpan (Get-Prop $aging 'RefreshInterval' $null)
+            NoRefreshInterval    = Format-TimeSpan (Get-Prop $aging 'NoRefreshInterval' $null)
+            AvailForScavengeTime = Safe-Get -Context "Zone '$ZoneName': AvailForScavengeTime stringify" -Default $null -Script { (Get-Prop $aging 'AvailForScavengeTime' $null).ToString() }
+            ScavengeServers      = Convert-ServerListToString (Get-Prop $aging 'ScavengeServers' $null)
+            AgingNote            = $null
+        }
+    }
+
+    function Get-ZoneTransferEvidence {
+        param([object]$ZoneDetails)
+
+        [pscustomobject]@{
+            ZoneTransferType  = Get-Prop $ZoneDetails 'ZoneTransferType' $null
+            SecureSecondaries = Get-Prop $ZoneDetails 'SecureSecondaries' $null
+            Notify            = Get-Prop $ZoneDetails 'Notify' $null
+            NotifyServers     = Convert-ServerListToString (Get-Prop $ZoneDetails 'NotifyServers' $null)
+            SecondaryServers  = Convert-ServerListToString (Get-Prop $ZoneDetails 'SecondaryServers' $null)
+            MasterServers     = Convert-ServerListToString (Get-Prop $ZoneDetails 'MasterServers' $null)
+            TransferNote      = $null
+        }
+    }
+
+    function Get-ZoneRecordCounts {
+        param([string]$ZoneName)
+
+        if (-not $script:IncludeRecordCounts) {
+            return [pscustomobject]@{
+                TotalRecords    = $null
+                A=$null; AAAA=$null; CNAME=$null; MX=$null; NS=$null; SRV=$null; TXT=$null; PTR=$null
+                RecordCountNote = "Record counting disabled."
+            }
+        }
+
+        if ($script:PreferZoneStatistics) {
+            $zs = Safe-Get -Context "Zone '$ZoneName': Get-DnsServerZoneStatistics" -Default $null -Script {
+                Get-DnsServerZoneStatistics -ComputerName $ComputerName -ZoneName $ZoneName -ErrorAction Stop
+            }
+            if ($zs) {
+                return [pscustomobject]@{
+                    TotalRecords    = Get-Prop $zs 'TotalRecordCount' (Get-Prop $zs 'RecordCount' $null)
+                    A               = Get-Prop $zs 'ARecordCount' $null
+                    AAAA            = Get-Prop $zs 'AAAARecordCount' $null
+                    CNAME           = Get-Prop $zs 'CNAMERecordCount' $null
+                    MX              = Get-Prop $zs 'MXRecordCount' $null
+                    NS              = Get-Prop $zs 'NSRecordCount' $null
+                    SRV             = Get-Prop $zs 'SRVRecordCount' $null
+                    TXT             = Get-Prop $zs 'TXTRecordCount' $null
+                    PTR             = Get-Prop $zs 'PTRRecordCount' $null
+                    RecordCountNote = "Counts from Get-DnsServerZoneStatistics (best-effort)."
+                }
+            }
+        }
+
+        $recs = Safe-Get -Context "Zone '$ZoneName': Get-DnsServerResourceRecord (enumeration)" -Default $null -Script {
+            Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -ErrorAction Stop
+        }
+        if (-not $recs) {
+            return [pscustomobject]@{
+                TotalRecords    = $null
+                A=$null; AAAA=$null; CNAME=$null; MX=$null; NS=$null; SRV=$null; TXT=$null; PTR=$null
+                RecordCountNote = "Record counting failed (permissions/size/zone type)."
+            }
+        }
+
+        $arr = @($recs)
+        $truncated = $false
+        if ($script:RecordCountMaxRecords -gt 0 -and $arr.Count -gt $script:RecordCountMaxRecords) {
+            $arr = $arr[0..($script:RecordCountMaxRecords-1)]
+            $truncated = $true
+        }
+
+        $byType = $arr | Group-Object -Property RecordType -NoElement
+
+        function Count-Type([string]$t, $groups) {
+            $g = $groups | Where-Object Name -eq $t | Select-Object -First 1
+            if ($g) { return [int]$g.Count }
+            return 0
+        }
+
+        [pscustomobject]@{
+            TotalRecords    = ($arr | Measure-Object).Count
+            A               = (Count-Type 'A' $byType)
+            AAAA            = (Count-Type 'AAAA' $byType)
+            CNAME           = (Count-Type 'CNAME' $byType)
+            MX              = (Count-Type 'MX' $byType)
+            NS              = (Count-Type 'NS' $byType)
+            SRV             = (Count-Type 'SRV' $byType)
+            TXT             = (Count-Type 'TXT' $byType)
+            PTR             = (Count-Type 'PTR' $byType)
+            RecordCountNote = if ($truncated) { "Counts truncated to first $($script:RecordCountMaxRecords) records (safety cap)." } else { $null }
+        }
+    }
+
+    function Get-ZoneIssuesAndRisk {
+        param([pscustomobject]$ZoneRow, [pscustomobject]$ServerPosture)
+
+        $issues = @()
+        $reco   = @()
+        $riskScore = 0
+        $factors = @()
+
+        if ($null -eq $ZoneRow.DynamicUpdate) {
+            $issues += "Dynamic updates: unknown (property not available)."
+            $reco   += "Verify zone dynamic update setting in DNS Manager (Zone Properties -> General)."
+            $riskScore += 1
+            $factors += "DU=Unknown"
+        } else {
+            switch ([string]$ZoneRow.DynamicUpdate) {
+                'Secure' { $factors += "DU=Secure" }
+                'None'   {
+                    $issues += "Dynamic updates: disabled."
+                    $reco   += "If this zone must accept registrations, enable Secure dynamic updates (AD-integrated recommended)."
+                    $riskScore += 1
+                    $factors += "DU=None"
+                }
+                default  {
+                    $issues += "Dynamic updates: non-secure updates allowed."
+                    $reco   += "Set dynamic updates to Secure (especially on AD-integrated zones)."
+                    $riskScore += 5
+                    $factors += "DU=NonSecure"
+                }
+            }
+        }
+
+        if ($ZoneRow.IsDsIntegrated -ne $true) {
+            $issues += "Zone is not AD-integrated."
+            $reco   += "If this is an internal zone, consider AD-integrated for secure updates and replication benefits."
+            $riskScore += 2
+            $factors += "ADI=No"
+        } else {
+            $factors += "ADI=Yes"
+        }
+
+        if ($ZoneRow.ZoneTransferType -and ($ZoneRow.ZoneTransferType -match 'Any')) {
+            $issues += "Zone transfers: allowed to any server."
+            $reco   += "Restrict zone transfers to explicit authorized secondaries or IP allow-lists."
+            $riskScore += 5
+            $factors += "XFR=Any"
+        } elseif ($ZoneRow.SecureSecondaries -ne $null -and $ZoneRow.SecureSecondaries -eq $false) {
+            $issues += "Zone transfer security (SecureSecondaries) is disabled."
+            $reco   += "Restrict zone transfers (secure secondaries / explicit allow-list)."
+            $riskScore += 3
+            $factors += "XFR=Insecure"
+        }
+
+        if ($ZoneRow.AgingEnabled -eq $false) {
+            $issues += "Aging/Scavenging: disabled."
+            $reco   += "Enable aging where appropriate and validate refresh/no-refresh intervals."
+            $riskScore += 2
+            $factors += "Aging=Off"
+        } elseif ($ZoneRow.AgingEnabled -eq $true -and $ServerPosture.ScavengingEnabled -ne $true) {
+            $issues += "Zone aging enabled but server scavenging appears disabled/unknown."
+            $reco   += "Enable scavenging at server level or validate intended posture."
+            $riskScore += 1
+            $factors += "Scav=Mismatch"
+        }
+
+        $riskLevel = if ($riskScore -ge 7) { 'High' } elseif ($riskScore -ge 3) { 'Medium' } else { 'Low' }
+
+        [pscustomobject]@{
+            RiskScore       = $riskScore
+            RiskLevel       = $riskLevel
+            Issues          = $issues
+            Recommendations = $reco
+            RiskFactors     = $factors
+        }
+    }
+
+    # ----------------------------
+    # Recommendations report generator
+    # ----------------------------
+    $RecommendationDisclaimer = @"
+Recommendations disclaimer:
+These recommendations are based on information from Microsoft and general DNS/AD best practices.
+Technicians must take into consideration their own:
+- best practices and operational standards
+- internal policies and compliance requirements
+- risk assessments and threat models
+- change management procedures and service impact
+before implementing any changes.
+"@
+
+    function Build-Recommendations {
+        param(
+            [pscustomobject]$ServerPosture,
+            [pscustomobject]$ServerRisk,
+            [array]$Rows
+        )
+
+        $items = New-Object System.Collections.Generic.List[object]
+
+        if ($ServerPosture.Recursion -eq $true) {
+            $items.Add([pscustomobject]@{
+                Priority = "Medium"
+                Area = "Server"
+                Topic = "Recursion exposure"
+                Evidence = "Recursion enabled = $($ServerPosture.Recursion)"
+                Recommendation = "Ensure the DNS server is not exposed to untrusted networks. Restrict client access via firewall/interface binding/allow-lists and document allowed resolvers."
+            }) | Out-Null
+        }
+
+        if (-not $ServerPosture.Forwarders) {
+            $items.Add([pscustomobject]@{
+                Priority = "Low"
+                Area = "Server"
+                Topic = "Forwarders"
+                Evidence = "Forwarders not detected"
+                Recommendation = "If external resolution is required, configure forwarders to approved resolvers. If not required, document the design (e.g., root hints in controlled networks)."
+            }) | Out-Null
+        }
+
+        if ($ServerPosture.ScavengingEnabled -ne $true) {
+            $items.Add([pscustomobject]@{
+                Priority = "Low"
+                Area = "Server"
+                Topic = "Scavenging"
+                Evidence = "Server scavenging state = $($ServerPosture.ScavengingEnabled)"
+                Recommendation = "If dynamic DNS is used, enable scavenging at server level and validate zone aging intervals to reduce stale records."
+            }) | Out-Null
+        }
+
+        $hasNonSecureDU = ($Rows | Where-Object { $_.Issues -match 'non-secure updates' } | Select-Object -First 1)
+        if ($hasNonSecureDU) {
+            $items.Add([pscustomobject]@{
+                Priority = "High"
+                Area = "Zones"
+                Topic = "Non-secure dynamic updates"
+                Evidence = "At least one zone allows non-secure dynamic updates"
+                Recommendation = "Set dynamic updates to Secure on AD-integrated zones. Avoid non-secure updates unless justified by a documented exception and compensating controls."
+            }) | Out-Null
+        }
+
+        $hasAnyXfr = ($Rows | Where-Object { $_.Issues -match 'Zone transfers: allowed to any' } | Select-Object -First 1)
+        if ($hasAnyXfr) {
+            $items.Add([pscustomobject]@{
+                Priority = "High"
+                Area = "Zones"
+                Topic = "Zone transfers to any"
+                Evidence = "At least one zone appears to allow transfers to any server"
+                Recommendation = "Restrict zone transfers to explicit authorized secondaries or IP allow-lists. Review Notify settings and validate secondaries."
+            }) | Out-Null
+        }
+
+        $hasAgingOff = ($Rows | Where-Object { $_.Issues -match 'Aging/Scavenging: disabled' } | Select-Object -First 1)
+        if ($hasAgingOff) {
+            $items.Add([pscustomobject]@{
+                Priority = "Medium"
+                Area = "Zones"
+                Topic = "Aging disabled"
+                Evidence = "At least one zone has aging/scavenging disabled"
+                Recommendation = "Enable aging where appropriate and ensure refresh/no-refresh intervals align with operational needs. Validate scavenging impact prior to enabling."
+            }) | Out-Null
+        }
+
+        $items.Add([pscustomobject]@{
+            Priority = "Medium"
+            Area = "Baseline"
+            Topic = "Least privilege and auditing"
+            Evidence = "Administrative control of DNS is high impact"
+            Recommendation = "Use least-privilege admin groups and enable auditing/monitoring for DNS changes. Separate duties where possible."
+        }) | Out-Null
+
+        $items.Add([pscustomobject]@{
+            Priority = "Medium"
+            Area = "Baseline"
+            Topic = "Patch and hardening"
+            Evidence = "DNS is critical infrastructure"
+            Recommendation = "Keep DNS servers patched, restrict management access, and baseline configuration against Microsoft security guidance."
+        }) | Out-Null
+
+        $items
+    }
+
+    # ----------------------------
+    # Collect zones
+    # ----------------------------
+    $zones = Safe-Get -Context "Get-DnsServerZone -ComputerName $ComputerName" -Default @() -Script {
+        @(Get-DnsServerZone -ComputerName $ComputerName -ErrorAction Stop)
+    }
+
+    if (-not $script:IncludeSystemZones) {
+        $zones = @($zones | Where-Object { $_.IsAutoCreated -ne $true -and $_.ZoneName -notmatch '^TrustAnchors$' })
+    }
+
+    $serverRisk = Get-ServerIssuesAndRisk -Posture $serverPosture
+
+    $rows = @()
+    foreach ($z in $zones) {
+        $zn = $z.ZoneName
+        try {
+            $zoneDetails = Safe-Get -Context "Zone '$zn': Get-DnsServerZone -Name" -Default $z -Script {
+                Get-DnsServerZone -ComputerName $ComputerName -Name $zn -ErrorAction Stop
+            }
+
+            $aging  = Get-ZoneAgingSummary -ZoneName $zn
+            $xfr    = Get-ZoneTransferEvidence -ZoneDetails $zoneDetails
+            $counts = Get-ZoneRecordCounts -ZoneName $zn
+
+            $baseRow = [pscustomobject]@{
+                Server              = $ComputerName
+                ZoneName            = Get-Prop $zoneDetails 'ZoneName' $zn
+                ZoneType            = Get-Prop $zoneDetails 'ZoneType' $null
+                IsDsIntegrated      = Get-Prop $zoneDetails 'IsDsIntegrated' $null
+                ReplicationScope    = Get-Prop $zoneDetails 'ReplicationScope' $null
+                IsReverseLookupZone = Get-Prop $zoneDetails 'IsReverseLookupZone' $null
+                IsAutoCreated       = Get-Prop $zoneDetails 'IsAutoCreated' $null
+                DynamicUpdate       = Get-Prop $zoneDetails 'DynamicUpdate' $null
+
+                ZoneTransferType    = $xfr.ZoneTransferType
+                SecureSecondaries   = $xfr.SecureSecondaries
+                Notify              = $xfr.Notify
+                NotifyServers       = $xfr.NotifyServers
+                SecondaryServers    = $xfr.SecondaryServers
+                MasterServers       = $xfr.MasterServers
+
+                AgingEnabled        = $aging.AgingEnabled
+                NoRefreshInterval   = $aging.NoRefreshInterval
+                RefreshInterval     = $aging.RefreshInterval
+                AvailForScavengeTime= $aging.AvailForScavengeTime
+                ScavengeServers     = $aging.ScavengeServers
+
+                TotalRecords        = $counts.TotalRecords
+                A                   = $counts.A
+                AAAA                = $counts.AAAA
+                CNAME               = $counts.CNAME
+                MX                  = $counts.MX
+                NS                  = $counts.NS
+                SRV                 = $counts.SRV
+                TXT                 = $counts.TXT
+                PTR                 = $counts.PTR
+
+                Notes               = ((@($aging.AgingNote, $counts.RecordCountNote, $xfr.TransferNote) | Where-Object { $_ }) -join ' | ')
+            }
+
+            $risk = Get-ZoneIssuesAndRisk -ZoneRow $baseRow -ServerPosture $serverPosture
+
+            $rows += [pscustomobject]@{
+                Server              = $baseRow.Server
+                ZoneName            = $baseRow.ZoneName
+                ZoneType            = $baseRow.ZoneType
+                IsDsIntegrated      = $baseRow.IsDsIntegrated
+                ReplicationScope    = $baseRow.ReplicationScope
+                IsReverseLookupZone = $baseRow.IsReverseLookupZone
+                DynamicUpdate       = $baseRow.DynamicUpdate
+
+                ZoneTransferType    = $baseRow.ZoneTransferType
+                SecureSecondaries   = $baseRow.SecureSecondaries
+                Notify              = $baseRow.Notify
+                NotifyServers       = $baseRow.NotifyServers
+                SecondaryServers    = $baseRow.SecondaryServers
+                MasterServers       = $baseRow.MasterServers
+
+                AgingEnabled        = $baseRow.AgingEnabled
+                NoRefreshInterval   = $baseRow.NoRefreshInterval
+                RefreshInterval     = $baseRow.RefreshInterval
+                AvailForScavengeTime= $baseRow.AvailForScavengeTime
+                ScavengeServers     = $baseRow.ScavengeServers
+
+                TotalRecords        = $baseRow.TotalRecords
+                A                   = $baseRow.A
+                AAAA                = $baseRow.AAAA
+                CNAME               = $baseRow.CNAME
+                MX                  = $baseRow.MX
+                NS                  = $baseRow.NS
+                SRV                 = $baseRow.SRV
+                TXT                 = $baseRow.TXT
+                PTR                 = $baseRow.PTR
+
+                RiskLevel           = $risk.RiskLevel
+                RiskScore           = $risk.RiskScore
+                RiskFactors         = ($risk.RiskFactors -join ';')
+                Issues              = ($risk.Issues -join ' | ')
+                Recommendations     = ($risk.Recommendations -join ' | ')
+                Notes               = $baseRow.Notes
+
+                _IssueList          = $risk.Issues
+                _RecoList           = $risk.Recommendations
+                _RiskFactorList     = $risk.RiskFactors
+            }
+        }
+        catch {
+            $script:ZoneFailures += [pscustomobject]@{
+                ZoneName = $zn
+                Error    = $_.Exception.Message
+                Type     = $_.Exception.GetType().FullName
+            }
+            if (-not $script:FailSoft) { throw }
+        }
+    }
+
+    # ----------------------------
+    # Summary + top findings
+    # ----------------------------
+    $totalZones = ($rows | Measure-Object).Count
+    $high   = ($rows | Where-Object RiskLevel -eq 'High'   | Measure-Object).Count
+    $medium = ($rows | Where-Object RiskLevel -eq 'Medium' | Measure-Object).Count
+    $low    = ($rows | Where-Object RiskLevel -eq 'Low'    | Measure-Object).Count
+
+    $topFindings = $rows |
+        ForEach-Object { $_._IssueList } |
+        Where-Object { $_ } |
+        ForEach-Object { $_ } |
+        Group-Object |
+        Sort-Object Count -Descending |
+        Select-Object -First 10
+
+    # ----------------------------
+    # Recommendations report
+    # ----------------------------
+    $recommendations = Build-Recommendations -ServerPosture $serverPosture -ServerRisk $serverRisk -Rows $rows
+
+    # TXT
+    $recTxt = @()
+    $recTxt += "DNS Recommendations Report"
+    $recTxt += "Target DNS server: $ComputerName"
+    $recTxt += "Generated: $($serverPosture.Generated)"
+    $recTxt += ""
+    $recTxt += $RecommendationDisclaimer.Trim()
+    $recTxt += ""
+    $recTxt += "Recommendations:"
+    $recTxt += ($recommendations | ForEach-Object {
+        "- [$($_.Priority)] $($_.Area) - $($_.Topic)`r`n  Evidence: $($_.Evidence)`r`n  Recommendation: $($_.Recommendation)"
+    })
+    $recTxt -join "`r`n" | Set-Content -Encoding UTF8 -Path $recTxtPath
+
+    # HTML
+    $recCss = @"
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 18px; }
+.small { color: #555; font-size: 0.95em; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+th { background: #f3f3f3; }
+.pri-high { background: #ffd6d6; }
+.pri-medium { background: #fff2cc; }
+.pri-low { background: #d9ead3; }
+</style>
+"@
+
+    $recRowsHtml = ($recommendations | ForEach-Object {
+        $cls = switch ($_.Priority) { 'High' { 'pri-high' } 'Medium' { 'pri-medium' } default { 'pri-low' } }
+        "<tr class='$cls'><td>$($_.Priority)</td><td>$($_.Area)</td><td>$($_.Topic)</td><td>$($_.Evidence)</td><td>$($_.Recommendation)</td></tr>"
+    }) -join "`r`n"
+
+@"
+$recCss
+<h1>DNS Recommendations Report</h1>
+<div class="small">
+<b>Target DNS server:</b> $ComputerName<br/>
+<b>Generated:</b> $($serverPosture.Generated)
+</div>
+
+<h2>Disclaimer</h2>
+<div class="small">
+$($RecommendationDisclaimer.Trim() -replace "`r?`n","<br/>")
+</div>
+
+<h2>Recommendations</h2>
+<table>
+<tr><th>Priority</th><th>Area</th><th>Topic</th><th>Evidence</th><th>Recommendation</th></tr>
+$recRowsHtml
+</table>
+"@ | Set-Content -Encoding UTF8 -Path $recHtmlPath
+
+    # ----------------------------
+    # Write audit outputs
+    # ----------------------------
+    $rows |
+        Sort-Object -Property @{Expression="RiskScore";Descending=$true}, @{Expression="ZoneName";Descending=$false} |
+        Select-Object Server,ZoneName,ZoneType,IsDsIntegrated,ReplicationScope,IsReverseLookupZone,DynamicUpdate,
+                      ZoneTransferType,SecureSecondaries,Notify,NotifyServers,SecondaryServers,MasterServers,
+                      AgingEnabled,NoRefreshInterval,RefreshInterval,AvailForScavengeTime,ScavengeServers,
+                      TotalRecords,A,AAAA,CNAME,MX,NS,SRV,TXT,PTR,
+                      RiskLevel,RiskScore,RiskFactors,Issues,Recommendations,Notes |
+        Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csvPath
+
+    $jsonObj = [pscustomobject]@{
+        ServerPosture = $serverPosture
+        ServerRisk    = $serverRisk
+        Summary       = [pscustomobject]@{
+            ZonesTotal      = $totalZones
+            HighRiskZones   = $high
+            MediumRiskZones = $medium
+            LowRiskZones    = $low
+            ZoneFailures    = ($script:ZoneFailures | Measure-Object).Count
+        }
+        TopFindings   = @($topFindings | Select-Object Name, Count)
+        Zones         = @(
+            $rows | ForEach-Object {
+                [pscustomobject]@{
+                    Server              = $_.Server
+                    ZoneName            = $_.ZoneName
+                    ZoneType            = $_.ZoneType
+                    IsDsIntegrated      = $_.IsDsIntegrated
+                    ReplicationScope    = $_.ReplicationScope
+                    IsReverseLookupZone = $_.IsReverseLookupZone
+                    DynamicUpdate       = $_.DynamicUpdate
+                    ZoneTransferType    = $_.ZoneTransferType
+                    SecureSecondaries   = $_.SecureSecondaries
+                    Notify              = $_.Notify
+                    NotifyServers       = $_.NotifyServers
+                    SecondaryServers    = $_.SecondaryServers
+                    MasterServers       = $_.MasterServers
+                    AgingEnabled        = $_.AgingEnabled
+                    NoRefreshInterval   = $_.NoRefreshInterval
+                    RefreshInterval     = $_.RefreshInterval
+                    AvailForScavengeTime= $_.AvailForScavengeTime
+                    ScavengeServers     = $_.ScavengeServers
+                    TotalRecords        = $_.TotalRecords
+                    A                   = $_.A
+                    AAAA                = $_.AAAA
+                    CNAME               = $_.CNAME
+                    MX                  = $_.MX
+                    NS                  = $_.NS
+                    SRV                 = $_.SRV
+                    TXT                 = $_.TXT
+                    PTR                 = $_.PTR
+                    RiskLevel           = $_.RiskLevel
+                    RiskScore           = $_.RiskScore
+                    RiskFactors         = $_._RiskFactorList
+                    Issues              = $_._IssueList
+                    Recommendations     = $_._RecoList
+                    Notes               = $_.Notes
+                }
+            }
+        )
+        Recommendations = @($recommendations)
+        Failures        = @($script:ZoneFailures)
+        CollectionErrors= @($script:CollectionErrors)
+    }
+
+    $jsonObj | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 -Path $jsonPath
+
+    if ($script:WriteErrorReport) {
+        [pscustomobject]@{
+            ZoneFailures     = @($script:ZoneFailures)
+            CollectionErrors = @($script:CollectionErrors)
+        } | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 -Path $errJsonPath
+    }
+
+    # ----------------------------
+    # HTML audit report
+    # ----------------------------
+    $css = @"
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 18px; }
+h1,h2 { margin-bottom: 6px; }
+.small { color: #555; font-size: 0.95em; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.9em; }
+.high { background: #ffd6d6; border: 1px solid #c40000; }
+.medium { background: #fff2cc; border: 1px solid #b38f00; }
+.low { background: #d9ead3; border: 1px solid #2d7d2d; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+th { background: #f3f3f3; position: sticky; top: 0; }
+</style>
+"@
+
+    $serverSummaryHtml = @"
+<table>
+<tr><th>Field</th><th>Value</th></tr>
+<tr><td>TargetDnsServer</td><td>$($serverPosture.TargetDnsServer)</td></tr>
+<tr><td>Generated</td><td>$($serverPosture.Generated)</td></tr>
+<tr><td>RunAs</td><td>$($serverPosture.RunAs)</td></tr>
+<tr><td>PowerShellVersion</td><td>$($serverPosture.PowerShellVersion)</td></tr>
+<tr><td>OSVersion</td><td>$($serverPosture.OSVersion)</td></tr>
+<tr><td>DnsServerModuleVersion</td><td>$($serverPosture.DnsServerModuleVersion)</td></tr>
+<tr><td>Recursion</td><td>$($serverPosture.Recursion)</td></tr>
+<tr><td>Forwarders</td><td>$($serverPosture.Forwarders)</td></tr>
+<tr><td>ScavengingEnabled</td><td>$($serverPosture.ScavengingEnabled)</td></tr>
+</table>
+"@
+
+    $serverRiskHtml = @"
+<div class="small">
+<b>Server risk:</b>
+<span class="badge $($serverRisk.RiskLevel.ToLower())">$($serverRisk.RiskLevel)</span>
+Score=$($serverRisk.RiskScore)<br/>
+<b>Issues:</b> $([string]::Join(' | ', $serverRisk.Issues))<br/>
+<b>Recommendations:</b> $([string]::Join(' | ', $serverRisk.Recommendations))
+</div>
+"@
+
+    $zonesTable = $rows |
+        Sort-Object -Property @{Expression="RiskScore";Descending=$true}, @{Expression="ZoneName";Descending=$false} |
+        Select-Object ZoneName, ZoneType, IsDsIntegrated, ReplicationScope, DynamicUpdate,
+                      ZoneTransferType, SecureSecondaries, Notify, NotifyServers, SecondaryServers,
+                      AgingEnabled, NoRefreshInterval, RefreshInterval,
+                      TotalRecords, RiskLevel, RiskScore, RiskFactors, Issues, Recommendations, Notes
+
+    $zonesHtml = ($zonesTable | ConvertTo-Html -Fragment) `
+        -replace '<td>High</td>','<td><span class="badge high">High</span></td>' `
+        -replace '<td>Medium</td>','<td><span class="badge medium">Medium</span></td>' `
+        -replace '<td>Low</td>','<td><span class="badge low">Low</span></td>'
+
+    $findingsHtml = (($topFindings | Select-Object Name, Count) | ConvertTo-Html -Fragment)
+
+@"
+$css
+<h1>DNS Audit Report</h1>
+<div class="small">
+<b>Target DNS server:</b> $ComputerName<br/>
+<b>Zones:</b> Total=$totalZones, High=$high, Medium=$medium, Low=$low<br/>
+<b>Recommendations report:</b> DNS-Recommendations-$timestamp.html
+</div>
+
+<h2>Server posture</h2>
+$serverSummaryHtml
+$serverRiskHtml
+
+<h2>Top findings</h2>
+$findingsHtml
+
+<h2>Zone details</h2>
+$zonesHtml
+"@ | Set-Content -Encoding UTF8 -Path $htmlPath
+
+    Write-Host "Report generated:"
+    Write-Host "  Target DNS:      $ComputerName"
+    Write-Host "  Reports folder:  $outDir"
+    Write-Host "  HTML folder:     $htmlDir"
+    Write-Host "  TXT folder:      $txtDir"
+    Write-Host "  Audit HTML:      $htmlPath"
+    Write-Host "  Audit CSV:       $csvPath"
+    Write-Host "  Audit JSON:      $jsonPath"
+    Write-Host "  Reco HTML:       $recHtmlPath"
+    Write-Host "  Reco TXT:        $recTxtPath"
+    if ($script:WriteErrorReport) { Write-Host "  ERR JSON:        $errJsonPath" }
+}
+
+# Backward-compatible wrapper (older call site in this script)
+function Invoke-DNSZoneReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$OutputRoot,
+        [switch]$IncludeRecordCounts,
+        [switch]$IncludeSystemZones
+    )
+    Invoke-DnsZonePostureReport -OutputRoot $OutputRoot -IncludeRecordCounts:$IncludeRecordCounts -IncludeSystemZones:$IncludeSystemZones
+}
+
+#endregion DNS Zone Posture Report
+
+
+
+
+#region Delegated Permissions Report (merged)
+function Invoke-DelegatedPermissionsReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$OutputRoot,
+        [switch]$IncludeSystemTrustees,
+        [switch]$IncludeDeny,
+        [switch]$IncludeInherited,
+        [string]$Server
+    )
+
+    # Embedded from Deligated_Permissions.ps1 (working version)
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    # Timestamped folders
+    $ts   = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $base = Join-Path $OutputRoot "ADAudit_Reports_$ts"
+    $ouDir  = Join-Path $base 'OUs'
+    $allDir = Join-Path $base 'All'
+    New-Item -ItemType Directory -Path $base,$ouDir,$allDir -Force | Out-Null
+
+    # Transcript
+    $log = Join-Path $base "Transcript_$ts.txt"
+    try { Start-Transcript -Path $log -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+    # RootDSE and NCs
+    $rootDse  = if ($Server) { Get-ADRootDSE -Server $Server } else { Get-ADRootDSE }
+    $domainNC = $rootDse.defaultNamingContext
+    $schemaNC = $rootDse.schemaNamingContext
+    $configNC = $rootDse.configurationNamingContext
+
+    # Server-pinned ACL read to avoid referrals
+    function Get-AclForDn {
+      param([Parameter(Mandatory)][string]$Dn,[string]$Server)
+      if ($Server) {
+        $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$Server/$Dn")
+        $de.RefreshCache()
+        return $de.ObjectSecurity
+      } else {
+        return (Get-Acl -Path "AD:$Dn")
+      }
+    }
+
+    # Simple retry wrapper
+    function Invoke-Retry([scriptblock]$Script,[int]$Max=3,[int]$DelaySec=2){
+      for($i=1;$i -le $Max;$i++){
+        try { return & $Script } catch { if($i -eq $Max){ throw } Start-Sleep -Seconds $DelaySec }
+      }
+    }
+
+    # GUID cache: attributes, classes, extended rights, property sets
+    $guidCache = @{}
+
+    # Schema objects
+    $schemaObjects = if ($Server) {
+      Get-ADObject -Server $Server -SearchBase $schemaNC -LDAPFilter '(|(objectClass=classSchema)(objectClass=attributeSchema))' -Properties lDAPDisplayName,schemaIDGUID
+    } else {
+      Get-ADObject -SearchBase $schemaNC -LDAPFilter '(|(objectClass=classSchema)(objectClass=attributeSchema))' -Properties lDAPDisplayName,schemaIDGUID
+    }
+    foreach ($s in $schemaObjects) {
+      try { $g = [Guid]$s.schemaIDGUID; $guidCache[$g.Guid] = $s.lDAPDisplayName } catch {}
+    }
+
+    # Extended rights (controlAccessRight) in Configuration NC
+    $carObjects = if ($Server) {
+      Get-ADObject -Server $Server -SearchBase $configNC -LDAPFilter '(objectClass=controlAccessRight)' -Properties displayName,rightsGuid,cn
+    } else {
+      Get-ADObject -SearchBase $configNC -LDAPFilter '(objectClass=controlAccessRight)' -Properties displayName,rightsGuid,cn
+    }
+    foreach ($c in $carObjects) {
+      try {
+        $g = [Guid]$c.rightsGuid
+        $friendly = if ($c.displayName) { $c.displayName } else { $c.cn }
+        $guidCache[$g.Guid] = $friendly
+      } catch {}
+    }
+
+    function Resolve-GuidName {
+      param($GuidValue)
+      if (-not $GuidValue -or $GuidValue -eq [Guid]::Empty) { return $null }
+      try {
+        $g = [Guid]$GuidValue
+        if ($guidCache.ContainsKey($g.Guid)) { return $guidCache[$g.Guid] }
+        return $g.Guid
+      } catch {
+        return $GuidValue.ToString()
+      }
+    }
+
+    # Trustee classification
+    function Get-PrincipalType {
+      param([string]$Identity)
+      try {
+        $filter = "(|(sAMAccountName=$Identity)(distinguishedName=$Identity)(objectSid=$Identity))"
+        $obj = if ($Server) {
+          Get-ADObject -Server $Server -LDAPFilter $filter -Properties objectClass -ErrorAction Stop
+        } else {
+          Get-ADObject -LDAPFilter $filter -Properties objectClass -ErrorAction Stop
+        }
+        if ($obj.objectClass -contains 'group')     { return 'Group' }
+        if ($obj.objectClass -contains 'user')      { return 'User' }
+        if ($obj.objectClass -contains 'computer')  { return 'Computer' }
+        if ($obj.objectClass -contains 'foreignSecurityPrincipal') { return 'FSP' }
+      } catch {}
+      if ($Identity -match '^S-\d-\d+') { return 'SID' }
+      return 'WellKnownOrExternal'
+    }
+
+    # Canonical path helper
+    function Get-Canonical {
+      param([string]$Dn)
+      try {
+        $p = @{ Identity=$Dn; Properties='CanonicalName'; ErrorAction='Stop' }
+        if ($Server) { $p['Server'] = $Server }
+        (Get-ADObject @p).CanonicalName
+      } catch { $null }
+    }
+
+    # Built-in trustees to optionally suppress
+    $systemTrustees = @(
+      'NT AUTHORITY\SELF',
+      'NT AUTHORITY\Authenticated Users',
+      'NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS',
+      'NT AUTHORITY\Everyone',
+      'BUILTIN\Administrators',
+      'NT AUTHORITY\SYSTEM'
+    )
+
+    # Scope discovery
+    $ouParams = @{ Filter='*'; Properties=@('DistinguishedName','Name') }
+    if ($Server) { $ouParams['Server'] = $Server }
+    $OUs = Get-ADOrganizationalUnit @ouParams
+
+    $scopes = New-Object 'System.Collections.Generic.List[string]'
+    [void]$scopes.Add($domainNC)
+    $OUs | ForEach-Object { [void]$scopes.Add($_.DistinguishedName) }
+
+    $wellKnownContainers = @(
+"@CN=Users,$domainNC",
+"@CN=Computers,$domainNC",
+"@CN=System,$domainNC",
+"@CN=Managed Service Accounts,$domainNC"
+    ) | Where-Object { Test-Path "AD:$_" }
+    $wellKnownContainers | ForEach-Object { [void]$scopes.Add($_) }
+
+    $adminSDHolder = "CN=AdminSDHolder,CN=System,$domainNC"
+    if (Test-Path "AD:$adminSDHolder") { [void]$scopes.Add($adminSDHolder) }
+
+    # Data store
+    $records = New-Object System.Collections.Generic.List[object]
+
+    # Iterate scopes and collect ACEs
+    foreach ($dn in $scopes) {
+      $scopeType = if ($dn -eq $domainNC) { 'Domain' }
+                   elseif ($dn -eq $adminSDHolder) { 'AdminSDHolder' }
+                   elseif ($wellKnownContainers -contains $dn) { 'Container' }
+                   else { 'OU' }
+
+      try {
+        $acl = Invoke-Retry { Get-AclForDn -Dn $dn -Server $Server }
+      } catch {
+        Write-Warning "ACL read failed: $dn. $_"
+        continue
+      }
+
+      foreach ($ace in $acl.Access) {
+        if (-not $IncludeInherited -and $ace.IsInherited) { continue }
+        if (-not $IncludeDeny -and $ace.AccessControlType -ne 'Allow') { continue }
+        $trustee = $ace.IdentityReference.Value
+        if (-not $IncludeSystemTrustees -and ($systemTrustees -contains $trustee)) { continue }
+
+        $objTypeName      = Resolve-GuidName $ace.ObjectType
+        $inheritedObjName = Resolve-GuidName $ace.InheritedObjectType
+
+        [void]$records.Add([pscustomobject]@{
+          ScopeDN               = $dn
+          CanonicalScope        = Get-Canonical $dn
+          ScopeType             = $scopeType
+          Trustee               = $trustee
+          TrusteeType           = Get-PrincipalType $trustee
+          AccessControlType     = $ace.AccessControlType
+          ActiveDirectoryRights = $ace.ActiveDirectoryRights
+          InheritanceType       = $ace.InheritanceType
+          AppliesToClass        = $inheritedObjName
+          AppliesToProperty     = $objTypeName
+          ObjectTypeGuid        = if ($ace.ObjectType -and $ace.ObjectType -ne [Guid]::Empty) { $ace.ObjectType } else { $null }
+          InheritedObjectGuid   = if ($ace.InheritedObjectType -and $ace.InheritedObjectType -ne [Guid]::Empty) { $ace.InheritedObjectType } else { $null }
+          IsInherited           = $ace.IsInherited
+          PropagationFlags      = $ace.PropagationFlags
+          InheritanceFlags      = $ace.InheritanceFlags
+        })
+      }
+
+      # Per-scope TXT summary grouped by trustee
+      $safeName = ($dn -replace '[=,]','_') -replace '[^\w\.-]','_'
+      $perScope = $records | Where-Object { $_.ScopeDN -eq $dn }
+      $txt = @()
+      $txt += "Delegated Permissions for ${scopeType}: $dn"
+      $txt += ('=' * 80)
+      foreach ($grp in ($perScope | Group-Object Trustee)) {
+        $first = $grp.Group | Select-Object -First 1
+        $txt += "Trustee: $($grp.Name)  [$($first.TrusteeType)]"
+        foreach ($r in $grp.Group) {
+          $txt += "  Rights: $($r.ActiveDirectoryRights)  Type: $($r.AccessControlType)"
+          if ($r.AppliesToClass)    { $txt += "  Class:    $($r.AppliesToClass)" }
+          if ($r.AppliesToProperty) { $txt += "  Property: $($r.AppliesToProperty)" }
+          $txt += "  Inheritance: $($r.InheritanceType)  InheritFlags: $($r.InheritanceFlags)  PropFlags: $($r.PropagationFlags)"
+        }
+        $txt += ""
+      }
+      $txtPath = Join-Path -Path $ouDir -ChildPath "ADAudit_$safeName.txt"
+      $txt -join [Environment]::NewLine | Out-File -FilePath $txtPath -Encoding UTF8
+      Write-Host "Wrote: $txtPath"
+    }
+
+    # De-duplicate identical ACE rows to reduce noise
+    $records = $records |
+      Sort-Object ScopeDN,Trustee,AccessControlType,ActiveDirectoryRights,AppliesToClass,AppliesToProperty,InheritanceType,IsInherited,ObjectTypeGuid,InheritedObjectGuid -Unique
+
+    # ------- Analytics and risk outputs (always generated) -------
+
+    # Windows LAPS + legacy LAPS attributes
+    $lapsAttributes = @('ms-Mcs-AdmPwd','ms-Mcs-AdmPwdExpirationTime','msLAPS-Password','msLAPS-PasswordExpirationTime')
+
+    $overDelegations = $records | Where-Object {
+      $_.ActiveDirectoryRights.ToString() -match 'GenericAll|WriteDacl|DeleteTree'
+    }
+    $accountOperators = $records | Where-Object { $_.Trustee -eq 'BUILTIN\Account Operators' }
+    $printOperators   = $records | Where-Object { $_.Trustee -eq 'BUILTIN\Print Operators' }
+    $exchangePattern  = 'Exchange Trusted Subsystem','Organization Management','Exchange Windows Permissions'
+    $exchangeDelegations = $records | Where-Object { $_.Trustee -in $exchangePattern }
+    $serviceAcctDelegations = $records | Where-Object {
+      $_.Trustee -match '^(svc|SVC)[\-_]' -or $_.Trustee -match 'DomainJoin' -or $_.Trustee -match 'DJ\b'
+    }
+    $unknownSids = @($records | Where-Object { $_.TrusteeType -eq 'SID' } | Select-Object -Expand Trustee | Sort-Object -Unique)
+    $membershipControl = $records | Where-Object {
+      $_.ActiveDirectoryRights.ToString() -match 'WriteProperty' -and $_.AppliesToProperty -eq 'member'
+    }
+    $preWin2k  = $records | Where-Object { $_.Trustee -eq 'Pre-Windows 2000 Compatible Access' }
+    $lapsRead  = $records | Where-Object {
+      $_.AppliesToProperty -in $lapsAttributes -and $_.ActiveDirectoryRights.ToString() -match 'ReadProperty|ExtendedRight'
+    }
+    $computerCreate = $records | Where-Object {
+      $_.ActiveDirectoryRights.ToString() -match 'CreateChild' -and ($_.AppliesToClass -match 'computer')
+    }
+
+    # Safe counts under StrictMode
+    $cntOver            = ($overDelegations      | Measure-Object).Count
+    $cntAcctOps         = ($accountOperators     | Measure-Object).Count
+    $cntPrintOps        = ($printOperators       | Measure-Object).Count
+    $cntExchange        = ($exchangeDelegations  | Measure-Object).Count
+    $cntSvc             = ($serviceAcctDelegations | Measure-Object).Count
+    $cntUnknownSids     = ($unknownSids          | Measure-Object).Count
+    $cntMemberCtrl      = ($membershipControl    | Measure-Object).Count
+    $cntPreWin2k        = ($preWin2k             | Measure-Object).Count
+    $cntLaps            = ($lapsRead             | Measure-Object).Count
+    $cntComputerCreate  = ($computerCreate       | Measure-Object).Count
+
+    # High-risk CSV
+    $highRisk = $records | Where-Object {
+      $_.ActiveDirectoryRights.ToString() -match 'GenericAll|WriteDacl|DeleteTree' -or
+      ($_.AppliesToProperty -in ($lapsAttributes + 'member') -and $_.ActiveDirectoryRights.ToString() -match 'WriteProperty|ReadProperty|ExtendedRight')
+    }
+    $highCsv = Join-Path -Path $allDir -ChildPath "ADAudit_HighRisk_$ts.csv"
+    $highRisk | Export-Csv -NoTypeInformation -Path $highCsv -Encoding UTF8
+    Write-Host "High-Risk CSV:  $highCsv"
+
+    # Risk assessment
+    $riskItems = @()
+    $riskItems += "Delegated Permissions Risk Assessment"
+    $riskItems += ('=' * 80)
+    $riskItems += "Timestamp: $(Get-Date -Format o)"
+    $riskItems += "Total ACE records analyzed: $($records.Count)"
+    $riskItems += ""
+    $riskItems += "1. Over-delegation (GenericAll / WriteDacl / DeleteTree): $cntOver"
+    if ($cntOver -gt 0) {
+      $sampleTrustees = ($overDelegations | Select-Object -Expand Trustee | Sort-Object -Unique | Select-Object -First 10) -join ', '
+      $riskItems += "   Sample trustees: $sampleTrustees"
+    }
+    $riskItems += "2. Account Operators present: $cntAcctOps  | Print Operators present: $cntPrintOps"
+    $riskItems += "3. Exchange broad delegations: $cntExchange"
+    $riskItems += "4. Service account elevated delegations: $cntSvc"
+    $riskItems += "5. Unknown / unresolved SIDs: $cntUnknownSids"
+    if ($cntUnknownSids -gt 0) { $riskItems += "   SIDs: $($unknownSids -join ', ')" }
+    $riskItems += "6. Group membership modification rights (WriteProperty member): $cntMemberCtrl"
+    $riskItems += "7. Legacy Pre-Windows 2000 Compatible Access ACEs: $cntPreWin2k"
+    $riskItems += "8. LAPS password read delegations: $cntLaps"
+    $riskItems += "9. Computer object creation rights (CreateChild on computer): $cntComputerCreate"
+    $riskItems += ""
+
+    $riskLevel = if ($cntOver -gt 50 -or $cntSvc -gt 30 -or $cntMemberCtrl -gt 40) { 'High' }
+                 elseif ($cntOver -gt 10 -or $cntSvc -gt 10) { 'Medium' }
+                 else { 'Low' }
+    $riskItems += "Overall qualitative risk level: $riskLevel"
+    $riskItems += ""
+    $riskItems += "Key Observations:"
+    if ($cntOver -gt 0)       { $riskItems += " - Broad rights (GenericAll/WriteDacl/DeleteTree) increase takeover and lateral movement risk." }
+    if ($cntAcctOps -gt 0)    { $riskItems += " - Account Operators delegation can indirectly create privileged paths; often should be empty." }
+    if ($cntExchange -gt 0)   { $riskItems += " - Exchange security groups hold rights beyond mail scope; review least privilege." }
+    if ($cntSvc -gt 0)        { $riskItems += " - Service accounts with write/create rights enable SPN abuse and escalation." }
+    if ($cntUnknownSids -gt 0){ $riskItems += " - Unknown SIDs may be orphaned or foreign; validate and remove if unnecessary." }
+    if ($cntMemberCtrl -gt 0) { $riskItems += " - Write access to group 'member' permits escalation via nesting." }
+    if ($cntComputerCreate -gt 0){ $riskItems += " - Excessive computer creation rights can enable RBCD abuse." }
+    if ($cntLaps -gt 0)       { $riskItems += " - LAPS password read delegations increase credential exposure." }
+    if ($cntPreWin2k -gt 0)   { $riskItems += " - Legacy read groups expand enumeration; prune if not required." }
+    $riskItems += ""
+
+    $riskPath = Join-Path $base 'ADAudit_RiskAssessment.txt'
+    $riskItems -join [Environment]::NewLine | Out-File -FilePath $riskPath -Encoding UTF8
+    Write-Host "Wrote: $riskPath"
+
+    # Recommendations (always generate)
+    $rec = @()
+    $rec += "Delegated Permissions Recommendations"
+    $rec += ('=' * 80)
+    $rec += "Prioritized Actions:"
+    $rec += " 1. Remove unnecessary GenericAll / WriteDacl / DeleteTree delegations."
+    $rec += " 2. Remove BUILTIN\Account Operators and Print Operators from OUs unless explicitly required."
+    $rec += " 3. Review Exchange-related ACLs; align with Microsoft minimums; eliminate GenericAll."
+    $rec += " 4. Resolve unknown SIDs; remove orphaned entries."
+    $rec += " 5. Enforce least privilege for service accounts (scoped rights, rotation, tiering)."
+    $rec += " 6. Restrict WriteProperty(member) to controlled group admins; isolate Tier0 groups."
+    $rec += " 7. Decommission Pre-Windows 2000 Compatible Access if no legacy need."
+    $rec += " 8. Harden Tier0 OUs: only Enterprise Admins / Domain Admins."
+    $rec += " 9. Constrain computer account creation to a dedicated join group with quota."
+    $rec += "10. Monitor ACL changes with auditing and alerts."
+    $rec += ""
+    $rec += "Microsoft Reference Links:"
+    $rec += " - AD DS security best practices: https://learn.microsoft.com/windows-server/identity/ad-ds/plan/security-best-practices"
+    $rec += " - AD partitions and naming contexts: https://learn.microsoft.com/windows/win32/ad/active-directory-partitions"
+    $rec += " - Control access rights (rightsGuid): https://learn.microsoft.com/windows/win32/ad/control-access-rights"
+    $rec += " - AdminSDHolder and protected groups: https://learn.microsoft.com/windows-server/identity/ad-ds/plan/security-best-practices#ad-protected-accounts-and-groups"
+    $rec += " - Windows LAPS overview: https://learn.microsoft.com/windows-server/identity/laps/laps-overview"
+    $rec += ""
+    $rec += "Disclaimer: Automated heuristic assessment; verify before remediation."
+    $recPath = Join-Path $base 'ADAudit_Recommendations.txt'
+    $rec -join [Environment]::NewLine | Out-File -FilePath $recPath -Encoding UTF8
+    Write-Host "Wrote: $recPath"
+
+    # CSVs
+    $masterCsv = Join-Path -Path $allDir -ChildPath "ADAudit_AllScopes_$ts.csv"
+    $records | Sort-Object ScopeType,ScopeDN,Trustee | Export-Csv -NoTypeInformation -Path $masterCsv -Encoding UTF8
+
+    $byScope = $records | Group-Object ScopeDN
+    foreach ($g in $byScope) {
+      $safeName = ($g.Name -replace '[=,]','_') -replace '[^\w\.-]','_'
+      $csvPath = Join-Path -Path $ouDir -ChildPath "ADAudit_$safeName.csv"
+      $g.Group | Export-Csv -NoTypeInformation -Path $csvPath -Encoding UTF8
+    }
+
+    # HTML index
+    $index = New-Object System.Collections.Generic.List[string]
+    $index.Add('<!doctype html>')
+    $index.Add('<html><head><meta charset="utf-8" />')
+    $index.Add('<title>AD Delegated Permissions Report</title>')
+    $index.Add('<style>body{font-family:Segoe UI,Arial,sans-serif} code{background:#f3f3f3;padding:2px 4px;border-radius:3px}</style>')
+    $index.Add('</head><body>')
+    $index.Add('<h1>AD Delegated Permissions Report</h1>')
+    $index.Add("<p>Generated: $(Get-Date -Format 'u')</p>")
+    $index.Add('<h2>Scopes</h2><ul>')
+    foreach ($dn in $scopes) {
+      $safe = ($dn -replace '[=,]','_') -replace '[^\w\.-]','_'
+      $index.Add("<li><code>$dn</code> - <a href='OUs/ADAudit_$safe.csv'>CSV</a> | <a href='OUs/ADAudit_$safe.txt'>TXT</a></li>")
+    }
+    $index.Add('</ul>')
+    $index.Add('<h2>Summary</h2><ul>')
+    $index.Add("<li><a href='All/ADAudit_AllScopes_$ts.csv'>Master CSV</a></li>")
+    $index.Add("<li><a href='All/ADAudit_HighRisk_$ts.csv'>High-Risk CSV</a></li>")
+    $index.Add("<li><a href='ADAudit_RiskAssessment.txt'>Risk Assessment</a></li>")
+    $index.Add("<li><a href='ADAudit_Recommendations.txt'>Recommendations</a></li>")
+    $index.Add('</ul></body></html>')
+    $indexPath = Join-Path $base 'index.html'
+    $index | Out-File -Encoding UTF8 -FilePath $indexPath
+    Write-Host "Index: $indexPath"
+    $index -join "`r`n" | Out-File -Encoding UTF8 -FilePath $indexPath
+    Write-Host "Index: $indexPath"
+
+    Write-Host "Reports folder: $base"
+    Write-Host "Master CSV:     $masterCsv"
+
+    # End transcript
+    try { Stop-Transcript | Out-Null } catch {}
+}
+
+#endregion Delegated Permissions Report
+
 $outputdir = (Get-Item -Path ".\").FullName + "\" + $env:computername
 $starttime = Get-Date
 $scriptname = $MyInvocation.MyCommand.Name
@@ -2229,12 +3989,24 @@ if ($ouperms -or ($all -and 'ouperms' -notin $exclude) -or 'ouperms' -in $select
 if ($laps -or ($all -and 'laps' -notin $exclude) -or 'laps' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For Existence of LAPS in domain" ; Get-LAPSStatus }
 if ($authpolsilos -or ($all -and 'authpolsilos' -notin $exclude) -or 'authpolsilos' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For Existence of Authentication Polices and Silos" ; Get-AuthenticationPoliciesAndSilos }
 if ($insecurednszone -or ($all -and 'insecurednszone' -notin $exclude) -or 'insecurednszone' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For Existence DNS Zones allowing insecure updates" ; Get-DNSZoneInsecure }
+if ($dnszone -or ($all -and 'dnszone' -notin $exclude) -or 'dnszone' -in $selectedChecks) {
+    $running = $true
+    Write-Both "[*] DNS Zone Report"
+    Invoke-DNSZoneReport -OutputRoot $(if($DnsZoneOutputRoot){$DnsZoneOutputRoot}else{$outputdir}) -IncludeRecordCounts:$DnsIncludeRecordCounts -IncludeSystemZones:$DnsIncludeSystemZones
+}
 if ($recentchanges -or ($all -and 'recentchanges' -notin $exclude) -or 'recentchanges' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For newly created users and groups"                ; Get-RecentChanges }
 if ($spn -or ($all -and 'spn' -notin $exclude) -or 'spn' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check high value kerberoastable user accounts"           ; Get-SPNs }
 if ($asrep -or ($all -and 'asrep' -notin $exclude) -or 'asrep' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check for accounts with kerberos pre-auth"               ; Get-ADUsersWithoutPreAuth }
 if ($acl -or ($all -and 'acl' -notin $exclude) -or 'acl' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check for dangerous ACL permissions on Computers, Users and Groups"  ; Find-DangerousACLPermissions }
 if ($adcs -or ($all -and 'adcs' -notin $exclude) -or 'adcs' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check for ADCS Vulnerabilities"                          ; Get-ADCSVulns }
 if ($ldapsecurity -or ($all -and 'ldapecurity' -notin $exclude) -or 'adcs' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check for LDAP Security Issues"                          ; Get-LDAPSecurity }
+if ($dataextract -or ($all -and 'dataextract' -notin $exclude) -or 'dataextract' -in $selectedChecks) { $running = $true ; Write-Both "[*] AD Raw Data Extract"                          ; Export-ADAuditDataExtract }
+if ($delegatedpermissions -or ($all -and 'delegatedpermissions' -notin $exclude) -or 'delegatedpermissions' -in $selectedChecks) {
+    $running = $true
+    if (-not $DelegatedOutputRoot) { $DelegatedOutputRoot = (Join-Path $outputdir 'DelegatedPermissions') }
+    Write-Both "[*] Delegated Permissions Report"
+    Invoke-DelegatedPermissionsReport -OutputRoot $DelegatedOutputRoot -IncludeSystemTrustees:$DelegIncludeSystemTrustees -IncludeDeny:$DelegIncludeDeny -IncludeInherited:$DelegIncludeInherited -Server $DelegServer
+}
 if (!$running) {
     Write-Both "[!] No arguments selected"
     Write-Both "[!] Other options are as follows, they can be used in combination"
@@ -2251,12 +4023,17 @@ if (!$running) {
     Write-Both "    -laps checks if LAPS is installed"
     Write-Both "    -authpolsilos checks for existence of authentication policies and silos"
     Write-Both "    -insecurednszone checks for insecure DNS zones"
+    Write-Both "    -dnszone generates a DNS zone posture report (HTML/CSV/JSON) (alias: -dns-zone)"
+    Write-Both "        Optional: -DnsIncludeRecordCounts -DnsIncludeSystemZones -DnsZoneOutputRoot <path>"
     Write-Both "    -recentchanges checks for newly created users and groups (last 30 days)"
     Write-Both "    -spn checks for kerberoastable high value accounts"
     Write-Both "    -asrep checks for accounts with kerberos pre-auth"
     Write-Both "    -acl checks for dangerous ACL permissions on Computers, Users and Groups"
     Write-Both "    -ADCS checks for ESC1,2,3,4 and 8"
     Write-Both "    -ldapsecurity checks for multiple LDAP issues"
+    Write-Both "    -dataextract exports raw AD audit data (users/groups/computers/OUs/GPO reports/OU ACLs/FGPP/trusts) to .\<COMPUTERNAME>\ADExtract"
+    Write-Both "    -delegatedpermissions generates an AD delegated permissions report (alias: -delegated-permissions)"
+    Write-Both "        Optional: -DelegIncludeSystemTrustees -DelegIncludeDeny -DelegIncludeInherited -DelegServer <dc> -DelegatedOutputRoot <path>"
     Write-Both "    -all runs all checks, e.g. $scriptname -all"
     Write-Both "    -exclude allows you to exclude specific checks when using -all, e.g. $scriptname -all -exclude hostdetails,ntds"
     Write-Both "    -select allows you to exclude specific checks when using -all, e.g. $scriptname -all `"-gpo,ntds,acl`""

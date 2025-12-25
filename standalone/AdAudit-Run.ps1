@@ -20,13 +20,13 @@ while ($true) {
     Write-Host "19: ACL"
     Write-Host "20: LDAP Security"
     Write-Host "21: Delegated Permissions"
-    Write-Host "22: DNS Zone"
-    Write-Host "23: Run All Checks"
+    Write-Host "22: Run All Checks"
     Write-Host "Q: Quit"
 
     $choice = Read-Host "Enter your choice"
     $scriptPath           = Join-Path $PSScriptRoot 'AdAudit.ps1'
     $offlineScriptPath    = Join-Path $PSScriptRoot 'InstallDeps.ps1'
+    $delegatedScriptPath  = Join-Path $PSScriptRoot 'Deligated_Permissions.ps1'
 
     switch ($choice) {
 
@@ -56,9 +56,20 @@ while ($true) {
         '18' { & $scriptPath -asrep; break }
         '19' { & $scriptPath -acl; break }
         '20' { & $scriptPath -ldapsecurity; break }
-        '21' { & $scriptPath -delegatedpermissions; break }
-        '22' { & $scriptPath -dnszone; break }
-        '23' { & $scriptPath -all; break }
+
+        '21' {
+            if (Test-Path $delegatedScriptPath) { & $delegatedScriptPath }
+            else { Write-Host "Delegated permissions script not found at '$delegatedScriptPath'" -ForegroundColor Red }
+            break
+        }
+
+        '22' {
+            & $scriptPath -all
+            if (Test-Path $delegatedScriptPath) { & $delegatedScriptPath }
+            else { Write-Host "Delegated permissions script not found at '$delegatedScriptPath'" -ForegroundColor Red }
+            break
+        }
+
         'Q' { exit }
 
         default { Write-Host "Invalid choice, please try again." }
