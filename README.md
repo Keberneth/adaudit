@@ -23,8 +23,10 @@ Added runtime arg<br>
 -dnszone
 <br><br>
 
-**Run the script**<br>
-Create the folder C:\ADAudit\<br>
+**Run the script**
+<br>
+Create the folder C:\ADAudit\
+<br>
 Coppy all script files to the folder and if installing dependencies offline the .nuplkg files.<br>
 **Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force & "C:\ADAudit\AdAudit-Run.ps1"**
 <br>
