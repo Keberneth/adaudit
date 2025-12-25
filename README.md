@@ -13,13 +13,46 @@ Offline installation for dependencies<br>
 Added explainations to some of the report files<br>
 Deligated AD permissions report<br>
 Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)<br>
+Full DNS-ZoneReport report<br>
 Can run on an other server then AD DC as long as:<br>
- RSAT tools is installed<br>
- Server can manage AD<br>
- Powershell can run using domain admin account<br>
+-RSAT tools is installed<br>
+-Server can manage AD<br>
+-Powershell can run using domain admin account<br>
+<br><br>
+
+**Run the script**<br>
+Create the folder C:\ADAudit\<br>
+Coppy all script files to the folder and if installing dependencies offline the .nuplkg files.
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force & "C:\ADAudit\AdAudit-Run.ps1"
+<br>
+Run the install dependencies
+<br>
+Run full check
+<br><br>
+
+## Active Directory Assessment Overview
+<br>
+This script performs an assessment of Active Directory configuration, security posture, and operational health.  
+The output is intended to provide visibility into potential risks, misconfigurations, and improvement areas.
+<br><br>
+
+
+### IMPORTANT
+<br>
+All findings must be evaluated in the context of:<br>
+- Organizational and regulatory requirements<br>
+- Internal security policies and approved exceptions<br>
+- Established operational practices and business constraints<br>
+- Business requirements<br>
+<br>
+The presence of a finding does not automatically indicate a security issue.  <br>
+Results should be reviewed, validated, and prioritized according to the organization’s risk management process.<br>
 <br>
 
-DNS-ZoneReport.ps1 - standalone script<br><br>
+### Purpose
+<br>
+This script is designed to support informed decision-making and continuous improvement of Active Directory security.
+<br><br>
 
 # adaudit
 This PowerShell script is designed to conduct a comprehensive audit of Microsoft Active Directory, focusing on identifying common security vulnerabilities and weaknesses. Its execution facilitates the pinpointing of critical areas that require reinforcement, thereby fortifying your infrastructure against prevalent tactics used in lateral movement or privilege escalation attacks targeting Active Directory.
