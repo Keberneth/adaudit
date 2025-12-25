@@ -18,6 +18,9 @@ Can run on an other server then AD DC as long as:<br>
 -RSAT tools is installed<br>
 -Server can manage AD<br>
 -Powershell can run using domain admin account<br>
+Added runtime arg<br>
+-delegatedpermissions<br>
+-dnszone
 <br><br>
 
 **Run the script**<br>
