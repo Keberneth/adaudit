@@ -4645,3 +4645,5 @@ $nessusoutput | Out-File $outputdir\adaudit-replaced.nessus
 
 $endtime = Get-Date
 Write-Both "[*] Script end time $endtime"
+
+& "$PSScriptRoot\\mangament_report.ps1" -InputRoot $outputdir
