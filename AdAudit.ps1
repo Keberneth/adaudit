@@ -2003,18 +2003,64 @@ Function Get-SPNs {
 }
 
 function Get-ADUsersWithoutPreAuth {
-    $ASREP = Get-ADUser -Filter * -Properties DoesNotRequirePreAuth, Enabled | Where-Object { $_.DoesNotRequirePreAuth -eq "True" -and $_.Enabled -eq "True" } | Select-Object Name
-    foreach ($user in $ASREP) {
-        $asrepuser = '    [!] AS-REP Roastable user: ' + $user.Name
-        Write-both $asrepuser
-        add-content -path $outputdir\ASREP.txt -value $user.Name
+    try {
+        $asrepUsers = Get-ADUser -Filter 'DoesNotRequirePreAuth -eq $true -and Enabled -eq $true' `
+                                 -Properties SamAccountName, Name, userAccountControl
     }
-    if (-not (Test-Path "$outputdir\ASREP.txt") -or !(Get-Content "$outputdir\ASREP.txt")) {
+    catch { $asrepUsers = @() }
+
+    if (-not $asrepUsers -or $asrepUsers.Count -eq 0) {
+        $asrepUsers = Get-ADUser -LDAPFilter '(&(userAccountControl:1.2.840.113556.1.4.803:=4194304)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+                                 -Properties SamAccountName, Name, userAccountControl
+    }
+
+    $asrepUsers = $asrepUsers | Select-Object SamAccountName, Name, userAccountControl
+
+    if (-not $asrepUsers -or $asrepUsers.Count -eq 0) {
         Write-Both "    [+] No ASREP Accounts"
+        return
     }
-    else {
-        Write-Nessus-Finding "AS-REP Roasting Attack" "KB720" ([System.IO.File]::ReadAllText("$outputdir\ASREP.txt"))
+
+    $asrepPath = Join-Path $outputdir 'ASREP.txt'
+    $header = @(
+        'AS-REP Roastable accounts detected (DONT_REQ_PREAUTH set).',
+        '',
+        'To list all vulnerable accounts:',
+        '  Get-ADUser -Filter ''DoesNotRequirePreAuth -eq $true -and Enabled -eq $true'' | Select SamAccountName, Enabled',
+        '  # Or LDAP bitwise (server-side):',
+        '  Get-ADUser -LDAPFilter ''(&(userAccountControl:1.2.840.113556.1.4.803:=4194304)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'' | Select SamAccountName, Enabled',
+        '',
+        'Mitigate (clear DONT_REQ_PREAUTH bit 0x00400000):',
+        '  $u = Get-ADUser <username> -Properties userAccountControl',
+        '  Set-ADUser <username> -Replace @{userAccountControl = ($u.userAccountControl -band (-bnot 0x00400000))}',
+        '',
+        'Force password reset (must meet domain policy):',
+        '  Set-ADAccountPassword -Identity <username> -Reset -NewPassword (Read-Host -AsSecureString)',
+        '',
+        '------------------------------------------------------------',
+        '',
+        'Accounts (Display Name (sAMAccountName)) with per-account commands:'
+    )
+    $header | Set-Content -Path $asrepPath -Encoding UTF8
+
+    foreach ($user in $asrepUsers) {
+        $display = ("{0} ({1})" -f $user.Name, $user.SamAccountName)
+        Write-Both ("    [!] AS-REP Roastable user: {0}" -f $display)
+
+        @(
+            $display,
+            '      # Verify vulnerable bit (non-zero means vulnerable):',
+            "      (Get-ADUser $($user.SamAccountName) -Properties userAccountControl).userAccountControl -band 0x00400000",
+            '      # Mitigate (clear bit 0x00400000):',
+            "      `$u = Get-ADUser $($user.SamAccountName) -Properties userAccountControl",
+            "      Set-ADUser $($user.SamAccountName) -Replace @{userAccountControl = (`$u.userAccountControl -band (-bnot 0x00400000))}",
+            '      # Optional: force password reset (use compliant password):',
+            "      Set-ADAccountPassword -Identity $($user.SamAccountName) -Reset -NewPassword (Read-Host -AsSecureString)",
+            ''
+        ) | Add-Content -Path $asrepPath
     }
+
+    Write-Nessus-Finding "AS-REP Roasting Attack" "KB720" ([System.IO.File]::ReadAllText($asrepPath))
 }
 
 function Get-LDAPSecurity {
