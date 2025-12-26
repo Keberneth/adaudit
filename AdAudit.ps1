@@ -164,6 +164,7 @@ Param (
     [switch]$domainaudit = $false,
     [switch]$trusts = $false,
     [switch]$accounts = $false,
+    [switch]$InactiveComputers = $false,
     [switch]$passwordpolicy = $false,
     [switch]$ntds = $false,
     [switch]$oldboxes = $false,
@@ -499,6 +500,34 @@ Function Get-MachineAccountQuota {
         Write-Nessus-Finding "DomainAccountQuota" "KB251" "Domain users can add $MachineAccountQuota devices to the domain"
     }
 }
+Function Get-InactiveComputerObjects {
+    $count = 0
+    $DaysAgo = (Get-Date).AddDays(-90)
+
+    $ReportPath = "$outputdir\computers_inactive_90days.txt"
+    Remove-Item -Path $ReportPath -ErrorAction SilentlyContinue
+
+    $inactiveComputers = Get-ADComputer -Filter { LastLogonTimeStamp -lt $DaysAgo -and Enabled -eq "true" } -Properties LastLogonTimeStamp, DNSHostName, OperatingSystem
+    $totalcount = ($inactiveComputers | Measure-Object | Select-Object Count).count
+
+    foreach ($computer in $inactiveComputers) {
+        if ($totalcount -eq 0) { break }
+        Write-Progress -Activity "Searching for inactive computer objects (>90 days)..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+
+        $datelastlogon = if ($computer.LastLogonTimeStamp) { [DateTime]::FromFileTime($computer.LastLogonTimeStamp) } else { "Never" }
+
+        Add-Content -Path $ReportPath -Value "Computer $($computer.Name) ($($computer.DNSHostName)) OS: $($computer.OperatingSystem) last logon: $datelastlogon"
+        $count++
+    }
+
+    Write-Progress -Activity "Searching for inactive computer objects (>90 days)..." -Status "Ready" -Completed
+
+    if ($count -gt 0) {
+        Write-Both "    [!] $count enabled computer objects inactive for >90 days, see computers_inactive_90days.txt (KB###)"
+        Write-Nessus-Finding "InactiveComputers90Days" "KB###" ([System.IO.File]::ReadAllText($ReportPath))
+    }
+}
+
 Function Get-PasswordPolicy {
     Write-Both "    [+] Checking default password policy"
     if (!(Get-ADDefaultDomainPasswordPolicy).ComplexityEnabled) {
@@ -833,15 +862,20 @@ Function Get-OldBoxes {
     $totalcount = ($oldboxes | Measure-Object | Select-Object Count).count
     foreach ($machine in $oldboxes) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for 2000/2003/XP/Vista/7/2008 devices joined to the domain..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for 2000/2003/XP/Vista/7/2008/2012/2012R2/2016 devices joined to the domain..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path "$outputdir\machines_old.txt" -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersio), $($machine.IPv4Address)"
         $count++
     }
-    Write-Progress -Activity "Searching for 2000/2003/XP/Vista/7/2008 devices joined to the domain..." -Status "Ready" -Completed
+    Write-Progress -Activity "Searching for 2000/2003/XP/Vista/7/2008/2012/2012R2/2016 devices joined to the domain..." -Status "Ready" -Completed
     if ($count -gt 0) {
-        Write-Both "    [!] We found $count machines running 2000/2003/XP/Vista/7/2008! see machines_old.txt (KB3/37/38/KB259)"
+        Write-Both "    [!] We found $count machines running 2000/2003/XP/Vista/7/2008/2012/2012R2/2016! see machines_old.txt (KB3/37/38/KB259)"
         Write-Nessus-Finding "OldBoxes" "KB259" ([System.IO.File]::ReadAllText("$outputdir\machines_old.txt"))
     }
+}
+if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or 'inactivecomputers' -in $selectedChecks) {
+    $running = $true
+    Write-Both "[*] Inactive Computer Objects Audit"
+    Get-InactiveComputerObjects
 }
 Function Get-DCsNotOwnedByDA {
     #Searches for DC objects not owned by the Domain Admins group
@@ -4574,7 +4608,11 @@ if ($domainaudit -or ($all -and 'domainaudit' -notin $exclude) -or 'domainaudit'
 if ($trusts -or ($all -and 'trusts' -notin $exclude) -or 'trusts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Domain Trust Audit" ; Get-DomainTrusts }
 if ($accounts -or ($all -and 'accounts' -notin $exclude) -or 'accounts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Accounts Audit" ; Get-InactiveAccounts ; Get-DisabledAccounts ; Get-LockedAccounts ; Get-AdminAccountChecks ; Get-NULLSessions ; Get-PrivilegedGroupAccounts ; Get-ProtectedUsers }
 if ($passwordpolicy -or ($all -and 'passwordpolicy' -notin $exclude) -or 'passwordpolicy' -in $selectedChecks) { $running = $true ; Write-Both "[*] Password Information Audit" ; Get-AccountPassDontExpire ; Get-UserPasswordNotChangedRecently ; Get-PasswordPolicy ; Get-PasswordQuality }
-
+if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or 'inactivecomputers' -in $selectedChecks) {
+    $running = $true
+    Write-Both "[*] Inactive Computer Objects Audit"
+    Get-InactiveComputerObjects
+}
 if ($highrisk -or ($all -and 'highrisk' -notin $exclude) -or 'highrisk' -in $selectedChecks) { $running = $true ; Write-Both "[*] High-Risk AD Baseline Report" ; Get-HighRiskADBaselineReport }
 if ($ntds -or ($all -and 'ntds' -notin $exclude) -or 'ntds' -in $selectedChecks) { $running = $true ; Write-Both "[*] Trying to save NTDS.dit, please wait..." ; Get-NTDSdit }
 if ($oldboxes -or ($all -and 'oldboxes' -notin $exclude) -or 'oldboxes' -in $selectedChecks) { $running = $true ; Write-Both "[*] Computer Objects Audit" ; Get-OldBoxes }

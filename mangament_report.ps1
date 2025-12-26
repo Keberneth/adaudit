@@ -58,7 +58,14 @@ function Invoke-ManagementReport {
     }
 
     $Findings = New-Object System.Collections.Generic.List[object]
-    $SeverityScore = @{ Critical = 8; High = 5; Medium = 3; Low = 1 }
+
+    # Base points (start values) - updated
+    $SeverityScore = @{
+        Critical = 12
+        High     = 8
+        Medium   = 5
+        Low      = 2
+    }
 
     function Normalize-Severity([string]$sev) {
         $s = ($sev -as [string])
@@ -97,12 +104,44 @@ function Invoke-ManagementReport {
         }) | Out-Null
     }
 
+    # Legacy scaler retained (used for some non-baseline count signals)
     function Score-Scaled([string]$Severity,[double]$Count,[int]$maxScale = 50) {
         $Severity = Normalize-Severity $Severity
         $base  = [int]$SeverityScore[$Severity]
         $c     = [Math]::Max([double]$Count, 0)
         $scale = [Math]::Min([Math]::Floor($c / 10), [Math]::Floor($maxScale / 10))
         return ($base + [int]$scale)
+    }
+
+    # New: Over-baseline curve (Option A)
+    function Score-OverBaselineLog {
+        param(
+            [string]$Severity,
+            [double]$Observed,
+            [double]$Baseline,
+
+            # Cap how much *extra* a single finding can add above the base severity score
+            [int]$MaxAdd = 18,
+
+            # Aggressiveness (higher = steeper)
+            [double]$K = 5
+        )
+
+        $Severity = Normalize-Severity $Severity
+        $base = [int]$SeverityScore[$Severity]
+
+        if ($Baseline -le 0) { return $base }
+        if ($Observed -le $Baseline) { return $base }
+
+        $ratio = $Observed / $Baseline
+
+        # log2(ratio) scaling
+        $add = [Math]::Ceiling($K * ([Math]::Log($ratio) / [Math]::Log(2)))
+
+        # cap so no single metric dominates
+        $add = [Math]::Min([int]$add, [int]$MaxAdd)
+
+        return ($base + [int]$add)
     }
 
     function DisplayOrDash($v) {
@@ -235,7 +274,18 @@ function Invoke-ManagementReport {
     if ($spnLines.Count -gt 0) {
         Add-FindingOnce 'Medium' 'Kerberoastable SPNs present (review high-value service accounts)' "Lines: $($spnLines.Count)" $spnPath (Score-Scaled 'Medium' $spnLines.Count)
     }
-
+    # Inactive computer objects (>90 days)
+    $inactiveCompsPath = Join-Path $InputRoot 'computers_inactive_90days.txt'
+    $inactiveCompsLines = Get-NonHeaderLines $inactiveCompsPath
+    if ($inactiveCompsLines.Count -gt 0) {
+        $obs = $inactiveCompsLines.Count
+        # Baseline: adjust if needed; using 5 by default to flag drift early
+        $base = 5
+        $sev = if ($obs -ge 200) { 'High' } elseif ($obs -ge 50) { 'Medium' } else { 'Low' }
+        $score = Score-OverBaselineLog -Severity $sev -Observed $obs -Baseline $base -MaxAdd 14 -K 3
+        Add-FindingOnce $sev 'Inactive computer accounts (>90 days)' "Computers inactive: $obs (Baseline: <= $base)" $inactiveCompsPath $score
+    }
+    
     $pndePath = Join-Path $InputRoot 'accounts_passdontexpire.txt'
     $pndeLines = Get-NonHeaderLines $pndePath
     if ($pndeLines.Count -gt 0) {
@@ -300,15 +350,19 @@ function Invoke-ManagementReport {
 
     if ($daCount -gt 0) {
         $sev = if ($daCount -gt 10) { 'High' } elseif ($daCount -gt 5) { 'Medium' } else { 'Low' }
-        Add-FindingOnce $sev 'Domain Admins membership size' "Members: $daCount" $daPath (Score-Scaled $sev $daCount)
+        $daBase = 5
+        Add-FindingOnce $sev 'Domain Admins membership size' "Members: $daCount (Baseline: <= $daBase)" $daPath (Score-OverBaselineLog -Severity $sev -Observed $daCount -Baseline $daBase -MaxAdd 18 -K 4)
     }
     if ($eaCount -gt 0) {
         $sev = if ($eaCount -gt 5) { 'High' } elseif ($eaCount -gt 2) { 'Medium' } else { 'Low' }
-        Add-FindingOnce $sev 'Enterprise Admins membership size' "Members: $eaCount" $eaPath (Score-Scaled $sev $eaCount)
+        $eaBase = 2
+        Add-FindingOnce $sev 'Enterprise Admins membership size' "Members: $eaCount (Baseline: <= $eaBase)" $eaPath (Score-OverBaselineLog -Severity $sev -Observed $eaCount -Baseline $eaBase -MaxAdd 16 -K 4)
     }
     if ($saCount -gt 0) {
         $sev = if ($saCount -gt 5) { 'High' } elseif ($saCount -gt 2) { 'Medium' } else { 'Low' }
-        Add-FindingOnce $sev 'Schema Admins membership size' "Members: $saCount" $saPath (Score-Scaled $sev $saCount)
+        # Baseline effectively 0 except during schema changes; use 1 to avoid divide-by-zero and cap.
+        $saBase = 1
+        Add-FindingOnce $sev 'Schema Admins membership size' "Members: $saCount (Baseline: 0 except during schema change)" $saPath (Score-OverBaselineLog -Severity $sev -Observed $saCount -Baseline $saBase -MaxAdd 18 -K 4)
     }
 
     # --- Baseline file parsing: convert [CRITICAL]/[HIGH]/... lines into findings ---
@@ -330,7 +384,89 @@ function Invoke-ManagementReport {
                 $sev     = Normalize-Severity $sevRaw
 
                 $evidence = "Observed: $obs | Baseline: $base"
-                $score = [int]$SeverityScore[$sev] + 4
+
+                # Default baseline score = base severity points
+                $score = [int]$SeverityScore[$sev]
+
+                switch -Regex ($title) {
+
+                    '^krbtgt password age$' {
+                        # Prefer "(NNN days)" from Observed text; fall back to first number
+                        $obsDays = 0
+                        if ($obs -match '\(([0-9]+)\s*days\)') { $obsDays = [int]$matches[1] }
+                        elseif ($obs -match '([0-9]+)') { $obsDays = [int]$matches[1] }
+
+                        # Baseline like "<= 180 days"
+                        $baseDays = 0
+                        if ($base -match '([0-9]+)') { $baseDays = [int]$matches[1] }
+
+                        if ($obsDays -gt 0 -and $baseDays -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsDays -Baseline $baseDays -MaxAdd 22 -K 5
+                        }
+                    }
+
+                    '^Domain Admins$' {
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+
+                        $baseCount = 0
+                        if ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
+
+                        if ($obsCount -gt 0 -and $baseCount -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
+                        }
+                    }
+
+                    '^Schema Admins$' {
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+
+                        # Baseline "0 (except during schema change)" -> treat as effectively zero
+                        $baseCount = 0
+                        if ($base -match '^\s*0\b') { $baseCount = 0 }
+                        elseif ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
+
+                        if ($obsCount -gt 0) {
+                            if ($baseCount -le 0) {
+                                # Baseline effectively 0 => strong deviation; cap bump
+                                $score = [int]$SeverityScore[$sev] + 18
+                            } else {
+                                $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
+                            }
+                        }
+                    }
+
+                    '^Enabled accounts inactive >\s*180\s*days$' {
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+                        if ($obsCount -gt 0) {
+                            # baseline 0 => use 1 for math, cap it
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline 1 -MaxAdd 14 -K 3
+                        }
+                    }
+
+                    '^Enabled user accounts with PasswordNeverExpires$' {
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+                        if ($obsCount -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline 1 -MaxAdd 14 -K 3
+                        }
+                    }
+
+                    '^ms-DS-MachineAccountQuota$' {
+                        $obsVal = 0
+                        if ($obs -match '([0-9]+)') { $obsVal = [int]$matches[1] }
+                        if ($obsVal -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsVal -Baseline 1 -MaxAdd 16 -K 4
+                        }
+                    }
+
+                    default {
+                        # Keep base score for generic baseline lines (stable, non-brittle parsing)
+                        $score = [int]$SeverityScore[$sev]
+                    }
+                }
+
                 Add-FindingOnce $sev $title $evidence $baselinePath $score
             }
         }
