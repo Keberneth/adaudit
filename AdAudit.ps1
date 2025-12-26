@@ -17,8 +17,8 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.1.1 - 25/12/2025
-                Added reports for high risks findings.
+            [X] Version 7.1.1 - 24/12/2025
+                Added Windows Update audit for high risk missing updates.
             [ ] Version 7.1.0 - 24/12/2025
                 Added Get-DNSZoneInsecure function to check for DNS zones allowing insecure updates.
                 Added DNS zone report.
@@ -198,7 +198,7 @@ Param (
 $selectedChecks = @()
 if ($select) { $selectedChecks = $select.Split(',') }
 
-$versionnum = "v6.0"
+$versionnum = "v7.1.2"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 Function Get-Variables() {
@@ -3985,6 +3985,7 @@ Function Get-HighRiskADBaselineReport {
         'Password never expires (humans)'          = '0 (use gMSA/MSA for services)'
         'MachineAccountQuota'                      = '0'
         'Duplicate passwords'                      = '0 shared passwords (no duplicate NT hashes)'
+        'Windows cumulative update (Patch Tuesday)'   = 'Latest monthly cumulative update installed (current Patch Tuesday cycle)'
     }
 
     $riskOutDir = Join-Path $outputdir 'HighRisk'
@@ -4253,6 +4254,131 @@ Function Get-HighRiskADBaselineReport {
         }
     }
 
+
+    # Windows Update / Patch Tuesday compliance (local machine)
+    # Baseline: Latest monthly cumulative update installed for the current Patch Tuesday cycle.
+    # NOTE: This check is best-effort and depends on Windows Update history being available on the host.
+    $wuSummaryObj = [pscustomobject]@{
+        RiskId='WIN_UPDATE'
+        Category='Patch Management'
+        Item='Windows cumulative update (Patch Tuesday) - latest cycle'
+        Severity='HIGH'
+        Baseline='Latest monthly cumulative update installed (current Patch Tuesday cycle)'
+        Observed='Not evaluated'
+        IsFinding=$false
+        Recommendation='Install the latest monthly cumulative update. Verify servicing stack prerequisites. Ensure update compliance monitoring is in place.'
+    }
+    $wuReportPath = Join-Path $riskOutDir 'WINDOWS_UPDATE.txt'
+
+    function _Get-SecondTuesday {
+        param([datetime]$MonthDate)
+        $first = Get-Date -Year $MonthDate.Year -Month $MonthDate.Month -Day 1
+        $offset = ([int][System.DayOfWeek]::Tuesday - [int]$first.DayOfWeek + 7) % 7
+        $firstTuesday = $first.AddDays($offset)
+        return $firstTuesday.AddDays(7)
+    }
+
+    function _Get-TargetPatchMonth {
+        $now = Get-Date
+        $pt = _Get-SecondTuesday -MonthDate $now
+        if ($now -ge $pt) { return $now } else { return $now.AddMonths(-1) }
+    }
+
+    try {
+        $monthsBack = 6
+        $cutoffDate = (Get-Date).AddMonths(-[math]::Abs($monthsBack)).Date
+
+        $session = New-Object -ComObject "Microsoft.Update.Session"
+        $searcher = $session.CreateUpdateSearcher()
+        $historyCount = $searcher.GetTotalHistoryCount()
+        $history = $searcher.QueryHistory(0, $historyCount)
+
+        # Exclude Defender signatures and MSRT, keep entries after cutoff
+        $filtered = $history | Where-Object {
+            $_.Date -gt $cutoffDate -and (
+                $_.Title -notmatch '(?i)\bDefender\b' -and
+                $_.Title -notmatch '(?i)Security Intelligence' -and
+                $_.Title -notmatch '(?i)Antivirus' -and
+                $_.Title -notmatch '(?i)\bMalicious Software Removal Tool\b' -and
+                $_.Title -notmatch '(?i)\bMSRT\b'
+            )
+        }
+
+        $latestRelevant = $filtered | Sort-Object Date -Descending | Select-Object -First 1
+        $latestRelevantDate = $null
+        if ($latestRelevant) { $latestRelevantDate = $latestRelevant.Date }
+
+        $target = _Get-TargetPatchMonth
+        $targetPrefix = $target.ToString('yyyy-MM')
+        $targetPatchTuesday = _Get-SecondTuesday -MonthDate $target
+
+        # Match monthly Cumulative Update for Windows Server by yyyy-MM prefix in title.
+        # Many CUs are titled like: "2025-12 Cumulative Update for Microsoft server operating system version ..."
+        $cuPattern = "(?i)^" + [Regex]::Escape($targetPrefix) + "\s+Cumulative Update.*(Windows Server|Microsoft\s+server)"
+        $targetMonthCU = $history | Where-Object { $_.Title -match $cuPattern } | Sort-Object Date -Descending | Select-Object -First 1
+
+        $daysSinceLast = $null
+        if ($latestRelevantDate) { $daysSinceLast = [int]((New-TimeSpan -Start $latestRelevantDate -End (Get-Date)).TotalDays) }
+
+        if ($targetMonthCU) {
+            # Compliant: do not create a missing-update report file
+            if (Test-Path $wuReportPath) { Remove-Item -Force $wuReportPath -ErrorAction SilentlyContinue }
+            $wuSummaryObj = [pscustomobject]@{
+                RiskId='WIN_UPDATE'
+                Category='Patch Management'
+                Item='Windows cumulative update (Patch Tuesday) - latest cycle'
+                Severity='HIGH'
+                Baseline='Latest monthly cumulative update installed (current Patch Tuesday cycle)'
+                Observed= $(if ($latestRelevantDate) { "Compliant. Latest relevant update: $latestRelevantDate ($daysSinceLast days ago). Target CU found: $($targetMonthCU.Title) on $($targetMonthCU.Date)." } else { "Compliant. Target CU found: $($targetMonthCU.Title) on $($targetMonthCU.Date)." })
+                IsFinding=$false
+                Recommendation='No action required for this check.'
+            }
+        } else {
+            # Not compliant: create a report file with details
+            $notUpdatedMsg = $(if ($latestRelevantDate) { "$daysSinceLast days since last relevant update." } else { "No relevant updates found in history within last $monthsBack months." })
+            $wuSummaryObj = [pscustomobject]@{
+                RiskId='WIN_UPDATE'
+                Category='Patch Management'
+                Item='Windows cumulative update (Patch Tuesday) - latest cycle'
+                Severity='HIGH'
+                Baseline="Install monthly CU for $targetPrefix (Patch Tuesday: $($targetPatchTuesday.ToString('yyyy-MM-dd')))"
+                Observed= "Missing $targetPrefix CU. Latest relevant update: $(if ($latestRelevantDate) { $latestRelevantDate } else { 'Unknown' }). $notUpdatedMsg"
+                IsFinding=$true
+                Recommendation='Install the latest monthly cumulative update, then reboot if required. Verify WSUS/WUfB configuration and servicing stack prerequisites.'
+            }
+
+            $r = New-Object System.Collections.Generic.List[string]
+            $r.Add("=== Windows Update / Patch Tuesday Compliance ===")
+            $r.Add("Generated: $(Get-Date -Format o)")
+            $r.Add("Computer:  $env:COMPUTERNAME")
+            $r.Add("")
+            $r.Add("Baseline:")
+            $r.Add("  - Latest monthly cumulative update installed for the current Patch Tuesday cycle.")
+            $r.Add("")
+            $r.Add("Target cycle:")
+            $r.Add("  - Target month (yyyy-MM): $targetPrefix")
+            $r.Add("  - Patch Tuesday date:      $($targetPatchTuesday.ToString('yyyy-MM-dd'))")
+            $r.Add("")
+            $r.Add("Status:")
+            $r.Add("  - Target cumulative update found: NO")
+            if ($latestRelevantDate) {
+                $r.Add("  - Latest relevant update installed: $latestRelevantDate ($daysSinceLast days ago)")
+            } else {
+                $r.Add("  - Latest relevant update installed: Unknown")
+            }
+            $r.Add("")
+            $r.Add("Recent update history (last $monthsBack months; excluding Defender/MSRT):")
+            $r.Add(('-' * 80))
+            foreach ($u in ($filtered | Sort-Object Date -Descending)) {
+                $r.Add(("{0} | {1}" -f ($u.Date.ToString('yyyy-MM-dd')), $u.Title))
+            }
+            $r | Out-File -FilePath $wuReportPath -Encoding UTF8
+        }
+    } catch {
+        # If Windows Update history cannot be queried, keep "Not evaluated" and do not create report.
+    }
+
+
     # Build summary table
     $summary = @()
     $summary += $privSummary
@@ -4262,6 +4388,7 @@ Function Get-HighRiskADBaselineReport {
     $summary += $disabledOldObj
     $summary += $maqObj
     $summary += $dupSummaryObj
+    $summary += $wuSummaryObj
 
     # Write TXT report (with baseline table embedded)
     $lines = New-Object System.Collections.Generic.List[string]
@@ -4356,6 +4483,7 @@ $html.Add("<li><a href='HighRisk/PASSWORD_NEVER_EXPIRES.csv'>Password never expi
 $html.Add("<li><a href='HighRisk/DISABLED_STALE.csv'>Disabled stale accounts (detail)</a></li>")
 $html.Add("<li><a href='HighRisk/MACHINE_ACCOUNT_QUOTA.csv'>MachineAccountQuota (detail)</a></li>")
 $html.Add("<li><a href='HighRisk/DUPLICATE_PASSWORDS.csv'>Duplicate passwords (detail; requires DSInternals + replication privileges)</a></li>")
+if (Test-Path (Join-Path $riskOutDir 'WINDOWS_UPDATE.txt')) { $html.Add("<li><a href='HighRisk/WINDOWS_UPDATE.txt'>Windows Update compliance (detail)</a></li>") }
 $html.Add('</ul>')
 
 $html.Add('<h2>Finding Counts</h2>')
@@ -4380,7 +4508,8 @@ Write-Both " _____ ____     _____       _ _ _
 |  _  |    \   |  _  |_ _ _| |_| |_
 |     |  |  |  |     | | | . | |  _|
 |__|__|____/   |__|__|___|___|_|_|
-$versionnum                  by phillips321
+6.0                     by phillips321
+$versionnum                  modified by Keberneth
 "
 $running = $false
 Write-Both "[*] Script start time $starttime"
@@ -4470,4 +4599,3 @@ $nessusoutput | Out-File $outputdir\adaudit-replaced.nessus
 
 $endtime = Get-Date
 Write-Both "[*] Script end time $endtime"
-
