@@ -22,7 +22,7 @@ Added runtime arg<br>
 -delegatedpermissions<br>
 -dnszone
 <br>
-Overall report for management added as a separate script
+Overall report for management added as a separate script. Will run directly after Audit script. (Run -all argument for best result)
 <br><br>
 
 **Run the script**
