@@ -60,7 +60,6 @@ Results should be reviewed, validated, and prioritized according to the organiza
 <br>
 
 ### Purpose
-<br>
 This script is designed to support informed decision-making and continuous improvement of Active Directory security.
 <br><br>
 
