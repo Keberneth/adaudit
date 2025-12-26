@@ -21,6 +21,8 @@ Can run on an other server then AD DC as long as:<br>
 Added runtime arg<br>
 -delegatedpermissions<br>
 -dnszone
+<br>
+Overall report for management added as a separate script. Will run directly after Audit script. (Run -all argument for best result)
 <br><br>
 
 **Run the script**
@@ -36,14 +38,16 @@ Run full check
 <br><br>
 
 ## Active Directory Assessment Overview
-<br>
 This script performs an assessment of Active Directory configuration, security posture, and operational health.  
 The output is intended to provide visibility into potential risks, misconfigurations, and improvement areas.
 <br><br>
 
+## Mangament Report
+Management report script creates a html file that give a more reprisentible summary of the audit with a overall security score
+<br><br>
+
 
 ### IMPORTANT
-<br>
 All findings must be evaluated in the context of:<br>
 - Organizational and regulatory requirements<br>
 - Internal security policies and approved exceptions<br>
@@ -55,7 +59,6 @@ Results should be reviewed, validated, and prioritized according to the organiza
 <br>
 
 ### Purpose
-<br>
 This script is designed to support informed decision-making and continuous improvement of Active Directory security.
 <br><br>
 
