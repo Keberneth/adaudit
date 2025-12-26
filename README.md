@@ -21,6 +21,8 @@ Can run on an other server then AD DC as long as:<br>
 Added runtime arg<br>
 -delegatedpermissions<br>
 -dnszone
+<br>
+Overall report for management added as a separate script
 <br><br>
 
 **Run the script**
