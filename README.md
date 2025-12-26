@@ -36,19 +36,16 @@ Run full check
 <br><br>
 
 ## Active Directory Assessment Overview
-<br>
 This script performs an assessment of Active Directory configuration, security posture, and operational health.  
 The output is intended to provide visibility into potential risks, misconfigurations, and improvement areas.
 <br><br>
 
 ## Mangament Report
-<br>
 Management report script creates a html file that give a more reprisentible summary of the audit with a overall security score
 <br><br>
 
 
 ### IMPORTANT
-<br>
 All findings must be evaluated in the context of:<br>
 - Organizational and regulatory requirements<br>
 - Internal security policies and approved exceptions<br>
