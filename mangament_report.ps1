@@ -83,7 +83,7 @@ function Invoke-ManagementReport {
         )
 
         $Severity = Normalize-Severity $Severity
-        $score = $SeverityScore[$Severity]
+        $score = [int]$SeverityScore[$Severity]
         if ($PSBoundParameters.ContainsKey('ScoreOverride')) {
             $score = [int]$ScoreOverride
         }
@@ -93,7 +93,7 @@ function Invoke-ManagementReport {
             Title    = $Title
             Evidence = $Evidence
             Link     = Get-RelPath $Path
-            Score    = [int]$score
+            Score    = $score
         }) | Out-Null
     }
 
@@ -103,13 +103,6 @@ function Invoke-ManagementReport {
         $c     = [Math]::Max([double]$Count, 0)
         $scale = [Math]::Min([Math]::Floor($c / 10), [Math]::Floor($maxScale / 10))
         return ($base + [int]$scale)
-    }
-
-    function Classify-Overall([int]$score) {
-        if ($score -ge 60) { return 'Critical' }
-        elseif ($score -ge 36) { return 'High' }
-        elseif ($score -ge 16) { return 'Medium' }
-        else { return 'Low' }
     }
 
     function DisplayOrDash($v) {
@@ -337,7 +330,7 @@ function Invoke-ManagementReport {
                 $sev     = Normalize-Severity $sevRaw
 
                 $evidence = "Observed: $obs | Baseline: $base"
-                $score = $SeverityScore[$sev] + 4
+                $score = [int]$SeverityScore[$sev] + 4
                 Add-FindingOnce $sev $title $evidence $baselinePath $score
             }
         }
@@ -351,30 +344,46 @@ function Invoke-ManagementReport {
         Low      = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Low'      }).Count
     }
 
-    # Overall score / level
+    # Overall score
     $TotalScore = 0
     foreach ($f in $Findings) { $TotalScore += [int]$f.Score }
-    $OverallLevel = Classify-Overall $TotalScore
 
     # ---------------------------
-    # Score matrix for report clarity
+    # Score matrix (neutral) + banding (CONSISTENT everywhere)
     # ---------------------------
     $ScoreBands = @(
-        [PSCustomObject]@{ Level='Low'      ; Range='0 - 15'  ; Meaning='Acceptable risk; maintain baseline and monitor.' }
-        [PSCustomObject]@{ Level='Medium'   ; Range='16 - 35' ; Meaning='Moderate risk; plan remediation and reduce exposure.' }
-        [PSCustomObject]@{ Level='High'     ; Range='36 - 59' ; Meaning='Elevated risk; prioritize remediation and validate controls.' }
-        [PSCustomObject]@{ Level='Critical' ; Range='60+'     ; Meaning='Immediate action required; likely exploitable weaknesses.' }
+        [PSCustomObject]@{
+            Level   = 'Low'
+            Range   = '0 - 49'
+            Meaning = 'Minor control gaps or baseline drift. Address during routine maintenance and continue monitoring.'
+        }
+        [PSCustomObject]@{
+            Level   = 'Medium'
+            Range   = '50 - 99'
+            Meaning = 'Noticeable control gaps. Plan remediation in the next hardening cycle and track to closure.'
+        }
+        [PSCustomObject]@{
+            Level   = 'High'
+            Range   = '100 - 149'
+            Meaning = 'Major control gaps. Prioritize remediation and validate that administrative controls are applied consistently.'
+        }
+        [PSCustomObject]@{
+            Level   = 'Critical'
+            Range   = '150+'
+            Meaning = 'Significant control gaps or privileged configuration drift. Treat as a priority workstream with defined owners and timelines.'
+        }
     )
 
     function Get-ScoreBand([int]$score) {
-        if ($score -ge 60) { return 'Critical' }
-        elseif ($score -ge 36) { return 'High' }
-        elseif ($score -ge 16) { return 'Medium' }
+        if ($score -ge 150) { return 'Critical' }
+        elseif ($score -ge 100) { return 'High' }
+        elseif ($score -ge 50) { return 'Medium' }
         else { return 'Low' }
     }
 
-    $bandNow = Get-ScoreBand $TotalScore
+    $OverallLevel = Get-ScoreBand $TotalScore
 
+    $bandNow = $OverallLevel
     $scoreMatrixRows = foreach ($b in $ScoreBands) {
         $isActive = ($b.Level -eq $bandNow)
         $cls = if ($isActive) { "matrix-row active sev-$($b.Level)" } else { "matrix-row sev-$($b.Level)" }
@@ -382,7 +391,7 @@ function Invoke-ManagementReport {
 <tr class="$cls">
   <td><span class="pill sev-$($b.Level)">$($b.Level)</span></td>
   <td class="mono">$($b.Range)</td>
-  <td>$(HtmlEncode $b.Meaning)</td>
+  <td class="matrix-meaning">$(HtmlEncode $b.Meaning)</td>
 </tr>
 "@
     }
@@ -414,31 +423,36 @@ function Invoke-ManagementReport {
 "@
     }
 
+    # Neutral interpretation text
     $meaning = switch ($OverallLevel) {
-        'Critical' { 'Immediate action required. Risk exposure is high and likely actionable by adversaries.' }
-        'High'     { 'Prioritize remediation. Significant weaknesses exist that can enable escalation or lateral movement.' }
-        'Medium'   { 'Address in planned hardening cycles. Some weaknesses may become critical when combined.' }
-        Default    { 'Maintain and monitor. No major high-impact weaknesses detected in the provided evidence.' }
+        'Critical' { 'The overall score indicates significant gaps relative to the defined baselines. Prioritize remediation for the highest-severity items and confirm governance for privileged access and password controls.' }
+        'High'     { 'The overall score indicates material gaps relative to the defined baselines. Prioritize remediation and validate that controls are applied consistently across the environment.' }
+        'Medium'   { 'The overall score indicates moderate gaps relative to the defined baselines. Plan remediation in the next hardening cycle and track progress to closure.' }
+        Default    { 'The overall score indicates minor gaps relative to the defined baselines. Address as part of routine maintenance and continue monitoring.' }
     }
 
     $nextSteps = switch ($OverallLevel) {
         'Critical' { @(
-            'Fix Critical items first (credential exposure, privileged group sprawl, KRBTGT rotation where applicable).'
-            'Reduce privileged memberships and validate tiering / admin workstation controls.'
-            'Confirm LDAP/NTLM/DNS hardening baselines and enforce via GPO.'
+            'Assign owners for Critical findings and define target dates for remediation.'
+            'Review privileged group membership (Domain Admins / Schema Admins / built-in administrators) and ensure membership is justified, documented, and reviewed regularly.'
+            'Address password control items (duplicate passwords, PasswordNeverExpires usage, KRBTGT rotation policy) and confirm they align with operational requirements.'
+            'Re-run the assessment after remediation to confirm closure and reduce configuration drift.'
         ) }
         'High' { @(
-            'Remediate High items and reduce attack paths (AS-REP roast, weak Kerberos ciphers, over-delegation).'
-            'Review service accounts / SPNs and apply gMSA where possible.'
-            'Implement continuous monitoring for privileged changes.'
+            'Prioritize High findings and track remediation to closure.'
+            'Validate privileged access governance (membership reviews, approvals, and change tracking).'
+            'Standardize account lifecycle controls (inactive accounts, disabled account review cadence).'
+            'Re-run the assessment after changes to confirm improvements.'
         ) }
         'Medium' { @(
-            'Plan remediation for Medium items; validate compensating controls.'
-            'Continue periodic audits and tighten baseline drift detection.'
+            'Plan remediation for Medium findings in the next hardening cycle.'
+            'Ensure baseline expectations and exception handling are documented and reviewed periodically.'
+            'Re-run the assessment on a regular cadence to monitor drift.'
         ) }
         Default { @(
-            'Keep baselines enforced and re-run the assessment after major changes.'
-            'Continue monitoring privileged group changes and authentication hardening.'
+            'Address Low findings through routine maintenance.'
+            'Continue periodic reviews of privileged access and baseline drift.'
+            'Re-run the assessment after major changes.'
         ) }
     }
     $nextStepsHtml = ($nextSteps | ForEach-Object { "<li>$(HtmlEncode $_)</li>" }) -join "`n"
@@ -488,11 +502,12 @@ h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
 .card .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}
 .card .v{font-size:22px;font-weight:800;margin-top:6px}
 .card .s{margin-top:4px;color:var(--muted);font-size:12px}
-.span-3{grid-column:span 3} .span-4{grid-column:span 4} .span-6{grid-column:span 6}
+.span-3{grid-column:span 3} .span-4{grid-column:span 4}
 .pill{
   display:inline-flex;align-items:center;justify-content:center;
   padding:4px 10px;border-radius:999px;font-weight:800;font-size:12px;
   border:1px solid var(--line);
+  min-width:86px;
 }
 .sev-Critical{background:var(--critical-bg)} .sev-High{background:var(--high-bg)}
 .sev-Medium{background:var(--medium-bg)} .sev-Low{background:var(--low-bg)}
@@ -502,7 +517,7 @@ h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
 .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin:10px 0}
 .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 
-/* INPUTS */
+/* INPUTS (dropdown options readable) */
 select,input{
   background:rgba(255,255,255,.06);
   color:var(--text);
@@ -513,14 +528,7 @@ select,input{
 }
 input{min-width:240px}
 small{color:var(--muted)}
-
-/* FIX: dropdown list (options) should be readable.
-   Selected value stays white (select color above).
-   Options render with OS dropdown background -> use dark background + white text. */
-select option{
-  background:#0b1220;
-  color:#ffffff;
-}
+select option{ background:#0b1220; color:#ffffff; }
 
 table{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:rgba(255,255,255,.03)}
 th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
@@ -531,8 +539,29 @@ td.score{font-weight:800} td.title{font-weight:700}
 td.source .mono{font-size:12px;color:#d7e6ff}
 pre{white-space:pre-wrap;background:rgba(0,0,0,.25);border:1px solid var(--line);border-radius: var(--radius);padding:12px;color:#dbe6ff;overflow:auto}
 .footer{margin-top:16px;color:var(--muted);font-size:12px}
-.matrix-row.active td{background:rgba(255,255,255,.06)}
+
+/* SCORE MATRIX ALIGNMENT */
 .matrix-wrap{margin-top:10px}
+table.matrix{
+  table-layout:fixed;
+}
+table.matrix th, table.matrix td{
+  padding:14px 18px;
+}
+table.matrix th{ cursor:default; }
+table.matrix th:nth-child(1), table.matrix td:nth-child(1){
+  width:18%;
+  padding-left:22px;
+}
+table.matrix th:nth-child(2), table.matrix td:nth-child(2){
+  width:18%;
+  text-align:center;
+}
+table.matrix th:nth-child(3), table.matrix td:nth-child(3){
+  width:64%;
+  padding-left:22px;
+}
+.matrix-row.active td{background:rgba(255,255,255,.06)}
 </style>
 "@
 
@@ -653,7 +682,7 @@ $css
 
       <div class="matrix-wrap">
         <p style="margin-top:12px"><b>Score matrix:</b> The total score is mapped to a risk level as follows (current score highlighted).</p><br>
-        <table>
+        <table class="matrix">
           <thead>
             <tr>
               <th>Level</th>
@@ -672,7 +701,7 @@ $css
         $nextStepsHtml
       </ul>
 
-      <div class="footer">Note: Findings are derived from evidence files under the input folder. Validate scope and collection completeness.</div>
+      <div class="footer">Note: This score is an index based on the findings included in this report and the evidence files available under the input folder. Validate scope and collection completeness.</div>
     </div>
   </div>
 
@@ -722,8 +751,8 @@ $css
   </div>
 
   <div class="footer">
-    Generated by the Management Report script. Review detailed findings and evidence files for remediation actions. <br>
-    Script cannot provide interpretations and should be used in conjunction with security expertise. Report should not be used as absolute evidence of security posture.
+    Generated by the Management Report script. Review detailed findings and evidence files for remediation actions.<br>
+    This report summarizes configuration and baseline observations. It should be reviewed alongside operational context and existing compensating controls.
   </div>
 </div>
 
@@ -744,7 +773,7 @@ $js
     $txt += "Target: $computerName"
     $txt += "Generated: $now"
     $txt += "Overall risk level: $OverallLevel (Score=$TotalScore)"
-    $txt += "Score matrix: Low=0-15; Medium=16-35; High=36-59; Critical=60+"
+    $txt += "Score matrix: Low=0-49; Medium=50-99; High=100-149; Critical=150+"
     if ($UsersCount)  { $txt += "Users: $UsersCount" }
     if ($GroupsCount) { $txt += "Groups: $GroupsCount" }
     if ($OUsCount)    { $txt += "OUs: $OUsCount" }
