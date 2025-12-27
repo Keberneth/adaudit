@@ -17,7 +17,9 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.1.1 - 24/12/2025
+            [X] Version 7.1.2 - 26/12/2025
+                Added inactive computers report.
+            [ ] Version 7.1.1 - 25/12/2025
                 Added Windows Update audit for high risk missing updates.
             [ ] Version 7.1.0 - 24/12/2025
                 Added Get-DNSZoneInsecure function to check for DNS zones allowing insecure updates.
@@ -4683,5 +4685,6 @@ $nessusoutput | Out-File $outputdir\adaudit-replaced.nessus
 
 $endtime = Get-Date
 Write-Both "[*] Script end time $endtime"
+
 
 & "$PSScriptRoot\\mangament_report.ps1" -InputRoot $outputdir
