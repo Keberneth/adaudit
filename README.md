@@ -9,19 +9,19 @@ Chose Manual Download. You will get two .nuplkg files. Plase them in the ADAudit
 To install the required modules, run the powershell script AdAudit-Run.ps1 and chose option 2 for offline installation.<br><br>
 
 Changes to this fork:<br>
-Offline installation for dependencies<br>
-Added explainations to some of the report files<br>
-Deligated AD permissions report<br>
-Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)<br>
-Full DNS-ZoneReport report<br>
-Can run on an other server then AD DC as long as:<br>
--RSAT tools is installed<br>
--Server can manage AD<br>
--Powershell can run using domain admin account<br>
-Added runtime arg<br>
--delegatedpermissions<br>
--dnszone<br>
--inactivecomputers
+- Offline installation for dependencies<br>
+- Added explainations to some of the report files<br>
+- Deligated AD permissions report<br>
+- Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)<br>
+- Full DNS-ZoneReport report<br>
+- Can run on an other server then AD DC as long as:<br>
+- -RSAT tools is installed<br>
+- -Server can manage AD<br>
+- -Powershell can run as admin using domain admin account<br>
+- Added runtime arg<br>
+- -delegatedpermissions<br>
+- -dnszone<br>
+- -inactivecomputers
 <br>
 Overall report for management added as a separate script. Will run directly after Audit script. (Run -all argument for best result)
 <br><br>
