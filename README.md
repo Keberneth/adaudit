@@ -20,7 +20,8 @@ Can run on an other server then AD DC as long as:<br>
 -Powershell can run using domain admin account<br>
 Added runtime arg<br>
 -delegatedpermissions<br>
--dnszone
+-dnszone<br>
+-inactivecomputers
 <br>
 Overall report for management added as a separate script. Will run directly after Audit script. (Run -all argument for best result)
 <br><br>
