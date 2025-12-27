@@ -5,23 +5,24 @@ while ($true) {
     Write-Host "4: Domain Audit"
     Write-Host "5: Trusts"
     Write-Host "6: Accounts"
-    Write-Host "7: Password Policy"
-    Write-Host "8: NTDS"
-    Write-Host "9: Old Boxes"
-    Write-Host "10: GPO"
-    Write-Host "11: OU Perms"
-    Write-Host "12: LAPS"
-    Write-Host "13: Auth Pol Silos"
-    Write-Host "14: Insecure DNS Zone"
-    Write-Host "15: Recent Changes"
-    Write-Host "16: ADCS"
-    Write-Host "17: SPN"
-    Write-Host "18: ASREP"
-    Write-Host "19: ACL"
-    Write-Host "20: LDAP Security"
-    Write-Host "21: Delegated Permissions"
-    Write-Host "22: DNS Zone"
-    Write-Host "23: Run All Checks"
+    Write-Host "7: Inactive Computers"
+    Write-Host "8: Password Policy"
+    Write-Host "9: NTDS"
+    Write-Host "10: Old Boxes"
+    Write-Host "11: GPO"
+    Write-Host "12: OU Perms"
+    Write-Host "13: LAPS"
+    Write-Host "14: Auth Pol Silos"
+    Write-Host "15: Insecure DNS Zone"
+    Write-Host "16: Recent Changes"
+    Write-Host "17: ADCS"
+    Write-Host "18: SPN"
+    Write-Host "19: ASREP"
+    Write-Host "20: ACL"
+    Write-Host "21: LDAP Security"
+    Write-Host "22: Delegated Permissions"
+    Write-Host "23: DNS Zone"
+    Write-Host "24: Run All Checks"
     Write-Host "Q: Quit"
 
     $choice = Read-Host "Enter your choice"
@@ -42,23 +43,24 @@ while ($true) {
         '4'  { & $scriptPath -domainaudit; break }
         '5'  { & $scriptPath -trusts; break }
         '6'  { & $scriptPath -accounts; break }
-        '7'  { & $scriptPath -passwordpolicy; break }
-        '8'  { & $scriptPath -ntds; break }
-        '9'  { & $scriptPath -oldboxes; break }
-        '10' { & $scriptPath -gpo; break }
-        '11' { & $scriptPath -ouperms; break }
-        '12' { & $scriptPath -laps; break }
-        '13' { & $scriptPath -authpolsilos; break }
-        '14' { & $scriptPath -insecurednszone; break }
-        '15' { & $scriptPath -recentchanges; break }
-        '16' { & $scriptPath -adcs; break }
-        '17' { & $scriptPath -spn; break }
-        '18' { & $scriptPath -asrep; break }
-        '19' { & $scriptPath -acl; break }
-        '20' { & $scriptPath -ldapsecurity; break }
-        '21' { & $scriptPath -delegatedpermissions; break }
-        '22' { & $scriptPath -dnszone; break }
-        '23' { & $scriptPath -all; break }
+        '7'  { & $scriptPath -inactivecomputers; break }
+        '8'  { & $scriptPath -passwordpolicy; break }
+        '9'  { & $scriptPath -ntds; break }
+        '10' { & $scriptPath -oldboxes; break }
+        '11' { & $scriptPath -gpo; break }
+        '12' { & $scriptPath -ouperms; break }
+        '13' { & $scriptPath -laps; break }
+        '14' { & $scriptPath -authpolsilos; break }
+        '15' { & $scriptPath -insecurednszone; break }
+        '16' { & $scriptPath -recentchanges; break }
+        '17' { & $scriptPath -adcs; break }
+        '18' { & $scriptPath -spn; break }
+        '19' { & $scriptPath -asrep; break }
+        '20' { & $scriptPath -acl; break }
+        '21' { & $scriptPath -ldapsecurity; break }
+        '22' { & $scriptPath -delegatedpermissions; break }
+        '23' { & $scriptPath -dnszone; break }
+        '24' { & $scriptPath -all; break }
         'Q' { exit }
 
         default { Write-Host "Invalid choice, please try again." }
