@@ -104,53 +104,6 @@ function Invoke-ManagementReport {
         }) | Out-Null
     }
 
-    # Legacy scaler retained (used for some non-baseline count signals)
-    function Score-Scaled([string]$Severity,[double]$Count,[int]$maxScale = 50) {
-        $Severity = Normalize-Severity $Severity
-        $base  = [int]$SeverityScore[$Severity]
-        $c     = [Math]::Max([double]$Count, 0)
-        $scale = [Math]::Min([Math]::Floor($c / 10), [Math]::Floor($maxScale / 10))
-        return ($base + [int]$scale)
-    }
-
-    # New: Over-baseline curve (Option A)
-    function Score-OverBaselineLog {
-        param(
-            [string]$Severity,
-            [double]$Observed,
-            [double]$Baseline,
-
-            # Cap how much *extra* a single finding can add above the base severity score
-            [int]$MaxAdd = 18,
-
-            # Aggressiveness (higher = steeper)
-            [double]$K = 5
-        )
-
-        $Severity = Normalize-Severity $Severity
-        $base = [int]$SeverityScore[$Severity]
-
-        if ($Baseline -le 0) { return $base }
-        if ($Observed -le $Baseline) { return $base }
-
-        $ratio = $Observed / $Baseline
-
-        # log2(ratio) scaling
-        $add = [Math]::Ceiling($K * ([Math]::Log($ratio) / [Math]::Log(2)))
-
-        # cap so no single metric dominates
-        $add = [Math]::Min([int]$add, [int]$MaxAdd)
-
-        return ($base + [int]$add)
-    }
-
-    function DisplayOrDash($v) {
-        if ($null -eq $v) { return '&mdash;' }
-        $s = [string]$v
-        if ([string]::IsNullOrWhiteSpace($s)) { return '&mdash;' }
-        return (HtmlEncode $s)
-    }
-
     # Avoid duplicates (same Severity+Title+Link)
     $dedup = New-Object 'System.Collections.Generic.HashSet[string]'
     function Add-FindingOnce {
@@ -165,6 +118,196 @@ function Invoke-ManagementReport {
         $k = '{0}|{1}|{2}' -f $Severity, (($Title -as [string]).Trim()), (Get-RelPath $Path)
         if ($dedup.Add($k)) {
             Add-Finding -Severity $Severity -Title $Title -Evidence $Evidence -Path $Path -ScoreOverride $ScoreOverride
+        }
+    }
+
+    # Legacy scaler retained (used for some non-baseline count signals)
+    function Score-Scaled([string]$Severity,[double]$Count,[int]$maxScale = 50) {
+        $Severity = Normalize-Severity $Severity
+        $base  = [int]$SeverityScore[$Severity]
+        $c     = [Math]::Max([double]$Count, 0)
+        $scale = [Math]::Min([Math]::Floor($c / 10), [Math]::Floor($maxScale / 10))
+        return ($base + [int]$scale)
+    }
+
+    # Over-baseline curve (baseline > 0)
+    function Score-OverBaselineLog {
+        param(
+            [string]$Severity,
+            [double]$Observed,
+            [double]$Baseline,
+            [int]$MaxAdd = 18,
+            [double]$K = 5
+        )
+
+        $Severity = Normalize-Severity $Severity
+        $base = [int]$SeverityScore[$Severity]
+
+        if ($Baseline -le 0) { return $base }
+        if ($Observed -le $Baseline) { return $base }
+
+        $ratio = $Observed / $Baseline
+        $add = [Math]::Ceiling($K * ([Math]::Log($ratio) / [Math]::Log(2)))
+        $add = [Math]::Min([int]$add, [int]$MaxAdd)
+        return ($base + [int]$add)
+    }
+
+    # Baseline=0 curve (scale from Observed)
+    function Score-BaselineZeroLog {
+        param(
+            [string]$Severity,
+            [double]$Observed,
+            [int]$MaxAdd = 34,
+            [double]$K = 10
+        )
+
+        $Severity = Normalize-Severity $Severity
+        $base = [int]$SeverityScore[$Severity]
+
+        $obs = [Math]::Max([double]$Observed, 0)
+        if ($obs -le 0) { return $base }
+
+        $add = [Math]::Ceiling($K * ([Math]::Log($obs + 1) / [Math]::Log(2)))
+        $add = [Math]::Min([int]$add, [int]$MaxAdd)
+        return ($base + [int]$add)
+    }
+
+    function DisplayOrDash($v) {
+        if ($null -eq $v) { return '&mdash;' }
+        $s = [string]$v
+        if ([string]::IsNullOrWhiteSpace($s)) { return '&mdash;' }
+        return (HtmlEncode $s)
+    }
+
+    # ---------------------------
+    # Baseline file parsing FIRST (authoritative for overlap + Schema Admins + etc)
+    # ---------------------------
+    $baselinePath = Join-Path $InputRoot 'ad_high_risk_baseline.txt'
+
+    # Flags so we can suppress duplicate secondary sources (schema_admins.txt, domain_admins.txt, etc)
+    $baselineHasDA = $false
+    $baselineHasEA = $false
+    $baselineHasSA = $false
+    $baselineHasDAOverlap = $false
+
+    if (Test-Path $baselinePath) {
+        $lines = Get-Content -LiteralPath $baselinePath -ErrorAction SilentlyContinue
+        $inFindings = $false
+
+        foreach ($ln in $lines) {
+            if (-not $ln) { continue }
+            if ($ln -match '^\s*Findings\s*$') { $inFindings = $true; continue }
+            if (-not $inFindings) { continue }
+
+            if ($ln -match '^\s*\[(CRITICAL|HIGH|MEDIUM|LOW)\]\s*(.+?)\s*\|\s*Observed:\s*(.+?)\s*\|\s*Baseline:\s*(.+?)\s*$') {
+                $sevRaw  = $matches[1]
+                $title   = $matches[2].Trim()
+                $obs     = $matches[3].Trim()
+                $base    = $matches[4].Trim()
+                $sev     = Normalize-Severity $sevRaw
+
+                $evidence = "Observed: $obs | Baseline: $base"
+
+                # Default score = base severity points
+                $score = [int]$SeverityScore[$sev]
+
+                switch -Regex ($title) {
+
+                    '^krbtgt password age$' {
+                        $obsDays = 0
+                        if ($obs -match '\(([0-9]+)\s*days\)') { $obsDays = [int]$matches[1] }
+                        elseif ($obs -match '([0-9]+)') { $obsDays = [int]$matches[1] }
+
+                        $baseDays = 0
+                        if ($base -match '([0-9]+)') { $baseDays = [int]$matches[1] }
+
+                        if ($obsDays -gt 0 -and $baseDays -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsDays -Baseline $baseDays -MaxAdd 22 -K 5
+                        }
+                    }
+
+                    '^Domain Admins$' {
+                        $baselineHasDA = $true
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+
+                        $baseCount = 0
+                        if ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
+
+                        if ($obsCount -gt 0 -and $baseCount -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
+                        }
+                    }
+
+                    '^Enterprise Admins$' {
+                        $baselineHasEA = $true
+                        # keep default severity score (or add custom curve later if you want)
+                    }
+
+                    '^Schema Admins$' {
+                        $baselineHasSA = $true
+
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+
+                        # Baseline is typically 0 (except during schema change)
+                        $baseCount = 0
+                        if ($base -match '^\s*0\b') { $baseCount = 0 }
+                        elseif ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
+
+                        if ($obsCount -gt 0) {
+                            if ($baseCount -le 0) {
+                                # baseline 0 => escalate strongly
+                                $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 28 -K 8
+                                $sev = 'Critical' # enforce critical as per baseline marked critical
+                            } else {
+                                $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
+                            }
+                        }
+                    }
+
+                    '^Domain Admins group overlap' {
+                        $baselineHasDAOverlap = $true
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+
+                        if ($obsCount -gt 0) {
+                            $sev = 'Critical' # baseline says Critical
+                            $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 34 -K 10
+                        }
+                    }
+
+                    '^Enabled accounts inactive >\s*180\s*days$' {
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+                        if ($obsCount -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline 1 -MaxAdd 14 -K 3
+                        }
+                    }
+
+                    '^Enabled user accounts with PasswordNeverExpires$' {
+                        $obsCount = 0
+                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
+                        if ($obsCount -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline 1 -MaxAdd 14 -K 3
+                        }
+                    }
+
+                    '^ms-DS-MachineAccountQuota$' {
+                        $obsVal = 0
+                        if ($obs -match '([0-9]+)') { $obsVal = [int]$matches[1] }
+                        if ($obsVal -gt 0) {
+                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsVal -Baseline 1 -MaxAdd 16 -K 4
+                        }
+                    }
+
+                    default {
+                        $score = [int]$SeverityScore[$sev]
+                    }
+                }
+
+                Add-FindingOnce $sev $title $evidence $baselinePath $score
+            }
         }
     }
 
@@ -339,150 +482,43 @@ function Invoke-ManagementReport {
         }
     }
 
-    # Admin groups (text files)
+    # ---------------------------
+    # Admin group text files (SUPPRESSED if baseline includes the same finding)
+    # ---------------------------
     $daPath = Join-Path $InputRoot 'domain_admins.txt'
     $eaPath = Join-Path $InputRoot 'enterprise_admins.txt'
     $saPath = Join-Path $InputRoot 'schema_admins.txt'
 
-    $daCount = (Get-NonHeaderLines $daPath).Count
-    $eaCount = (Get-NonHeaderLines $eaPath).Count
-    $saCount = (Get-NonHeaderLines $saPath).Count
-
-    if ($daCount -gt 0) {
-        $sev = if ($daCount -gt 10) { 'High' } elseif ($daCount -gt 5) { 'Medium' } else { 'Low' }
-        $daBase = 5
-        Add-FindingOnce $sev 'Domain Admins membership size' "Members: $daCount (Baseline: <= $daBase)" $daPath (Score-OverBaselineLog -Severity $sev -Observed $daCount -Baseline $daBase -MaxAdd 18 -K 4)
-    }
-    if ($eaCount -gt 0) {
-        $sev = if ($eaCount -gt 5) { 'High' } elseif ($eaCount -gt 2) { 'Medium' } else { 'Low' }
-        $eaBase = 2
-        Add-FindingOnce $sev 'Enterprise Admins membership size' "Members: $eaCount (Baseline: <= $eaBase)" $eaPath (Score-OverBaselineLog -Severity $sev -Observed $eaCount -Baseline $eaBase -MaxAdd 16 -K 4)
-    }
-    if ($saCount -gt 0) {
-        $sev = if ($saCount -gt 5) { 'High' } elseif ($saCount -gt 2) { 'Medium' } else { 'Low' }
-        $saBase = 1
-        Add-FindingOnce $sev 'Schema Admins membership size' "Members: $saCount (Baseline: 0 except during schema change)" $saPath (Score-OverBaselineLog -Severity $sev -Observed $saCount -Baseline $saBase -MaxAdd 18 -K 4)
-    }
-
-    # NEW: Domain Admins overlap (baseline 0 => any overlap is Critical)
-    # Expected evidence file: accounts_domain_admins_group_overlap.txt
-    $daOverlapPath  = Join-Path $InputRoot 'accounts_domain_admins_group_overlap.txt'
-    $daOverlapLines = Get-NonHeaderLines $daOverlapPath
-    if ($daOverlapLines.Count -gt 0) {
-        $obs = $daOverlapLines.Count
-
-        # Baseline is 0, but Score-OverBaselineLog requires Baseline > 0 for ratio math.
-        # Treat as Baseline=1 for scoring curve while keeping evidence baseline as 0.
-        $score = Score-OverBaselineLog -Severity 'Critical' -Observed $obs -Baseline 1 -MaxAdd 22 -K 5
-
-        Add-FindingOnce `
-            'Critical' `
-            'Domain Admins membership overlaps with other privileged groups' `
-            "Overlapping accounts: $obs (Baseline: 0)" `
-            $daOverlapPath `
-            $score
-    }
-
-    # --- Baseline file parsing: convert [CRITICAL]/[HIGH]/... lines into findings ---
-    $baselinePath = Join-Path $InputRoot 'ad_high_risk_baseline.txt'
-    if (Test-Path $baselinePath) {
-        $lines = Get-Content -LiteralPath $baselinePath -ErrorAction SilentlyContinue
-        $inFindings = $false
-
-        foreach ($ln in $lines) {
-            if (-not $ln) { continue }
-            if ($ln -match '^\s*Findings\s*$') { $inFindings = $true; continue }
-            if (-not $inFindings) { continue }
-
-            if ($ln -match '^\s*\[(CRITICAL|HIGH|MEDIUM|LOW)\]\s*(.+?)\s*\|\s*Observed:\s*(.+?)\s*\|\s*Baseline:\s*(.+?)\s*$') {
-                $sevRaw  = $matches[1]
-                $title   = $matches[2].Trim()
-                $obs     = $matches[3].Trim()
-                $base    = $matches[4].Trim()
-                $sev     = Normalize-Severity $sevRaw
-
-                $evidence = "Observed: $obs | Baseline: $base"
-
-                # Default baseline score = base severity points
-                $score = [int]$SeverityScore[$sev]
-
-                switch -Regex ($title) {
-
-                    '^krbtgt password age$' {
-                        $obsDays = 0
-                        if ($obs -match '\(([0-9]+)\s*days\)') { $obsDays = [int]$matches[1] }
-                        elseif ($obs -match '([0-9]+)') { $obsDays = [int]$matches[1] }
-
-                        $baseDays = 0
-                        if ($base -match '([0-9]+)') { $baseDays = [int]$matches[1] }
-
-                        if ($obsDays -gt 0 -and $baseDays -gt 0) {
-                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsDays -Baseline $baseDays -MaxAdd 22 -K 5
-                        }
-                    }
-
-                    '^Domain Admins$' {
-                        $obsCount = 0
-                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
-
-                        $baseCount = 0
-                        if ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
-
-                        if ($obsCount -gt 0 -and $baseCount -gt 0) {
-                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
-                        }
-                    }
-
-                    '^Schema Admins$' {
-                        $obsCount = 0
-                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
-
-                        $baseCount = 0
-                        if ($base -match '^\s*0\b') { $baseCount = 0 }
-                        elseif ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
-
-                        if ($obsCount -gt 0) {
-                            if ($baseCount -le 0) {
-                                $score = [int]$SeverityScore[$sev] + 18
-                            } else {
-                                $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
-                            }
-                        }
-                    }
-
-                    '^Enabled accounts inactive >\s*180\s*days$' {
-                        $obsCount = 0
-                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
-                        if ($obsCount -gt 0) {
-                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline 1 -MaxAdd 14 -K 3
-                        }
-                    }
-
-                    '^Enabled user accounts with PasswordNeverExpires$' {
-                        $obsCount = 0
-                        if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
-                        if ($obsCount -gt 0) {
-                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline 1 -MaxAdd 14 -K 3
-                        }
-                    }
-
-                    '^ms-DS-MachineAccountQuota$' {
-                        $obsVal = 0
-                        if ($obs -match '([0-9]+)') { $obsVal = [int]$matches[1] }
-                        if ($obsVal -gt 0) {
-                            $score = Score-OverBaselineLog -Severity $sev -Observed $obsVal -Baseline 1 -MaxAdd 16 -K 4
-                        }
-                    }
-
-                    default {
-                        $score = [int]$SeverityScore[$sev]
-                    }
-                }
-
-                Add-FindingOnce $sev $title $evidence $baselinePath $score
-            }
+    if (-not $baselineHasDA) {
+        $daCount = (Get-NonHeaderLines $daPath).Count
+        if ($daCount -gt 0) {
+            $sev = if ($daCount -gt 10) { 'High' } elseif ($daCount -gt 5) { 'Medium' } else { 'Low' }
+            $daBase = 5
+            Add-FindingOnce $sev 'Domain Admins membership size' "Members: $daCount (Baseline: <= $daBase)" $daPath (Score-OverBaselineLog -Severity $sev -Observed $daCount -Baseline $daBase -MaxAdd 18 -K 4)
         }
     }
+
+    if (-not $baselineHasEA) {
+        $eaCount = (Get-NonHeaderLines $eaPath).Count
+        if ($eaCount -gt 0) {
+            $sev = if ($eaCount -gt 5) { 'High' } elseif ($eaCount -gt 2) { 'Medium' } else { 'Low' }
+            $eaBase = 2
+            Add-FindingOnce $sev 'Enterprise Admins membership size' "Members: $eaCount (Baseline: <= $eaBase)" $eaPath (Score-OverBaselineLog -Severity $sev -Observed $eaCount -Baseline $eaBase -MaxAdd 16 -K 4)
+        }
+    }
+
+    # THIS is the change you asked for: if baseline contains Schema Admins (critical), do not add schema_admins.txt finding
+    if (-not $baselineHasSA) {
+        $saCount = (Get-NonHeaderLines $saPath).Count
+        if ($saCount -gt 0) {
+            $sev = if ($saCount -gt 5) { 'High' } elseif ($saCount -gt 2) { 'Medium' } else { 'Low' }
+            $saBase = 1
+            Add-FindingOnce $sev 'Schema Admins membership size' "Members: $saCount (Baseline: 0 except during schema change)" $saPath (Score-OverBaselineLog -Severity $sev -Observed $saCount -Baseline $saBase -MaxAdd 18 -K 4)
+        }
+    }
+
+    # IMPORTANT: Do NOT calculate DA overlap from accounts_domain_admins_group_overlap.txt
+    # Baseline file is authoritative for PRIV_DA_OVERLAP as requested.
 
     # Severity counts
     $sevCounts = @{
@@ -552,7 +588,9 @@ function Invoke-ManagementReport {
 
     $domainInfoBlock = ''
     try {
-        $domainInfoBlock = (Get-Content -LiteralPath $baselinePath -ErrorAction SilentlyContinue) -join "`n"
+        if (Test-Path $baselinePath) {
+            $domainInfoBlock = (Get-Content -LiteralPath $baselinePath -ErrorAction SilentlyContinue) -join "`n"
+        }
     } catch { }
 
     $sortedFindings = $Findings | Sort-Object -Property @{Expression='Score';Descending=$true}, @{Expression='Severity';Descending=$false}
@@ -582,14 +620,14 @@ function Invoke-ManagementReport {
         'Critical' { @(
             'Assign owners for Critical findings and define target dates for remediation.'
             'Review privileged group membership (Domain Admins / Schema Admins / built-in administrators) and ensure membership is justified, documented, and reviewed regularly.'
-            'If Domain Admin accounts overlap with other privileged groups, reduce standing access and align with tiering (Tier 0 vs Tier 1 separation).'
+            'Reduce standing privilege and align with tiering (Tier 0 vs Tier 1 separation). Avoid Tier0+Tier1 overlap.'
             'Address password control items (duplicate passwords, PasswordNeverExpires usage, KRBTGT rotation policy) and confirm they align with operational requirements.'
             'Re-run the assessment after remediation to confirm closure and reduce configuration drift.'
         ) }
         'High' { @(
             'Prioritize High findings and track remediation to closure.'
             'Validate privileged access governance (membership reviews, approvals, and change tracking).'
-            'If Domain Admin accounts overlap with other privileged groups, reduce standing access and align with tiering (Tier 0 vs Tier 1 separation).'
+            'Reduce standing privilege and align with tiering (Tier 0 vs Tier 1 separation).'
             'Standardize account lifecycle controls (inactive accounts, disabled account review cadence).'
             'Re-run the assessment after changes to confirm improvements.'
         ) }
@@ -665,8 +703,6 @@ h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
 .callout p{margin:0;line-height:1.4} .callout ul{margin:10px 0 0 18px} .callout li{margin:6px 0}
 .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin:10px 0}
 .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-
-/* INPUTS (dropdown options readable) */
 select,input{
   background:rgba(255,255,255,.06);
   color:var(--text);
@@ -678,7 +714,6 @@ select,input{
 input{min-width:240px}
 small{color:var(--muted)}
 select option{ background:#0b1220; color:#ffffff; }
-
 table{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:rgba(255,255,255,.03)}
 th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em;background: rgba(255,255,255,.05);cursor:pointer;user-select:none}
@@ -688,28 +723,13 @@ td.score{font-weight:800} td.title{font-weight:700}
 td.source .mono{font-size:12px;color:#d7e6ff}
 pre{white-space:pre-wrap;background:rgba(0,0,0,.25);border:1px solid var(--line);border-radius: var(--radius);padding:12px;color:#dbe6ff;overflow:auto}
 .footer{margin-top:16px;color:var(--muted);font-size:12px}
-
-/* SCORE MATRIX ALIGNMENT */
 .matrix-wrap{margin-top:10px}
-table.matrix{
-  table-layout:fixed;
-}
-table.matrix th, table.matrix td{
-  padding:14px 18px;
-}
+table.matrix{ table-layout:fixed; }
+table.matrix th, table.matrix td{ padding:14px 18px; }
 table.matrix th{ cursor:default; }
-table.matrix th:nth-child(1), table.matrix td:nth-child(1){
-  width:18%;
-  padding-left:22px;
-}
-table.matrix th:nth-child(2), table.matrix td:nth-child(2){
-  width:18%;
-  text-align:center;
-}
-table.matrix th:nth-child(3), table.matrix td:nth-child(3){
-  width:64%;
-  padding-left:22px;
-}
+table.matrix th:nth-child(1), table.matrix td:nth-child(1){ width:18%; padding-left:22px; }
+table.matrix th:nth-child(2), table.matrix td:nth-child(2){ width:18%; text-align:center; }
+table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-left:22px; }
 .matrix-row.active td{background:rgba(255,255,255,.06)}
 </style>
 "@
@@ -777,7 +797,7 @@ table.matrix th:nth-child(3), table.matrix td:nth-child(3){
   });
 
   applyFilters();
-  sortBy('score'); sortBy('score'); // start desc
+  sortBy('score'); sortBy('score');
 })();
 </script>
 "@
