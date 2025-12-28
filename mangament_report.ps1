@@ -59,7 +59,7 @@ function Invoke-ManagementReport {
 
     $Findings = New-Object System.Collections.Generic.List[object]
 
-    # Base points (start values) - updated
+    # Base points (start values)
     $SeverityScore = @{
         Critical = 12
         High     = 8
@@ -274,18 +274,18 @@ function Invoke-ManagementReport {
     if ($spnLines.Count -gt 0) {
         Add-FindingOnce 'Medium' 'Kerberoastable SPNs present (review high-value service accounts)' "Lines: $($spnLines.Count)" $spnPath (Score-Scaled 'Medium' $spnLines.Count)
     }
+
     # Inactive computer objects (>90 days)
     $inactiveCompsPath = Join-Path $InputRoot 'computers_inactive_90days.txt'
     $inactiveCompsLines = Get-NonHeaderLines $inactiveCompsPath
     if ($inactiveCompsLines.Count -gt 0) {
         $obs = $inactiveCompsLines.Count
-        # Baseline: adjust if needed; using 5 by default to flag drift early
         $base = 5
         $sev = if ($obs -ge 200) { 'High' } elseif ($obs -ge 50) { 'Medium' } else { 'Low' }
         $score = Score-OverBaselineLog -Severity $sev -Observed $obs -Baseline $base -MaxAdd 14 -K 3
         Add-FindingOnce $sev 'Inactive computer accounts (>90 days)' "Computers inactive: $obs (Baseline: <= $base)" $inactiveCompsPath $score
     }
-    
+
     $pndePath = Join-Path $InputRoot 'accounts_passdontexpire.txt'
     $pndeLines = Get-NonHeaderLines $pndePath
     if ($pndeLines.Count -gt 0) {
@@ -360,9 +360,27 @@ function Invoke-ManagementReport {
     }
     if ($saCount -gt 0) {
         $sev = if ($saCount -gt 5) { 'High' } elseif ($saCount -gt 2) { 'Medium' } else { 'Low' }
-        # Baseline effectively 0 except during schema changes; use 1 to avoid divide-by-zero and cap.
         $saBase = 1
         Add-FindingOnce $sev 'Schema Admins membership size' "Members: $saCount (Baseline: 0 except during schema change)" $saPath (Score-OverBaselineLog -Severity $sev -Observed $saCount -Baseline $saBase -MaxAdd 18 -K 4)
+    }
+
+    # NEW: Domain Admins overlap (baseline 0 => any overlap is Critical)
+    # Expected evidence file: accounts_domain_admins_group_overlap.txt
+    $daOverlapPath  = Join-Path $InputRoot 'accounts_domain_admins_group_overlap.txt'
+    $daOverlapLines = Get-NonHeaderLines $daOverlapPath
+    if ($daOverlapLines.Count -gt 0) {
+        $obs = $daOverlapLines.Count
+
+        # Baseline is 0, but Score-OverBaselineLog requires Baseline > 0 for ratio math.
+        # Treat as Baseline=1 for scoring curve while keeping evidence baseline as 0.
+        $score = Score-OverBaselineLog -Severity 'Critical' -Observed $obs -Baseline 1 -MaxAdd 22 -K 5
+
+        Add-FindingOnce `
+            'Critical' `
+            'Domain Admins membership overlaps with other privileged groups' `
+            "Overlapping accounts: $obs (Baseline: 0)" `
+            $daOverlapPath `
+            $score
     }
 
     # --- Baseline file parsing: convert [CRITICAL]/[HIGH]/... lines into findings ---
@@ -391,12 +409,10 @@ function Invoke-ManagementReport {
                 switch -Regex ($title) {
 
                     '^krbtgt password age$' {
-                        # Prefer "(NNN days)" from Observed text; fall back to first number
                         $obsDays = 0
                         if ($obs -match '\(([0-9]+)\s*days\)') { $obsDays = [int]$matches[1] }
                         elseif ($obs -match '([0-9]+)') { $obsDays = [int]$matches[1] }
 
-                        # Baseline like "<= 180 days"
                         $baseDays = 0
                         if ($base -match '([0-9]+)') { $baseDays = [int]$matches[1] }
 
@@ -421,14 +437,12 @@ function Invoke-ManagementReport {
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
 
-                        # Baseline "0 (except during schema change)" -> treat as effectively zero
                         $baseCount = 0
                         if ($base -match '^\s*0\b') { $baseCount = 0 }
                         elseif ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
 
                         if ($obsCount -gt 0) {
                             if ($baseCount -le 0) {
-                                # Baseline effectively 0 => strong deviation; cap bump
                                 $score = [int]$SeverityScore[$sev] + 18
                             } else {
                                 $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
@@ -440,7 +454,6 @@ function Invoke-ManagementReport {
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
                         if ($obsCount -gt 0) {
-                            # baseline 0 => use 1 for math, cap it
                             $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline 1 -MaxAdd 14 -K 3
                         }
                     }
@@ -462,7 +475,6 @@ function Invoke-ManagementReport {
                     }
 
                     default {
-                        # Keep base score for generic baseline lines (stable, non-brittle parsing)
                         $score = [int]$SeverityScore[$sev]
                     }
                 }
@@ -485,7 +497,7 @@ function Invoke-ManagementReport {
     foreach ($f in $Findings) { $TotalScore += [int]$f.Score }
 
     # ---------------------------
-    # Score matrix (neutral) + banding (CONSISTENT everywhere)
+    # Score matrix + banding
     # ---------------------------
     $ScoreBands = @(
         [PSCustomObject]@{
@@ -559,7 +571,6 @@ function Invoke-ManagementReport {
 "@
     }
 
-    # Neutral interpretation text
     $meaning = switch ($OverallLevel) {
         'Critical' { 'The overall score indicates significant gaps relative to the defined baselines. Prioritize remediation for the highest-severity items and confirm governance for privileged access and password controls.' }
         'High'     { 'The overall score indicates material gaps relative to the defined baselines. Prioritize remediation and validate that controls are applied consistently across the environment.' }
@@ -571,12 +582,14 @@ function Invoke-ManagementReport {
         'Critical' { @(
             'Assign owners for Critical findings and define target dates for remediation.'
             'Review privileged group membership (Domain Admins / Schema Admins / built-in administrators) and ensure membership is justified, documented, and reviewed regularly.'
+            'If Domain Admin accounts overlap with other privileged groups, reduce standing access and align with tiering (Tier 0 vs Tier 1 separation).'
             'Address password control items (duplicate passwords, PasswordNeverExpires usage, KRBTGT rotation policy) and confirm they align with operational requirements.'
             'Re-run the assessment after remediation to confirm closure and reduce configuration drift.'
         ) }
         'High' { @(
             'Prioritize High findings and track remediation to closure.'
             'Validate privileged access governance (membership reviews, approvals, and change tracking).'
+            'If Domain Admin accounts overlap with other privileged groups, reduce standing access and align with tiering (Tier 0 vs Tier 1 separation).'
             'Standardize account lifecycle controls (inactive accounts, disabled account review cadence).'
             'Re-run the assessment after changes to confirm improvements.'
         ) }

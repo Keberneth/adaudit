@@ -17,7 +17,9 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.1.2 - 26/12/2025
+            [X] Version 7.1.3 - 26/12/2025
+                Added check for tier overlapping accounts in privileged groups.
+            [ ] Version 7.1.2 - 26/12/2025
                 Added inactive computers report.
             [ ] Version 7.1.1 - 25/12/2025
                 Added Windows Update audit for high risk missing updates.
@@ -805,6 +807,187 @@ Function Get-AdminAccountChecks {
     if ($AdministratorLastLogonDate -gt (Get-Date).AddDays(-180)) {
         Write-Both "    [!] UID500 (LocalAdministrator) account is still used, last used $AdministratorLastLogonDate! (KB309)"
         Write-Nessus-Finding "AdminAccountRenamed" "KB309" "UID500 (LocalAdmini) account is still used, last used $AdministratorLastLogonDate"
+    }
+}
+Function Get-DomainAdminsGroupOverlap {
+    [CmdletBinding()]
+    Param(
+        # Baseline groups that should NOT be treated as overlap for Tier-0 admin accounts
+        [string[]]$BaselineGroups = @(
+            'Domain Users',
+            'Domain Admins',
+            'Administrators',
+            'Users',
+
+            # Common Tier-0 extensions (policy-based but usually acceptable for Tier-0 accounts)
+            'Group Policy Creator Owners',
+            'Protected Users',
+            'Key Admins',
+            'Enterprise Key Admins',
+
+            # Forest-level Tier-0 (only if the account is intended to operate at forest scope)
+            'Schema Admins',
+            'Enterprise Admins'
+        ),
+
+        # Tier-0 groups (for detecting tier-mixing, not for allowlisting)
+        [string[]]$Tier0Groups = @(
+            'Enterprise Admins',
+            'Schema Admins',
+            'Administrators',
+            'Domain Admins',
+            'Group Policy Creator Owners',
+            'Protected Users',
+            'Key Admins',
+            'Enterprise Key Admins'
+        ),
+
+        # Tier-1 groups (membership by a DA should be considered overlap / tier mixing)
+        [string[]]$Tier1Groups = @(
+            'Account Operators',
+            'Server Operators',
+            'Backup Operators',
+            'Print Operators',
+            'DnsAdmins',
+            'Certificate Publishers',
+            'Remote Desktop Users'
+        ),
+
+        # If set, only write results when overlap is found (default: true)
+        [switch]$OnlyReportFindings = $true
+    )
+
+    # Ensure HighRisk output folder exists
+    $highRiskDir = Join-Path $outputdir 'HighRisk'
+    if (-not (Test-Path $highRiskDir)) {
+        New-Item -Path $highRiskDir -ItemType Directory -Force | Out-Null
+    }
+
+    # Output files:
+    # - TXT in root output folder
+    # - CSV in HighRisk folder (as requested)
+    $outTxt = Join-Path $outputdir   "accounts_domain_admins_group_overlap.txt"
+    $outCsv = Join-Path $highRiskDir "accounts_domain_admins_group_overlap.csv"
+
+    # Resolve the Domain Admins group name already used by the script if present
+    $daGroupName = $script:DomainAdmins
+    if ([string]::IsNullOrEmpty($daGroupName)) { $daGroupName = 'Domain Admins' }
+
+    # Case-insensitive lookup tables
+    $baselineSet = @{}
+    foreach ($g in $BaselineGroups) {
+        if ($g) { $baselineSet[$g.ToLowerInvariant()] = $true }
+    }
+
+    $tier0Set = @{}
+    foreach ($g in $Tier0Groups) {
+        if ($g) { $tier0Set[$g.ToLowerInvariant()] = $true }
+    }
+
+    $tier1Set = @{}
+    foreach ($g in $Tier1Groups) {
+        if ($g) { $tier1Set[$g.ToLowerInvariant()] = $true }
+    }
+
+    $results = @()
+
+    try {
+        # Enumerate effective members (recursive) of Domain Admins
+        $members = Get-ADGroupMember -Identity $daGroupName -Recursive -ErrorAction Stop |
+            Where-Object { $_.objectClass -eq 'user' }
+    }
+    catch {
+        Write-Both "    [!] Failed to enumerate members of '$daGroupName' : $($_.Exception.Message)"
+        return
+    }
+
+    foreach ($m in $members) {
+        try {
+            $u = Get-ADUser -Identity $m.DistinguishedName -Properties Enabled,SamAccountName,Name,DistinguishedName -ErrorAction Stop
+
+            # Effective group membership (includes nested groups)
+            $groups = Get-ADPrincipalGroupMembership -Identity $u.DistinguishedName -ErrorAction Stop |
+                Select-Object -ExpandProperty SamAccountName
+
+            $groupsNorm = @($groups | Where-Object { $_ } | ForEach-Object { $_.ToString() })
+
+            # Extra groups beyond baseline (case-insensitive)
+            $extra = @()
+            foreach ($g in $groupsNorm) {
+                if (-not $baselineSet.ContainsKey($g.ToLowerInvariant())) {
+                    $extra += $g
+                }
+            }
+
+            # Tier hits (not mutually exclusive)
+            $tier0Hits = @()
+            $tier1Hits = @()
+            foreach ($g in $groupsNorm) {
+                $gl = $g.ToLowerInvariant()
+                if ($tier0Set.ContainsKey($gl)) { $tier0Hits += $g }
+                if ($tier1Set.ContainsKey($gl)) { $tier1Hits += $g }
+            }
+
+            $flagExtra    = (($extra | Measure-Object).Count -gt 0)
+            $flagTier1    = (($tier1Hits | Measure-Object).Count -gt 0)
+            $flagTierMix  = (($tier0Hits | Measure-Object).Count -gt 0 -and ($tier1Hits | Measure-Object).Count -gt 0)
+
+            if ($flagExtra -or $flagTier1 -or $flagTierMix) {
+                $flags = @()
+                if ($flagExtra)   { $flags += 'ExtraGroupsBeyondBaseline' }
+                if ($flagTier1)   { $flags += 'Tier1MembershipDetected' }
+                if ($flagTierMix) { $flags += 'Tier0AndTier1Overlap' }
+
+                $results += [pscustomobject]@{
+                    SamAccountName     = $u.SamAccountName
+                    Name               = $u.Name
+                    Enabled            = $u.Enabled
+                    ExtraGroupCount    = ($extra | Measure-Object).Count
+                    ExtraGroups        = ($extra | Sort-Object -Unique) -join '; '
+                    Tier0GroupsFound   = ($tier0Hits | Sort-Object -Unique) -join '; '
+                    Tier1GroupsFound   = ($tier1Hits | Sort-Object -Unique) -join '; '
+                    Flags              = ($flags -join '|')
+                }
+            }
+            elseif (-not $OnlyReportFindings) {
+                $results += [pscustomobject]@{
+                    SamAccountName     = $u.SamAccountName
+                    Name               = $u.Name
+                    Enabled            = $u.Enabled
+                    ExtraGroupCount    = 0
+                    ExtraGroups        = ''
+                    Tier0GroupsFound   = ($tier0Hits | Sort-Object -Unique) -join '; '
+                    Tier1GroupsFound   = ''
+                    Flags              = ''
+                }
+            }
+        }
+        catch {
+            Write-Both "    [!] Failed processing DA member '$($m.SamAccountName)' : $($_.Exception.Message)"
+        }
+    }
+
+    if (($results | Measure-Object).Count -gt 0) {
+        # CSV -> HighRisk folder
+        $results | Sort-Object ExtraGroupCount -Descending |
+            Export-Csv -NoTypeInformation -Encoding UTF8 -Path $outCsv
+
+        # TXT -> root output folder
+        "Domain Admins users with group overlap beyond baseline ($($BaselineGroups -join ', ')):" |
+            Out-File -Encoding UTF8 $outTxt
+
+        $results | Sort-Object ExtraGroupCount -Descending |
+            ForEach-Object {
+                "{0} ({1}) Enabled={2} ExtraGroups={3} Flags={4}`n  Extra: {5}`n  Tier0:  {6}`n  Tier1:  {7}`n" -f `
+                    $_.SamAccountName, $_.Name, $_.Enabled, $_.ExtraGroupCount, $_.Flags, $_.ExtraGroups, $_.Tier0GroupsFound, $_.Tier1GroupsFound
+            } | Add-Content -Encoding UTF8 -Path $outTxt
+
+        Write-Both "    [!] Domain Admins group overlap findings: $((($results | Measure-Object).Count)) account(s)."
+        Write-Both "        - TXT: $(Split-Path -Leaf $outTxt)"
+        Write-Both "        - CSV: HighRisk\$(Split-Path -Leaf $outCsv)"
+    }
+    else {
+        Write-Both "    [+] No Domain Admin users found with group overlap beyond baseline."
     }
 }
 Function Get-DisabledAccounts {
@@ -4131,6 +4314,7 @@ Function Get-HighRiskADBaselineReport {
     }
 
     # Summarize privileged group counts vs baseline thresholds
+        # Summarize privileged group counts vs baseline thresholds
     $privSummary = @()
     foreach ($gd in $groupDefs) {
         $cnt = ($privDetails | Where-Object { $_.RiskId -eq $gd.RiskId } | Measure-Object).Count
@@ -4143,14 +4327,40 @@ Function Get-HighRiskADBaselineReport {
         elseif ($gd.RiskId -eq 'PRIV_ADM' -and $cnt -gt 0) { $isFinding = $true } # "Minimal" -> always worth review
 
         $privSummary += [pscustomobject]@{
-            RiskId      = $gd.RiskId
-            Category    = 'Privileged Group Membership'
-            Item        = $gd.Name
-            Severity    = $gd.Severity
-            Baseline    = $gd.Baseline
-            Observed    = $cnt
-            IsFinding   = $isFinding
+            RiskId         = $gd.RiskId
+            Category       = 'Privileged Group Membership'
+            Item           = $gd.Name
+            Severity       = $gd.Severity
+            Baseline       = $gd.Baseline
+            Observed       = $cnt
+            IsFinding      = $isFinding
             Recommendation = 'Minimize permanent membership; use JIT/PIM where possible; keep Tier0 separate; monitor changes.'
+        }
+    }
+
+    # Domain Admins group overlap (DA members in extra groups)
+    $daOverlapCsv = Join-Path $riskOutDir 'accounts_domain_admins_group_overlap.csv'
+    $daOverlapSummaryObj = $null
+
+    if (Test-Path $daOverlapCsv) {
+        $overlaps = Import-Csv $daOverlapCsv
+
+        # Prefer unique accounts (not rows) if SamAccountName exists
+        if ($overlaps -and ($overlaps[0].PSObject.Properties.Name -contains 'SamAccountName')) {
+            $overlapCount = ($overlaps | Select-Object -ExpandProperty SamAccountName -Unique | Measure-Object).Count
+        } else {
+            $overlapCount = ($overlaps | Measure-Object).Count
+        }
+
+        $daOverlapSummaryObj = [pscustomobject]@{
+            RiskId         = 'PRIV_DA_OVERLAP'
+            Category       = 'Privileged Group Membership'
+            Item           = 'Domain Admins group overlap (extra group memberships)'
+            Severity       = 'CRITICAL'
+            Baseline       = 0
+            Observed       = $overlapCount
+            IsFinding      = ($overlapCount -gt 0)
+            Recommendation = 'Remove Domain Admin accounts from all non-essential groups. Tier0 identities must be isolated; avoid Tier0+Tier1 overlap and delegated memberships.'
         }
     }
 
@@ -4460,17 +4670,19 @@ Function Get-HighRiskADBaselineReport {
         # If Windows Update history cannot be queried, keep "Not evaluated" and do not create report.
     }
 
-
     # Build summary table
     $summary = @()
     $summary += $privSummary
+    if ($daOverlapSummaryObj) { $summary += $daOverlapSummaryObj }
     $summary += $krbtgtObj
+    $summary += $inactiveObj
     $summary += $inactiveObj
     $summary += $pneObj
     $summary += $disabledOldObj
     $summary += $maqObj
     $summary += $dupSummaryObj
     $summary += $wuSummaryObj
+
 
     # Write TXT report (with baseline table embedded)
     $lines = New-Object System.Collections.Generic.List[string]
@@ -4608,7 +4820,7 @@ if ($installdeps) { $running = $true ; Write-Both "[*] Installing optionnal feat
 if ($hostdetails -or ($all -and 'hostdetails' -notin $exclude) -or 'hostdetails' -in $selectedChecks) { $running = $true ; Write-Both "[*] Device Information" ; Get-HostDetails }
 if ($domainaudit -or ($all -and 'domainaudit' -notin $exclude) -or 'domainaudit' -in $selectedChecks) { $running = $true ; Write-Both "[*] Domain Audit" ; Get-LastWUDate ; Get-DCEval ; Get-TimeSource ; Get-PrivilegedGroupMembership ; Get-MachineAccountQuota; Get-DefaultDomainControllersPolicy ; Get-SMB1Support ; Get-FunctionalLevel ; Get-DCsNotOwnedByDA ; Get-ReplicationType ; Check-Shares ; Get-RecycleBinState ; Get-CriticalServicesStatus ; Get-RODC }
 if ($trusts -or ($all -and 'trusts' -notin $exclude) -or 'trusts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Domain Trust Audit" ; Get-DomainTrusts }
-if ($accounts -or ($all -and 'accounts' -notin $exclude) -or 'accounts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Accounts Audit" ; Get-InactiveAccounts ; Get-DisabledAccounts ; Get-LockedAccounts ; Get-AdminAccountChecks ; Get-NULLSessions ; Get-PrivilegedGroupAccounts ; Get-ProtectedUsers }
+if ($accounts -or ($all -and 'accounts' -notin $exclude) -or 'accounts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Accounts Audit" ; Get-InactiveAccounts ; Get-DisabledAccounts ; Get-LockedAccounts ; Get-AdminAccountChecks ; Get-NULLSessions ; Get-PrivilegedGroupAccounts ; Get-ProtectedUsers ; Get-DomainAdminsGroupOverlap}
 if ($passwordpolicy -or ($all -and 'passwordpolicy' -notin $exclude) -or 'passwordpolicy' -in $selectedChecks) { $running = $true ; Write-Both "[*] Password Information Audit" ; Get-AccountPassDontExpire ; Get-UserPasswordNotChangedRecently ; Get-PasswordPolicy ; Get-PasswordQuality }
 if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or 'inactivecomputers' -in $selectedChecks) {
     $running = $true
