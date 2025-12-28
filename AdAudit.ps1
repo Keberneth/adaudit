@@ -17,7 +17,7 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.1.3 - 26/12/2025
+            [X] Version 7.1.3 - 28/12/2025
                 Added check for tier overlapping accounts in privileged groups.
             [ ] Version 7.1.2 - 26/12/2025
                 Added inactive computers report.
