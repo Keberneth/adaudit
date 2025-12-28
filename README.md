@@ -12,7 +12,6 @@ Changes to this fork:<br>
 Offline installation for dependencies<br>
 Added explainations to some of the report files<br>
 Deligated AD permissions report<br>
-Tier overlapping accounts check<br>
 Lookup DNS servers and then run the DNS report. (DNS report do not need to run on the DNS server)<br>
 Full DNS-ZoneReport report<br>
 Can run on an other server then AD DC as long as:<br>
@@ -46,7 +45,10 @@ The output is intended to provide visibility into potential risks, misconfigurat
 <br><br>
 
 ## Mangament Report
-Management report script creates a html file that give a more reprisentible summary of the audit with a overall security score
+Management report script creates a html file that give a more reprisentible summary of the audit with a overall security score<br>
+The futher something is from the basline the higher risk score. Example, Critical risks start at 12 points, but criticallity and points get higher the futher from basline a risk is.<br>
+If krbtgt password has not been changed in 180 days it is a criticcal risk. (12 points) but if it is not changed in 2000 days it is 31 points.<br>
+This is a way of pinpoint and help prioritize criticalities. A low criticality can become a high if far enough from the basline value. 
 <br><br>
 
 
