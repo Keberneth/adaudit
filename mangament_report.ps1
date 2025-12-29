@@ -57,6 +57,40 @@ function Invoke-ManagementReport {
         try { return Import-Csv -LiteralPath $path -ErrorAction Stop } catch { return @() }
     }
 
+    # --- ASREP.txt parsing: count ONLY the actual vulnerable accounts ---
+    # Your ASREP.txt includes a lot of explanatory text + per-account commands.
+    # This function extracts only the account header lines like: "Jane Doe (jado)"
+    # by requiring:
+    #   - line starts at column 1 (no leading whitespace)
+    #   - line ends with "(samAccountName)"
+    #   - excludes known header lines starting with "Accounts ("
+    function Get-AsrepAccounts([string]$path) {
+        if (-not (Test-Path -LiteralPath $path)) { return @() }
+        $lines = @()
+        try { $lines = Get-Content -LiteralPath $path -ErrorAction Stop } catch { return @() }
+        $accounts = foreach ($ln in $lines) {
+            if (-not $ln) { continue }
+            $t = $ln.TrimEnd()
+            if ($t.Trim().Length -eq 0) { continue }
+
+            # Must start at column 1 (exclude indented command lines)
+            if ($t -notmatch '^[^\s]') { continue }
+
+            # Exclude section headers like: Accounts (Display Name (sAMAccountName)) ...
+            if ($t -match '^Accounts\s*\(') { continue }
+
+            # Match: Display Name (sam)  [sam = typical AD sAMAccountName charset]
+            if ($t -match '^(?<Display>.+?)\s+\((?<Sam>[A-Za-z0-9._-]{1,64})\)\s*$') {
+                [PSCustomObject]@{
+                    DisplayName    = $matches['Display'].Trim()
+                    SamAccountName = $matches['Sam'].Trim()
+                    Line           = $t
+                }
+            }
+        }
+        return @($accounts)
+    }
+
     $Findings = New-Object System.Collections.Generic.List[object]
 
     # Base points (start values)
@@ -241,7 +275,6 @@ function Invoke-ManagementReport {
 
                     '^Enterprise Admins$' {
                         $baselineHasEA = $true
-                        # keep default severity score (or add custom curve later if you want)
                     }
 
                     '^Schema Admins$' {
@@ -272,7 +305,7 @@ function Invoke-ManagementReport {
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
 
                         if ($obsCount -gt 0) {
-                            $sev = 'Critical' # baseline says Critical
+                            $sev = 'Critical'
                             $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 34 -K 10
                         }
                     }
@@ -406,10 +439,26 @@ function Invoke-ManagementReport {
         Add-FindingOnce 'High' 'Domain controllers allow weak Kerberos ciphers' "DCs flagged: $($weakKerbLines.Count)" $weakKerbPath (Score-Scaled 'High' $weakKerbLines.Count)
     }
 
+    # ---------------------------
+    # AS-REP roastable (FIXED COUNT + High/Critical curve, baseline=0)
+    # ---------------------------
     $asrepPath = Join-Path $InputRoot 'ASREP.txt'
-    $asrepLines = Get-NonHeaderLines $asrepPath
-    if ($asrepLines.Count -gt 0) {
-        Add-FindingOnce 'High' 'Accounts without Kerberos pre-auth (AS-REP roastable)' "Accounts: $($asrepLines.Count)" $asrepPath (Score-Scaled 'High' $asrepLines.Count)
+    $asrepAccounts = Get-AsrepAccounts $asrepPath
+    $asrepCount = $asrepAccounts.Count
+
+    if ($asrepCount -gt 0) {
+        # Enforce High/Critical only, baseline=0 curve.
+        # If you want always-Critical, keep this as Critical.
+        $sev = 'Critical'
+
+        # Score using baseline=0 curve (same style as other "baseline 0" findings)
+        $score = Score-BaselineZeroLog -Severity $sev -Observed $asrepCount -MaxAdd 34 -K 10
+
+        # Include a short list of affected sAMAccountName values in evidence (keeps report useful but small)
+        $samList = ($asrepAccounts | Select-Object -ExpandProperty SamAccountName -Unique)
+        $samPreview = if ($samList.Count -le 10) { ($samList -join ', ') } else { (($samList | Select-Object -First 10) -join ', ') + ', ...' }
+
+        Add-FindingOnce $sev 'Accounts without Kerberos pre-auth (AS-REP roastable)' "Accounts: $asrepCount | Users: $samPreview" $asrepPath $score
     }
 
     $spnPath = Join-Path $InputRoot 'SPNs.txt'
@@ -507,7 +556,6 @@ function Invoke-ManagementReport {
         }
     }
 
-    # THIS is the change you asked for: if baseline contains Schema Admins (critical), do not add schema_admins.txt finding
     if (-not $baselineHasSA) {
         $saCount = (Get-NonHeaderLines $saPath).Count
         if ($saCount -gt 0) {
@@ -516,9 +564,6 @@ function Invoke-ManagementReport {
             Add-FindingOnce $sev 'Schema Admins membership size' "Members: $saCount (Baseline: 0 except during schema change)" $saPath (Score-OverBaselineLog -Severity $sev -Observed $saCount -Baseline $saBase -MaxAdd 18 -K 4)
         }
     }
-
-    # IMPORTANT: Do NOT calculate DA overlap from accounts_domain_admins_group_overlap.txt
-    # Baseline file is authoritative for PRIV_DA_OVERLAP as requested.
 
     # Severity counts
     $sevCounts = @{
