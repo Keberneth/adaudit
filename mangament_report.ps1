@@ -58,18 +58,19 @@ function Invoke-ManagementReport {
     }
 
     # --- ASREP.txt parsing: count ONLY the actual vulnerable accounts ---
-    # Your ASREP.txt includes a lot of explanatory text + per-account commands.
-    # This function extracts only the account header lines like: "Jane Doe (jado)"
-    # by requiring:
-    #   - line starts at column 1 (no leading whitespace)
-    #   - line ends with "(samAccountName)"
-    #   - excludes known header lines starting with "Accounts ("
+    # FIX: always returns an array (even when exactly one match)
     function Get-AsrepAccounts([string]$path) {
         if (-not (Test-Path -LiteralPath $path)) { return @() }
+
         $lines = @()
         try { $lines = Get-Content -LiteralPath $path -ErrorAction Stop } catch { return @() }
-        $accounts = foreach ($ln in $lines) {
+
+        $results = New-Object 'System.Collections.Generic.List[object]'
+
+        foreach ($ln in $lines) {
             if (-not $ln) { continue }
+
+            # Keep original content; handle end-of-line whitespace
             $t = $ln.TrimEnd()
             if ($t.Trim().Length -eq 0) { continue }
 
@@ -79,16 +80,18 @@ function Invoke-ManagementReport {
             # Exclude section headers like: Accounts (Display Name (sAMAccountName)) ...
             if ($t -match '^Accounts\s*\(') { continue }
 
-            # Match: Display Name (sam)  [sam = typical AD sAMAccountName charset]
+            # Match: Display Name (sam)
+            # sam charset kept conservative; extend if needed.
             if ($t -match '^(?<Display>.+?)\s+\((?<Sam>[A-Za-z0-9._-]{1,64})\)\s*$') {
-                [PSCustomObject]@{
+                $results.Add([PSCustomObject]@{
                     DisplayName    = $matches['Display'].Trim()
                     SamAccountName = $matches['Sam'].Trim()
                     Line           = $t
-                }
+                }) | Out-Null
             }
         }
-        return @($accounts)
+
+        return $results.ToArray()
     }
 
     $Findings = New-Object System.Collections.Generic.List[object]
@@ -292,7 +295,7 @@ function Invoke-ManagementReport {
                             if ($baseCount -le 0) {
                                 # baseline 0 => escalate strongly
                                 $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 28 -K 8
-                                $sev = 'Critical' # enforce critical as per baseline marked critical
+                                $sev = 'Critical'
                             } else {
                                 $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
                             }
@@ -440,23 +443,37 @@ function Invoke-ManagementReport {
     }
 
     # ---------------------------
-    # AS-REP roastable (FIXED COUNT + High/Critical curve, baseline=0)
+    # AS-REP roastable (FIXED: single-user array + score rule)
+    # Requirement: if exactly 1 user => Critical with 12 points
     # ---------------------------
     $asrepPath = Join-Path $InputRoot 'ASREP.txt'
-    $asrepAccounts = Get-AsrepAccounts $asrepPath
-    $asrepCount = $asrepAccounts.Count
+    $asrepAccounts = @(
+        Get-AsrepAccounts -path $asrepPath
+    )
+    $asrepCount = @($asrepAccounts).Count
 
     if ($asrepCount -gt 0) {
-        # Enforce High/Critical only, baseline=0 curve.
-        # If you want always-Critical, keep this as Critical.
         $sev = 'Critical'
 
-        # Score using baseline=0 curve (same style as other "baseline 0" findings)
-        $score = Score-BaselineZeroLog -Severity $sev -Observed $asrepCount -MaxAdd 34 -K 10
+        # EXACTLY what you asked for:
+        # - 1 account => Critical, 12 points
+        # - 2+ accounts => scaled (baseline=0 curve)
+        $score = if ($asrepCount -eq 1) {
+            [int]$SeverityScore.Critical
+        } else {
+            Score-BaselineZeroLog -Severity $sev -Observed $asrepCount -MaxAdd 34 -K 10
+        }
 
-        # Include a short list of affected sAMAccountName values in evidence (keeps report useful but small)
-        $samList = ($asrepAccounts | Select-Object -ExpandProperty SamAccountName -Unique)
-        $samPreview = if ($samList.Count -le 10) { ($samList -join ', ') } else { (($samList | Select-Object -First 10) -join ', ') + ', ...' }
+        # Preview users safely as an array (avoid char-splitting when only one string)
+        $samList = @(
+            $asrepAccounts | Select-Object -ExpandProperty SamAccountName -Unique
+        )
+
+        $samPreview = if ($samList.Count -le 10) {
+            ($samList -join ', ')
+        } else {
+            (($samList | Select-Object -First 10) -join ', ') + ', ...'
+        }
 
         Add-FindingOnce $sev 'Accounts without Kerberos pre-auth (AS-REP roastable)' "Accounts: $asrepCount | Users: $samPreview" $asrepPath $score
     }
