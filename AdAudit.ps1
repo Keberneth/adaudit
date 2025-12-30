@@ -17,7 +17,10 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.1.3 - 28/12/2025
+            [X] Version 7.1.4 - 28/12/2025
+                Removed ntds export function.
+                Fixed bug with Win32 FileTime
+            [ ] Version 7.1.3 - 28/12/2025
                 Added check for tier overlapping accounts in privileged groups.
             [ ] Version 7.1.2 - 26/12/2025
                 Added inactive computers report.
@@ -170,7 +173,6 @@ Param (
     [switch]$accounts = $false,
     [switch]$InactiveComputers = $false,
     [switch]$passwordpolicy = $false,
-    [switch]$ntds = $false,
     [switch]$oldboxes = $false,
     [switch]$gpo = $false,
     [switch]$ouperms = $false,
@@ -708,15 +710,6 @@ Function Get-GPOsPerOU {
     Write-Progress -Activity "Identifying which GPOs apply to which OUs..." -Status "Ready" -Completed
     Write-Both "    [+] Inherited GPOs saved to ous_inheritedGPOs.txt"
 }
-Function Get-NTDSdit {
-    #Dumps NTDS.dit, SYSTEM and SAM for password cracking
-    if (Test-Path "$outputdir\ntds.dit") { Remove-Item "$outputdir\ntds.dit" -Recurse }
-    $outputdirntds = '\"' + $outputdir + '\ntds.dit\"'
-    $command = "ntdsutil `"ac in ntds`" `"ifm`" `"cr fu $outputdirntds `" q q"
-    $hide = cmd.exe /c "$command" 2>&1
-    Write-Both "    [+] NTDS.dit, SYSTEM & SAM saved to output folder"
-    Write-Both "    [+] Use secretsdump.py -system registry/SYSTEM -ntds Active\ Directory/ntds.dit LOCAL -outputfile customer"
-}
 Function Get-SYSVOLXMLS {
     #Finds XML files in SYSVOL (thanks --> https://github.com/PowerShellMafia/PowerSploit/blob/master/Exfiltration/Get-GPPPassword.ps1)
     $XMLFiles = Get-ChildItem -Path "\\$Env:USERDNSDOMAIN\SYSVOL" -Recurse -ErrorAction SilentlyContinue -Include 'Groups.xml', 'Services.xml', 'Scheduledtasks.xml', 'DataSources.xml', 'Printers.xml', 'Drives.xml'
@@ -751,39 +744,100 @@ Function Get-SYSVOLXMLS {
         Write-Nessus-Finding "GPOPasswordStorage" "KB329" "$GPOxml"
     }
 }
+
 Function Get-InactiveAccounts {
-    #Lists accounts not used in past 180 days plus some checks for admin accounts
+
+    [CmdletBinding()]
+    param(
+        [int]$InactiveDays = 180
+    )
+
+    $ErrorActionPreference = 'Stop'
+
     $count = 0
     $progresscount = 0
-    $inactiveaccounts = Search-ADaccount -AccountInactive -Timespan (New-TimeSpan -Days 180) -UsersOnly | Where-Object { $_.Enabled -eq $true }
-    $totalcount = ($inactiveaccounts | Measure-Object | Select-Object Count).count
+
+    # Output paths (match script convention: txt in root outputdir, csv in HighRisk)
+    $txtPath = Join-Path $outputdir 'accounts_inactive.txt'
+    $highRiskDir = Join-Path $outputdir 'HighRisk'
+    $csvPath = Join-Path $highRiskDir ("accounts_inactive_{0}days.csv" -f $InactiveDays)
+
+    if (-not (Test-Path -LiteralPath $highRiskDir)) {
+        New-Item -ItemType Directory -Path $highRiskDir -Force | Out-Null
+    }
+
+    # lastLogonTimestamp is replicated; good for inactivity reporting
+    $cutoffUtc = [datetime]::UtcNow.AddDays(-1 * [math]::Abs($InactiveDays))
+    $cutoffFt  = $cutoffUtc.ToFileTimeUtc()
+
+    # Enabled users + inactive (old lastLogonTimestamp or missing)
+    $ldapFilter =
+        "(&(objectCategory=person)(objectClass=user)" +
+        "(!(userAccountControl:1.2.840.113556.1.4.803:=2))" +
+        "(|(lastLogonTimestamp<=$cutoffFt)(!(lastLogonTimestamp=*))))"
+
+    $props = @('samAccountName','name','distinguishedName','lastLogonTimestamp','whenCreated','pwdLastSet')
+
+    $inactiveUsers = Get-ADUser -LDAPFilter $ldapFilter -Properties $props
+
+    $totalcount = ($inactiveUsers | Measure-Object).Count
 
     if ($totalcount -gt 0) {
-        # Header (overwrite any existing file)
-"@Accounts inactive (no logon) for the past 180 days" | Set-Content -Path "$outputdir\accounts_inactive.txt"
+        "@Accounts inactive (no logon) for the past $InactiveDays days (based on lastLogonTimestamp)" |
+            Set-Content -Encoding UTF8 -Path $txtPath
+    } else {
+        # Ensure no stale file from previous runs
+        if (Test-Path -LiteralPath $txtPath) { Remove-Item -LiteralPath $txtPath -Force -ErrorAction SilentlyContinue }
+        # Also clear CSV
+        if (Test-Path -LiteralPath $csvPath) { Remove-Item -LiteralPath $csvPath -Force -ErrorAction SilentlyContinue }
     }
 
-    foreach ($account in $inactiveaccounts) {
-        if ($totalcount -eq 0) { break }
+    $results = foreach ($u in $inactiveUsers) {
         $progresscount++
-        Write-Progress -Activity "Searching for inactive users..." -Status "Currently identifed $count" -PercentComplete ($progresscount / $totalcount * 100)
-        if ($account.Enabled) {
-            if ($account.LastLogonDate) {
-                $userlastused = $account.LastLogonDate
-            }
-            else {
-                $userlastused = "Never"
-            }
-            Add-Content -Path "$outputdir\accounts_inactive.txt" -Value "User $($account.SamAccountName) ($($account.Name)) has not logged on since $userlastused"
-            $count++
+        Write-Progress -Activity "Searching for inactive users..." -Status "Currently identified $count" -PercentComplete (($progresscount / [math]::Max($totalcount,1)) * 100)
+
+        $lastLogonUtc = $null
+        if ($u.lastLogonTimestamp) {
+            try { $lastLogonUtc = [datetime]::FromFileTimeUtc([int64]$u.lastLogonTimestamp) } catch { $lastLogonUtc = $null }
+        }
+
+        $pwdLastSetUtc = $null
+        if ($u.pwdLastSet) {
+            try { $pwdLastSetUtc = [datetime]::FromFileTimeUtc([int64]$u.pwdLastSet) } catch { $pwdLastSetUtc = $null }
+        }
+
+        $lltText = if ($lastLogonUtc) { $lastLogonUtc.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' }
+
+        Add-Content -Encoding UTF8 -Path $txtPath -Value "User $($u.SamAccountName) ($($u.Name)) has not logged on since $lltText"
+        $count++
+
+        [pscustomobject]@{
+            SamAccountName    = $u.SamAccountName
+            Name              = $u.Name
+            LastLogonDateUTC  = $lastLogonUtc
+            PwdLastSetUTC     = $pwdLastSetUtc
+            WhenCreated       = $u.whenCreated
+            DistinguishedName = $u.DistinguishedName
         }
     }
+
     Write-Progress -Activity "Searching for inactive users..." -Status "Ready" -Completed
+
     if ($count -gt 0) {
-        Write-Both "    [!] $count inactive user accounts(180days), see accounts_inactive.txt (KB500)"
-        Write-Nessus-Finding "InactiveAccounts" "KB500" ([System.IO.File]::ReadAllText("$outputdir\accounts_inactive.txt"))
+        # Sort: oldest logon first (nulls last)
+        $resultsSorted = $results | Sort-Object @{
+            Expression = { if ($_.LastLogonDateUTC) { $_.LastLogonDateUTC } else { [datetime]::MaxValue } }
+            Ascending  = $true
+        }, SamAccountName
+
+        $resultsSorted | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csvPath
+
+        Write-Both "    [!] $count inactive user accounts($InactiveDays days), see accounts_inactive.txt (KB500)"
+        Write-Both "        - CSV: HighRisk\$(Split-Path -Leaf $csvPath)"
+        Write-Nessus-Finding "InactiveAccounts" "KB500" ([System.IO.File]::ReadAllText($txtPath))
     }
 }
+
 Function Get-AdminAccountChecks {
     #Checks if Administrator account has been renamed, replaced and is no longer used.
     $AdministratorSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-500"
@@ -991,22 +1045,47 @@ Function Get-DomainAdminsGroupOverlap {
     }
 }
 Function Get-DisabledAccounts {
-    #Lists disabled accounts
-    $disabledaccounts = Search-ADaccount -AccountDisabled -UsersOnly
+
+    [CmdletBinding()]
+    param()
+
+    $ErrorActionPreference = 'Stop'
+
     $count = 0
-    $totalcount = ($disabledaccounts | Measure-Object | Select-Object Count).count
+    $txtPath = Join-Path $outputdir 'accounts_disabled.txt'
+
+    # Disabled user accounts (UAC bit 0x2)
+    $ldapFilter = "(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2))"
+
+    $disabledaccounts = Get-ADUser -LDAPFilter $ldapFilter -Properties SamAccountName,Name
+
+    $totalcount = ($disabledaccounts | Measure-Object).Count
+
+    if ($totalcount -gt 0) {
+        # Reset file for this run
+        Set-Content -Encoding UTF8 -Path $txtPath -Value "@Disabled user accounts"
+    } else {
+        # Ensure no stale output from previous runs
+        if (Test-Path -LiteralPath $txtPath) { Remove-Item -LiteralPath $txtPath -Force -ErrorAction SilentlyContinue }
+    }
+
     foreach ($account in $disabledaccounts) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for disabled users..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
-        Add-Content -Path "$outputdir\accounts_disabled.txt" -Value "Account $($account.SamAccountName) ($($account.Name)) is disabled"
+
+        Write-Progress -Activity "Searching for disabled users..." -Status "Currently identified $count" -PercentComplete (($count / $totalcount) * 100)
+
+        Add-Content -Encoding UTF8 -Path $txtPath -Value "Account $($account.SamAccountName) ($($account.Name)) is disabled"
         $count++
     }
+
     Write-Progress -Activity "Searching for disabled users..." -Status "Ready" -Completed
+
     if ($count -gt 0) {
         Write-Both "    [!] $count disabled user accounts, see accounts_disabled.txt (KB501)"
-        Write-Nessus-Finding "DisabledAccounts" "KB501" ([System.IO.File]::ReadAllText("$outputdir\accounts_disabled.txt"))
+        Write-Nessus-Finding "DisabledAccounts" "KB501" ([System.IO.File]::ReadAllText($txtPath))
     }
 }
+
 Function Get-LockedAccounts {
     #Lists locked accounts
     $lockedAccounts = Get-ADUser -Filter * -Properties LockedOut | Where-Object { $_.LockedOut -eq $true }
@@ -1629,10 +1708,10 @@ Function Get-CriticalServicesStatus {
     $searcher = [ADSISearcher] "(objectClass=msDFSR-GlobalSettings)"
     $objectExists = $searcher.FindOne() -ne $null
     if ($objectExists) {
-        $services = @("dns", "netlogon", "kdc", "w32time", "ntds", "dfsr")
+        $services = @("dns", "netlogon", "kdc", "w32time", "dfsr")
     }
     else {
-        $services = @("dns", "netlogon", "kdc", "w32time", "ntds", "ntfrs")
+        $services = @("dns", "netlogon", "kdc", "w32time", "ntfrs")
     }
     foreach ($DC in $dcList) {
         foreach ($service in $services) {
@@ -2626,26 +2705,27 @@ function Export-ADAuditDataExtract {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$false)]
-        [ValidateScript({Test-Path $_ -PathType 'Container'})]
+        [ValidateScript({ Test-Path $_ -PathType 'Container' })]
         [string]$Path = (Join-Path $outputdir 'ADExtract'),
+
         [Parameter(Mandatory=$false)]
         [string]$SearchBase = (Get-ADRootDSE | Select-Object -ExpandProperty defaultNamingContext)
     )
 
     try { Import-Module ActiveDirectory -ErrorAction Stop } catch { Write-Both "    [!] ActiveDirectory module missing. $_"; return }
-    try { Import-Module GroupPolicy -ErrorAction Stop } catch { Write-Both "    [!] GroupPolicy module missing. $_"; return }
+    try { Import-Module GroupPolicy    -ErrorAction Stop } catch { Write-Both "    [!] GroupPolicy module missing. $_"; return }
 
     $domainInfo = Get-ADDomain -Current LocalComputer
     $domainDN   = $domainInfo.DistinguishedName
     $outRoot    = Join-Path $Path $domainDN
 
     if (Test-Path $outRoot) { Remove-Item $outRoot -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -ItemType Directory -Path $outRoot | Out-Null
+    New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
     $log = Join-Path $outRoot 'consoleOutput.txt'
-"@Starting AD data extract at $(Get-Date -Format G)" | Out-File -FilePath $log -Encoding utf8
-"@Path parameter: '$outRoot'" | Out-File -FilePath $log -Append -Encoding utf8
-"@SearchBase parameter: '$SearchBase'" | Out-File -FilePath $log -Append -Encoding utf8
+    "@Starting AD data extract at $(Get-Date -Format G)" | Out-File -FilePath $log -Encoding utf8
+    "@Path parameter: '$outRoot'"                        | Out-File -FilePath $log -Append -Encoding utf8
+    "@SearchBase parameter: '$SearchBase'"               | Out-File -FilePath $log -Append -Encoding utf8
 
     # OS info
     $sysInfo = Get-CimInstance -ClassName Win32_OperatingSystem
@@ -2673,76 +2753,179 @@ function Export-ADAuditDataExtract {
         ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
         Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-ForestInfo.csv") -Append
 
-    # Users
-    $delimiter='|'; $eol="`r`n"
-    $userProps = @('accountExpirationDate','adminCount','canonicalName','cn','comment','company','department','description','displayName',
+    # -------------------------
+    # Users (SAFE RAW LDAP EXPORT)
+    # -------------------------
+    $delimiter = '|'
+    $eol = "`r`n"
+
+    function _SafeFileTimeToString {
+        param([object]$v)
+        if ($null -eq $v) { return '' }
+        try {
+            $ft = [int64]$v
+            if ($ft -le 0) { return '' }
+            return [datetime]::FromFileTimeUtc($ft).ToString("o")
+        } catch {
+            return ''   # invalid/out-of-range FILETIME -> blank, do not fail export
+        }
+    }
+
+    function _PropFirst {
+        param($props, [string]$name)
+        if ($props.Contains($name) -and $props[$name] -and $props[$name].Count -gt 0) { return $props[$name][0] }
+        return $null
+    }
+
+    function _PropJoin {
+        param($props, [string]$name, [string]$sep)
+        if ($props.Contains($name) -and $props[$name] -and $props[$name].Count -gt 0) {
+            return ($props[$name] | ForEach-Object { [string]$_ }) -join $sep
+        }
+        return ''
+    }
+
+    function _SidBytesToString {
+        param([object]$sidObj)
+        try {
+            if ($sidObj -is [byte[]]) {
+                return (New-Object System.Security.Principal.SecurityIdentifier($sidObj,0)).Value
+            }
+            if ($sidObj) { return [string]$sidObj }
+            return ''
+        } catch { return '' }
+    }
+
+    # Keep your original header list, but source values via LDAP safely
+    $userProps = @(
+        'accountExpirationDate','adminCount','canonicalName','cn','comment','company','department','description','displayName',
         'distinguishedName','employeeID','employeeNumber','employeeType','givenName','info','LastLogonDate','mail','managedObjects',
         'manager','memberOf','middleName','msDS-AllowedToDelegateTo','msDS-PSOApplied','msDS-ResultantPSO',
         'msDS-User-Account-Control-Computed','msDS-UserPasswordExpiryTimeComputed','name','objectSid','PasswordExpired',
         'PasswordLastSet','primaryGroupID','sAMAccountName','servicePrincipalName','sIDHistory','sn','title','uid','uidNumber',
-        'userAccountControl','userWorkstations','whenChanged','whenCreated')
+        'userAccountControl','userWorkstations','whenChanged','whenCreated'
+    )
     $userHeader = $userProps + @('relativeIdentifier')
-    $users = Get-ADUser -SearchBase $SearchBase -Filter * -Properties $userProps
-    $w = [System.IO.StreamWriter](Join-Path $outRoot "$($domainInfo.DNSRoot)-Users.csv")
-    $w.Write(($userHeader -join $delimiter) + $eol)
-    foreach ($u in $users) {
-        $managed = ($u.managedObjects | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
-        $memberof = ($u.memberOf | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
-        $psoApplied = (($u.'msDS-PSOApplied' -join ';') -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=',''
-        $psoRes = (($u.'msDS-ResultantPSO' -join ';') -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=',''
-        $line = @(
-            [string]$u.accountExpirationDate
-            $u.adminCount
-            (Remove-InvalidFileNameChars $u.canonicalName)
-            (Remove-InvalidFileNameChars $u.cn)
-            (Remove-InvalidFileNameChars $u.comment)
-            $u.company
-            $u.department
-            (Remove-InvalidFileNameChars $u.description)
-            (Remove-InvalidFileNameChars $u.displayName)
-            $u.distinguishedName
-            $u.employeeID
-            $u.employeeNumber
-            $u.employeeType
-            (Remove-InvalidFileNameChars $u.givenName)
-            (Remove-InvalidFileNameChars $u.info)
-            [string]$u.LastLogonDate
-            $u.mail
-            $managed
-            $u.manager
-            $memberof
-            (Remove-InvalidFileNameChars $u.middleName)
-            ($u.'msDS-AllowedToDelegateTo' -join ';')
-            $psoApplied
-            $psoRes
-            (ConvertFrom-UACComputed $u.'msDS-User-Account-Control-Computed')
-            (ConvertFrom-PasswordExpiration $u.'msDS-UserPasswordExpiryTimeComputed')
-            (Remove-InvalidFileNameChars $u.name)
-            $u.objectSid
-            $u.PasswordExpired
-            [string]$u.PasswordLastSet
-            $u.primaryGroupID
-            $u.sAMAccountName
-            ($u.servicePrincipalName -join ';')
-            ($u.sIDHistory -join ';')
-            (Remove-InvalidFileNameChars $u.sn)
-            $u.title
-            ($u.uid -join ';')
-            $u.uidNumber
-            (ConvertFrom-UAC $u.userAccountControl)
-            $u.userWorkstations
-            [string]$u.whenChanged
-            [string]$u.whenCreated
-            (($u.SID.Value).Split('-')[-1])
-        ) -join $delimiter
-        $w.Write($line + $eol)
-    }
-    $w.Close()
 
-    # Groups
+    # LDAP properties to load (raw names)
+    # - accountExpirationDate comes from accountExpires (FILETIME)
+    # - PasswordLastSet comes from pwdLastSet (FILETIME)
+    # - LastLogonDate comes from lastLogonTimestamp (FILETIME)
+    $ldapLoad = @(
+        'accountExpires','adminCount','canonicalName','cn','comment','company','department','description','displayName',
+        'distinguishedName','employeeID','employeeNumber','employeeType','givenName','info','lastLogonTimestamp','mail','managedObjects',
+        'manager','memberOf','middleName','msDS-AllowedToDelegateTo','msDS-PSOApplied','msDS-ResultantPSO',
+        'msDS-User-Account-Control-Computed','msDS-UserPasswordExpiryTimeComputed','name','objectSid','primaryGroupID',
+        'pwdLastSet','sAMAccountName','servicePrincipalName','sIDHistory','sn','title','uid','uidNumber',
+        'userAccountControl','userWorkstations','whenChanged','whenCreated'
+    )
+
+    try {
+        $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$SearchBase")
+        $ds = New-Object System.DirectoryServices.DirectorySearcher($root)
+        $ds.PageSize = 2000
+        $ds.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $ds.Filter = '(&(objectCategory=person)(objectClass=user))'
+        $ds.PropertiesToLoad.Clear()
+        foreach ($p in $ldapLoad) { [void]$ds.PropertiesToLoad.Add($p) }
+
+        $usersCsvPath = Join-Path $outRoot "$($domainInfo.DNSRoot)-Users.csv"
+        $w = $null
+        try {
+            $w = [System.IO.StreamWriter]::new($usersCsvPath, $false, [System.Text.Encoding]::UTF8)
+            $w.Write(($userHeader -join $delimiter) + $eol)
+
+            foreach ($r in $ds.FindAll()) {
+                $p = $r.Properties
+
+                $managed = ''
+                if ($p.Contains('managedobjects')) {
+                    $managed = ($p['managedobjects'] | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
+                }
+
+                $memberof = ''
+                if ($p.Contains('memberof')) {
+                    $memberof = ($p['memberof'] | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
+                }
+
+                $psoApplied = (_PropJoin $p 'msds-psoapplied' ';')
+                $psoRes     = (_PropJoin $p 'msds-resultantpso' ';')
+                if ($psoApplied) { $psoApplied = ($psoApplied -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=','' }
+                if ($psoRes)     { $psoRes     = ($psoRes     -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=','' }
+
+                $sidStr = _SidBytesToString (_PropFirst $p 'objectsid')
+                $rid = ''
+                if ($sidStr -match '^(S-\d-\d+-.+)-(\d+)$') { $rid = $matches[2] }
+
+                # Derive the fields that were previously auto-converted by AD cmdlets
+                $accountExpirationDate = _SafeFileTimeToString (_PropFirst $p 'accountexpires')
+                $passwordLastSet       = _SafeFileTimeToString (_PropFirst $p 'pwdlastset')
+                $lastLogonDate         = _SafeFileTimeToString (_PropFirst $p 'lastlogontimestamp')
+                $pwdExpiryComputed     = _SafeFileTimeToString (_PropFirst $p 'msds-userpasswordexpirytimecomputed')
+
+                # PasswordExpired was previously from AD cmdlet; keep best-effort blank (or compute if you want later)
+                $passwordExpired = ''
+
+                $line = @(
+                    [string]$accountExpirationDate
+                    (_PropFirst $p 'admincount')
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'canonicalname')))
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'cn')))
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'comment')))
+                    [string](_PropFirst $p 'company')
+                    [string](_PropFirst $p 'department')
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'description')))
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'displayname')))
+                    [string](_PropFirst $p 'distinguishedname')
+                    [string](_PropFirst $p 'employeeid')
+                    [string](_PropFirst $p 'employeenumber')
+                    [string](_PropFirst $p 'employeetype')
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'givenname')))
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'info')))
+                    [string]$lastLogonDate
+                    [string](_PropFirst $p 'mail')
+                    [string]$managed
+                    [string](_PropFirst $p 'manager')
+                    [string]$memberof
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'middlename')))
+                    (_PropJoin $p 'msds-allowedtodelegateto' ';')
+                    [string]$psoApplied
+                    [string]$psoRes
+                    (ConvertFrom-UACComputed (_PropFirst $p 'msds-user-account-control-computed'))
+                    (ConvertFrom-PasswordExpiration (_PropFirst $p 'msds-userpasswordexpirytimecomputed'))
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'name')))
+                    [string]$sidStr
+                    [string]$passwordExpired
+                    [string]$passwordLastSet
+                    [string](_PropFirst $p 'primarygroupid')
+                    [string](_PropFirst $p 'samaccountname')
+                    (_PropJoin $p 'serviceprincipalname' ';')
+                    (_PropJoin $p 'sidhistory' ';')
+                    (Remove-InvalidFileNameChars ([string](_PropFirst $p 'sn')))
+                    [string](_PropFirst $p 'title')
+                    (_PropJoin $p 'uid' ';')
+                    [string](_PropFirst $p 'uidnumber')
+                    (ConvertFrom-UAC (_PropFirst $p 'useraccountcontrol'))
+                    [string](_PropFirst $p 'userworkstations')
+                    [string](_PropFirst $p 'whenchanged')
+                    [string](_PropFirst $p 'whencreated')
+                    [string]$rid
+                ) -join $delimiter
+
+                $w.Write($line + $eol)
+            }
+        } finally {
+            if ($w) { $w.Close() }
+        }
+    } catch {
+        "@Problem exporting users (raw LDAP): $_" | Out-File -FilePath $log -Append -Encoding utf8
+        Write-Both "    [!] Problem exporting users. See consoleOutput.txt"
+    }
+
+    # Groups (unchanged)
     $groupProps = @('CN','description','displayName','distinguishedName','GroupCategory','GroupScope','ManagedBy','memberOf','msDS-PSOApplied','name','objectSID','sAMAccountName','whenCreated','whenChanged')
     $groupHeader = $groupProps + @('relativeIdentifier')
-    $groups = Get-ADGroup -SearchBase $SearchBase -Filter * -Properties $groupProps
+    $groups = Get-ADGroup -SearchBase $SearchBase -Filter * -Properties $groupProps -ErrorAction SilentlyContinue
     $w = [System.IO.StreamWriter](Join-Path $outRoot "$($domainInfo.DNSRoot)-Groups.csv")
     $w.Write(($groupHeader -join $delimiter) + $eol)
     foreach ($g in $groups) {
@@ -2769,18 +2952,18 @@ function Export-ADAuditDataExtract {
     }
     $w.Close()
 
-    # Computers
+    # Computers (keep as-is; if you later hit FileTime errors here, apply the same raw LDAP pattern)
     $computerProps = @('cn','description','displayName','distinguishedName','LastLogonDate','name','objectSid','operatingSystem','operatingSystemServicePack','operatingSystemVersion','primaryGroupID','PasswordLastSet','userAccountControl','whenCreated','whenChanged')
-    $computers = Get-ADComputer -SearchBase $SearchBase -Filter * -Properties $computerProps
+    $computers = Get-ADComputer -SearchBase $SearchBase -Filter * -Properties $computerProps -ErrorAction SilentlyContinue
     $computers | Select-Object $computerProps | ForEach-Object {
         $_.userAccountControl = ConvertFrom-UAC $_.userAccountControl
         $_
     } | ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
         Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-Computers.csv") -Append
 
-    # OUs
+    # OUs (unchanged)
     $ouProps = @('CanonicalName','Description','DisplayName','DistinguishedName','ManagedBy','Name','whenChanged','whenCreated')
-    Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * -Properties $ouProps |
+    Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * -Properties $ouProps -ErrorAction SilentlyContinue |
         Select-Object CanonicalName,Description,DisplayName,DistinguishedName,ManagedBy,Name,whenChanged,whenCreated |
         ForEach-Object {
             $_.CanonicalName = Remove-InvalidFileNameChars $_.CanonicalName
@@ -2791,34 +2974,46 @@ function Export-ADAuditDataExtract {
         } | ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
         Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-OUs.csv") -Append
 
-    # GPO Reports + inheritance
+    # GPO Reports + inheritance (harden filenames + ensure dirs exist)
     $gpRoot = Join-Path $outRoot 'GroupPolicy'
+    New-Item -ItemType Directory -Path $gpRoot -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $gpRoot 'Reports') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $gpRoot 'Inheritance') -Force | Out-Null
 
-    $gpos = Get-GPO -All
+    $gpos = Get-GPO -All -ErrorAction SilentlyContinue
     foreach ($gpo in $gpos) {
         $name = Remove-InvalidFileNameChars $gpo.DisplayName
-        Get-GPOReport -Guid $gpo.Id -ReportType Html -Path (Join-Path (Join-Path $gpRoot 'Reports') "$name.html")
+
+        # Prevent path-too-long / weird names
+        if ($name.Length -gt 150) { $name = $name.Substring(0,150) }
+
+        $reportPath = Join-Path (Join-Path $gpRoot 'Reports') "$name.html"
+        try {
+            Get-GPOReport -Guid $gpo.Id -ReportType Html -Path $reportPath -ErrorAction Stop
+        } catch {
+            "@Problem exporting GPO report '$($gpo.DisplayName)' to '$reportPath': $_" | Out-File -FilePath $log -Append -Encoding utf8
+        }
     }
 
-    $domainGPI = Get-GPInheritance -Target $domainDN
+    $domainGPI = Get-GPInheritance -Target $domainDN -ErrorAction SilentlyContinue
     $domainGPI | Select-Object Name,ContainerType,Path,GpoInheritanceBlocked | Format-List |
         Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$domainDN.txt")
     $domainGPI | Select-Object -ExpandProperty InheritedGpoLinks |
         Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$domainDN.txt") -Append
 
-    $adOUs = Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter *
+    $adOUs = Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * -ErrorAction SilentlyContinue
     foreach ($ou in $adOUs) {
         $fn = Remove-InvalidFileNameChars $ou.DistinguishedName
-        $gpi = Get-GPInheritance -Target $ou.DistinguishedName
+        if ($fn.Length -gt 150) { $fn = $fn.Substring(0,150) }
+
+        $gpi = Get-GPInheritance -Target $ou.DistinguishedName -ErrorAction SilentlyContinue
         $gpi | Select-Object Name,ContainerType,Path,GpoInheritanceBlocked | Format-List |
             Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$fn.txt")
         $gpi | Select-Object -ExpandProperty InheritedGpoLinks |
             Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$fn.txt") -Append
     }
 
-    # OU ACLs (full dump)
+    # OU ACLs (unchanged)
     New-Item -ItemType Directory -Path (Join-Path $outRoot 'OU\ACLs') -Force | Out-Null
     $schemaIDGUID = @{}
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'SilentlyContinue'
@@ -2839,6 +3034,8 @@ function Export-ADAuditDataExtract {
 
     foreach ($ouDN in $ouDns) {
         $fn = Remove-InvalidFileNameChars $ouDN
+        if ($fn.Length -gt 150) { $fn = $fn.Substring(0,150) }
+
         $csvPath = Join-Path (Join-Path $outRoot 'OU\ACLs') "$fn.csv"
         Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$ouDN" |
             Select-Object -ExpandProperty Access |
@@ -2849,17 +3046,17 @@ function Export-ADAuditDataExtract {
             Out-File -FilePath $csvPath -Append
     }
 
-    # Confidentiality bit
+    # Confidentiality bit (unchanged)
     try {
         Get-ADObject -SearchBase "CN=Schema,CN=Configuration,$domainDN" -LDAPFilter '(searchFlags:1.2.840.113556.1.4.803:=128)' |
             Select-Object DistinguishedName,Name |
             ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
             Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-confidentialBit.csv") -Append
     } catch {
-"@Problem exporting confidentiality bit: $_" | Out-File -FilePath $log -Append -Encoding utf8
+        "@Problem exporting confidentiality bit: $_" | Out-File -FilePath $log -Append -Encoding utf8
     }
 
-    # Default password policy + FGPP
+    # Default password policy + FGPP (unchanged)
     Get-ADDefaultDomainPasswordPolicy |
         Select-Object ComplexityEnabled,DistinguishedName,LockoutDuration,LockoutObservationWindow,LockoutThreshold,MaxPasswordAge,
             MinPasswordAge,MinPasswordLength,PasswordHistoryCount,ReversibleEncryptionEnabled |
@@ -2874,7 +3071,7 @@ function Export-ADAuditDataExtract {
         ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
         Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-fgppDetails.csv") -Append
 
-    # Trusts (Get-ADTrust if available, else netdom text)
+    # Trusts (unchanged)
     if (Get-Command Get-ADTrust -ErrorAction SilentlyContinue) {
         Get-ADTrust -Filter * -Properties * |
             Select-Object CanonicalName,CN,Created,Deleted,Description,DisallowTransivity,DisplayName,DistinguishedName,flatName,
@@ -2889,19 +3086,18 @@ function Export-ADAuditDataExtract {
         & netdom query trust > (Join-Path $outRoot "$($domainInfo.DNSRoot)-trustedDomains-netdom.txt")
     }
 
-"@Finished AD data extract at $(Get-Date -Format G)" | Out-File -FilePath $log -Append -Encoding utf8
+    "@Finished AD data extract at $(Get-Date -Format G)" | Out-File -FilePath $log -Append -Encoding utf8
 
     # Zip output (best-effort)
     $zip = Join-Path $Path ("$domainDN.zip")
     if (New-ZipFile -Path $zip -Source $outRoot) {
-"@Compressed output: $zip" | Out-File -FilePath $log -Append -Encoding utf8
+        "@Compressed output: $zip" | Out-File -FilePath $log -Append -Encoding utf8
     } else {
-"@.NET 4.5.2+ not detected - skipping zip" | Out-File -FilePath $log -Append -Encoding utf8
+        "@.NET 4.5.2+ not detected - skipping zip" | Out-File -FilePath $log -Append -Encoding utf8
     }
 
     Write-Both "    [+] AD raw data export complete: $outRoot"
 }
-#endregion AD raw data extract
 
 #region DNS Zone Posture Report (merged)
 function Invoke-DnsZonePostureReport {
@@ -4385,33 +4581,61 @@ Function Get-HighRiskADBaselineReport {
     }
 
     # Enabled inactive users (>180 days)
-    $inactiveDays = 180
-    $inactiveUsers = Search-ADAccount -AccountInactive -Timespan (New-TimeSpan -Days $inactiveDays) -UsersOnly -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Enabled -eq $true }
-    $inactiveDetails = @()
-    foreach ($u in $inactiveUsers) {
+    # Enabled inactive users (>180 days) - SAFE (handles invalid FILETIME values)
+$inactiveDays = 180
+$cutoff = (Get-Date).AddDays(-$inactiveDays)
+
+function _SafeFromFileTimeUtc {
+    param([Nullable[long]]$FileTime)
+    if ($null -eq $FileTime) { return $null }
+    try { return [datetime]::FromFileTimeUtc([int64]$FileTime) } catch { return $null }
+}
+
+$inactiveDetails = @()
+
+# Enabled users (bitwise filter for "not disabled")
+$enabledUsers = Get-ADUser -LDAPFilter '(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+    -Properties lastLogonTimestamp,whenCreated,SamAccountName,Name -ErrorAction SilentlyContinue
+
+foreach ($u in $enabledUsers) {
+    $lltRaw = $null
+    try { $lltRaw = [int64]$u.lastLogonTimestamp } catch { $lltRaw = $null }
+
+    $llt = _SafeFromFileTimeUtc -FileTime $lltRaw
+    $invalidFileTime = ($null -ne $lltRaw -and $null -eq $llt)
+
+    # If lastLogonTimestamp is missing/invalid, fall back to whenCreated as a best-effort heuristic
+    $isInactive =
+        (($llt -ne $null) -and ($llt -lt $cutoff)) -or
+        (($llt -eq $null) -and ($u.whenCreated -lt $cutoff))
+
+    if ($isInactive) {
         $inactiveDetails += [pscustomobject]@{
-            RiskId='ACCT_INACTIVE'
-            SamAccountName=$u.SamAccountName
-            Name=$u.Name
-            LastLogonDate=$u.LastLogonDate
-            Enabled=$u.Enabled
-            Baseline="Disable if inactive > $inactiveDays days"
-            Severity='HIGH'
-            IsPrivileged= $privSamSet.Contains([string]$u.SamAccountName)
+            RiskId               = 'ACCT_INACTIVE'
+            SamAccountName       = $u.SamAccountName
+            Name                 = $u.Name
+            LastLogonDate        = $llt
+            LastLogonTimestampRaw= $lltRaw
+            InvalidFileTime      = $invalidFileTime
+            WhenCreated          = $u.whenCreated
+            Baseline             = "Disable if inactive > $inactiveDays days"
+            Severity             = 'HIGH'
+            IsPrivileged         = $privSamSet.Contains([string]$u.SamAccountName)
         }
     }
-    $inactiveObj = [pscustomobject]@{
-        RiskId='ACCT_INACTIVE'
-        Category='Account Hygiene'
-        Item="Enabled accounts inactive > $inactiveDays days"
-        Severity='HIGH'
-        Baseline="0 (disable if inactive > $inactiveDays days)"
-        Observed=($inactiveDetails | Measure-Object).Count
-        IsFinding=((($inactiveDetails | Measure-Object).Count) -gt 0)
-        Recommendation='Disable or remove accounts that are no longer used; verify HR/offboarding; prioritize privileged and service accounts.'
-    }
+}
 
+$inactiveObj = [pscustomobject]@{
+    RiskId='ACCT_INACTIVE'
+    Category='Account Hygiene'
+    Item="Enabled accounts inactive > $inactiveDays days"
+    Severity='HIGH'
+    Baseline="0 (disable if inactive > $inactiveDays days)"
+    Observed=($inactiveDetails | Measure-Object).Count
+    IsFinding=((($inactiveDetails | Measure-Object).Count) -gt 0)
+    Recommendation='Disable or remove accounts that are no longer used; verify HR/offboarding; prioritize privileged and service accounts.'
+}
+    
     # Password never expires (enabled users)
     $pneUsers = Search-ADAccount -PasswordNeverExpires -UsersOnly -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $true }
     $pneDetails = @()
@@ -4828,7 +5052,6 @@ if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or '
     Get-InactiveComputerObjects
 }
 if ($highrisk -or ($all -and 'highrisk' -notin $exclude) -or 'highrisk' -in $selectedChecks) { $running = $true ; Write-Both "[*] High-Risk AD Baseline Report" ; Get-HighRiskADBaselineReport }
-if ($ntds -or ($all -and 'ntds' -notin $exclude) -or 'ntds' -in $selectedChecks) { $running = $true ; Write-Both "[*] Trying to save NTDS.dit, please wait..." ; Get-NTDSdit }
 if ($oldboxes -or ($all -and 'oldboxes' -notin $exclude) -or 'oldboxes' -in $selectedChecks) { $running = $true ; Write-Both "[*] Computer Objects Audit" ; Get-OldBoxes }
 if ($gpo -or ($all -and 'gpo' -notin $exclude) -or 'gpo' -in $selectedChecks) { $running = $true ; Write-Both "[*] GPO audit (and checking SYSVOL for passwords)" ; Get-GPOtoFile ; Get-GPOsPerOU ; Get-SYSVOLXMLS; Get-GPOEnum }
 if ($ouperms -or ($all -and 'ouperms' -notin $exclude) -or 'ouperms' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check Generic Group AD Permissions" ; Get-OUPerms }
@@ -4862,7 +5085,6 @@ if (!$running) {
     Write-Both "    -trusts retrieves information about any doman trusts"
     Write-Both "    -accounts identifies account issues such as expired, disabled, etc..."
     Write-Both "    -passwordpolicy retrieves password policy information"
-    Write-Both "    -ntds dumps the NTDS.dit file using ntdsutil"
     Write-Both "    -oldboxes identifies outdated OSs like 2000/2003/XP/Vista/7/2008 joined to the domain"
     Write-Both "    -gpo dumps the GPOs in XML and HTML for later analysis"
     Write-Both "    -ouperms checks generic OU permission issues"
@@ -4881,8 +5103,6 @@ if (!$running) {
     Write-Both "    -delegatedpermissions generates an AD delegated permissions report (alias: -delegated-permissions)"
     Write-Both "        Optional: -DelegIncludeSystemTrustees -DelegIncludeDeny -DelegIncludeInherited -DelegServer <dc> -DelegatedOutputRoot <path>"
     Write-Both "    -all runs all checks, e.g. $scriptname -all"
-    Write-Both "    -exclude allows you to exclude specific checks when using -all, e.g. $scriptname -all -exclude hostdetails,ntds"
-    Write-Both "    -select allows you to exclude specific checks when using -all, e.g. $scriptname -all `"-gpo,ntds,acl`""
 }
 Write-Nessus-Footer
 
