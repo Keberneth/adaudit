@@ -58,7 +58,6 @@ function Invoke-ManagementReport {
     }
 
     # --- ASREP.txt parsing: count ONLY the actual vulnerable accounts ---
-    # FIX: always returns an array (even when exactly one match)
     function Get-AsrepAccounts([string]$path) {
         if (-not (Test-Path -LiteralPath $path)) { return @() }
 
@@ -70,18 +69,12 @@ function Invoke-ManagementReport {
         foreach ($ln in $lines) {
             if (-not $ln) { continue }
 
-            # Keep original content; handle end-of-line whitespace
             $t = $ln.TrimEnd()
             if ($t.Trim().Length -eq 0) { continue }
 
-            # Must start at column 1 (exclude indented command lines)
             if ($t -notmatch '^[^\s]') { continue }
-
-            # Exclude section headers like: Accounts (Display Name (sAMAccountName)) ...
             if ($t -match '^Accounts\s*\(') { continue }
 
-            # Match: Display Name (sam)
-            # sam charset kept conservative; extend if needed.
             if ($t -match '^(?<Display>.+?)\s+\((?<Sam>[A-Za-z0-9._-]{1,64})\)\s*$') {
                 $results.Add([PSCustomObject]@{
                     DisplayName    = $matches['Display'].Trim()
@@ -89,6 +82,46 @@ function Invoke-ManagementReport {
                     Line           = $t
                 }) | Out-Null
             }
+        }
+
+        return $results.ToArray()
+    }
+
+    # --- password_quality.txt parsing: reversible encryption section ---
+    function Get-ReversibleEncryptionAccounts {
+        param([string]$Path)
+
+        if (-not (Test-Path -LiteralPath $Path)) { return @() }
+
+        $lines = @()
+        try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { return @() }
+        if (-not $lines -or $lines.Count -eq 0) { return @() }
+
+        $startIdx = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if (($lines[$i] -as [string]) -match '^\s*Passwords of these accounts are stored using reversible encryption:\s*$') {
+                $startIdx = $i + 1
+                break
+            }
+        }
+        if ($startIdx -lt 0 -or $startIdx -ge $lines.Count) { return @() }
+
+        $results = New-Object 'System.Collections.Generic.List[string]'
+
+        for ($j = $startIdx; $j -lt $lines.Count; $j++) {
+            $ln = $lines[$j]
+            if ($null -eq $ln) { continue }
+
+            # Stop at the next section header
+            if ($ln -match '^\s*LM hashes of passwords of these accounts are present:\s*$') { break }
+
+            $t = ($ln -as [string]).Trim()
+            if ($t.Length -eq 0) { continue }
+
+            # Skip obvious header-like lines (defensive)
+            if ($t -match ':\s*$') { continue }
+
+            $results.Add($t) | Out-Null
         }
 
         return $results.ToArray()
@@ -243,6 +276,11 @@ function Invoke-ManagementReport {
                 $base    = $matches[4].Trim()
                 $sev     = Normalize-Severity $sevRaw
 
+                # IMPORTANT: suppress baseline duplicate-password line (we keep ONLY HighRisk\DUPLICATE_PASSWORDS.csv)
+                if ($title -match '^\s*Duplicate passwords\b') {
+                    continue
+                }
+
                 $evidence = "Observed: $obs | Baseline: $base"
 
                 # Default score = base severity points
@@ -293,7 +331,6 @@ function Invoke-ManagementReport {
 
                         if ($obsCount -gt 0) {
                             if ($baseCount -le 0) {
-                                # baseline 0 => escalate strongly
                                 $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 28 -K 8
                                 $sev = 'Critical'
                             } else {
@@ -377,6 +414,7 @@ function Invoke-ManagementReport {
             Summary                 = Join-Path $highRiskDir 'Summary.csv'
         }
 
+        # Keep ONLY this duplicate password finding (suppress baseline one above)
         $dupRows = Get-CsvSafe $hrFiles.DUPLICATE_PASSWORDS
         if ($dupRows.Count -gt 0) {
             Add-FindingOnce 'Critical' 'Duplicate passwords detected' "Accounts with identical password hashes: $($dupRows.Count)" $hrFiles.DUPLICATE_PASSWORDS (Score-Scaled 'Critical' $dupRows.Count 100)
@@ -442,9 +480,23 @@ function Invoke-ManagementReport {
         Add-FindingOnce 'High' 'Domain controllers allow weak Kerberos ciphers' "DCs flagged: $($weakKerbLines.Count)" $weakKerbPath (Score-Scaled 'High' $weakKerbLines.Count)
     }
 
+    # --- Password quality (reversible encryption) => Critical ---
+    $pqPath = Join-Path $InputRoot 'password_quality.txt'
+    $revAccounts = @(Get-ReversibleEncryptionAccounts -Path $pqPath)
+    $revCount = @($revAccounts).Count
+    if ($revCount -gt 0) {
+        $preview = if ($revCount -le 10) {
+            ($revAccounts -join ', ')
+        } else {
+            (($revAccounts | Select-Object -First 10) -join ', ') + ', ...'
+        }
+
+        $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $revCount -MaxAdd 34 -K 10
+        Add-FindingOnce 'Critical' 'Passwords stored using reversible encryption' "Accounts: $revCount | Example: $preview" $pqPath $score
+    }
+
     # ---------------------------
-    # AS-REP roastable (FIXED: single-user array + score rule)
-    # Requirement: if exactly 1 user => Critical with 12 points
+    # AS-REP roastable
     # ---------------------------
     $asrepPath = Join-Path $InputRoot 'ASREP.txt'
     $asrepAccounts = @(
@@ -454,17 +506,12 @@ function Invoke-ManagementReport {
 
     if ($asrepCount -gt 0) {
         $sev = 'Critical'
-
-        # EXACTLY what you asked for:
-        # - 1 account => Critical, 12 points
-        # - 2+ accounts => scaled (baseline=0 curve)
         $score = if ($asrepCount -eq 1) {
             [int]$SeverityScore.Critical
         } else {
             Score-BaselineZeroLog -Severity $sev -Observed $asrepCount -MaxAdd 34 -K 10
         }
 
-        # Preview users safely as an array (avoid char-splitting when only one string)
         $samList = @(
             $asrepAccounts | Select-Object -ExpandProperty SamAccountName -Unique
         )
@@ -684,6 +731,7 @@ function Invoke-ManagementReport {
             'Review privileged group membership (Domain Admins / Schema Admins / built-in administrators) and ensure membership is justified, documented, and reviewed regularly.'
             'Reduce standing privilege and align with tiering (Tier 0 vs Tier 1 separation). Avoid Tier0+Tier1 overlap.'
             'Address password control items (duplicate passwords, PasswordNeverExpires usage, KRBTGT rotation policy) and confirm they align with operational requirements.'
+            'Disable reversible password encryption and remediate affected accounts (password reset + policy review).'
             'Re-run the assessment after remediation to confirm closure and reduce configuration drift.'
         ) }
         'High' { @(
