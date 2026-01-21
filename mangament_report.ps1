@@ -20,7 +20,16 @@ function Invoke-ManagementReport {
 
     $ErrorActionPreference = 'Stop'
 
-    # --- Portable HTML encoding (PS 5.1 + PS 7+) ---
+    # ---------------------------
+    # Tunable baselines
+    # ---------------------------
+    $Baselines = @{
+        DisabledUserAccounts = 20   # policy baseline for disabled user accounts (review/cleanup cadence)
+    }
+
+    # ---------------------------
+    # Encoding helpers
+    # ---------------------------
     function HtmlEncode([string]$s) {
         if ($null -eq $s) { return '' }
         if ('System.Web.HttpUtility' -as [type]) { return [System.Web.HttpUtility]::HtmlEncode($s) }
@@ -57,7 +66,55 @@ function Invoke-ManagementReport {
         try { return Import-Csv -LiteralPath $path -ErrorAction Stop } catch { return @() }
     }
 
-    # --- ASREP.txt parsing: count ONLY the actual vulnerable accounts ---
+    # ---------------------------
+    # Parsers
+    # ---------------------------
+
+    # accounts_disabled.txt parsing
+    function Get-DisabledAccounts {
+        param([string]$Path)
+
+        if (-not (Test-Path -LiteralPath $Path)) { return @() }
+
+        $lines = @()
+        try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { return @() }
+        if (-not $lines -or $lines.Count -eq 0) { return @() }
+
+        $results = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($ln in $lines) {
+            if ($null -eq $ln) { continue }
+            $t = ($ln -as [string]).Trim()
+            if ($t.Length -eq 0) { continue }
+
+            # skip headers/metadata
+            if ($t -match '^[\s]*@') { continue }
+            if ($t -match '^\s*Disabled user accounts\s*$') { continue }
+
+            # Example:
+            # Account $RON000-1LMLA83QPUGL (Exchange Online-ApplicationAccount) is disabled
+            if ($t -match '^\s*Account\s+(?<Sam>\S+)\s+\((?<Display>.+?)\)\s+is\s+disabled\s*$') {
+                $results.Add([PSCustomObject]@{
+                    SamAccountName = $matches['Sam'].Trim()
+                    DisplayName    = $matches['Display'].Trim()
+                    Line           = $t
+                }) | Out-Null
+                continue
+            }
+
+            # fallback
+            if ($t -match '^\s*Account\s+(?<Sam>\S+)\s+is\s+disabled\s*$') {
+                $results.Add([PSCustomObject]@{
+                    SamAccountName = $matches['Sam'].Trim()
+                    DisplayName    = ''
+                    Line           = $t
+                }) | Out-Null
+            }
+        }
+
+        return $results.ToArray()
+    }
+
+    # ASREP.txt parsing
     function Get-AsrepAccounts([string]$path) {
         if (-not (Test-Path -LiteralPath $path)) { return @() }
 
@@ -87,7 +144,7 @@ function Invoke-ManagementReport {
         return $results.ToArray()
     }
 
-    # --- password_quality.txt parsing: reversible encryption section ---
+    # password_quality.txt parsing (reversible encryption section)
     function Get-ReversibleEncryptionAccounts {
         param([string]$Path)
 
@@ -112,13 +169,10 @@ function Invoke-ManagementReport {
             $ln = $lines[$j]
             if ($null -eq $ln) { continue }
 
-            # Stop at the next section header
             if ($ln -match '^\s*LM hashes of passwords of these accounts are present:\s*$') { break }
 
             $t = ($ln -as [string]).Trim()
             if ($t.Length -eq 0) { continue }
-
-            # Skip obvious header-like lines (defensive)
             if ($t -match ':\s*$') { continue }
 
             $results.Add($t) | Out-Null
@@ -127,9 +181,11 @@ function Invoke-ManagementReport {
         return $results.ToArray()
     }
 
+    # ---------------------------
+    # Findings framework
+    # ---------------------------
     $Findings = New-Object System.Collections.Generic.List[object]
 
-    # Base points (start values)
     $SeverityScore = @{
         Critical = 12
         High     = 8
@@ -150,6 +206,22 @@ function Invoke-ManagementReport {
         }
     }
 
+    function Get-CanonicalTitle([string]$Title) {
+        $t = ($Title -as [string])
+        if (-not $t) { return '' }
+        $t = $t.Trim()
+
+        switch -Regex ($t) {
+            '^Enabled accounts inactive >\s*180\s*days$' { return 'Observed inactive enabled accounts (>180 days)' }
+            '^Inactive enabled accounts$'                { return 'Observed inactive enabled accounts (>180 days)' }
+
+            '^Accounts with password set to not expire$' { return 'Enabled user accounts with PasswordNeverExpires' }
+            '^Passwords set to never expire$'            { return 'Enabled user accounts with PasswordNeverExpires' }
+
+            default { return $t }
+        }
+    }
+
     function Add-Finding {
         param(
             [string]$Severity,
@@ -160,6 +232,8 @@ function Invoke-ManagementReport {
         )
 
         $Severity = Normalize-Severity $Severity
+        $Title = Get-CanonicalTitle $Title
+
         $score = [int]$SeverityScore[$Severity]
         if ($PSBoundParameters.ContainsKey('ScoreOverride')) {
             $score = [int]$ScoreOverride
@@ -174,7 +248,6 @@ function Invoke-ManagementReport {
         }) | Out-Null
     }
 
-    # Avoid duplicates (same Severity+Title+Link)
     $dedup = New-Object 'System.Collections.Generic.HashSet[string]'
     function Add-FindingOnce {
         param(
@@ -185,13 +258,14 @@ function Invoke-ManagementReport {
             [int]$ScoreOverride
         )
         $Severity = Normalize-Severity $Severity
+        $Title = Get-CanonicalTitle $Title
+
         $k = '{0}|{1}|{2}' -f $Severity, (($Title -as [string]).Trim()), (Get-RelPath $Path)
         if ($dedup.Add($k)) {
             Add-Finding -Severity $Severity -Title $Title -Evidence $Evidence -Path $Path -ScoreOverride $ScoreOverride
         }
     }
 
-    # Legacy scaler retained (used for some non-baseline count signals)
     function Score-Scaled([string]$Severity,[double]$Count,[int]$maxScale = 50) {
         $Severity = Normalize-Severity $Severity
         $base  = [int]$SeverityScore[$Severity]
@@ -200,7 +274,6 @@ function Invoke-ManagementReport {
         return ($base + [int]$scale)
     }
 
-    # Over-baseline curve (baseline > 0)
     function Score-OverBaselineLog {
         param(
             [string]$Severity,
@@ -222,7 +295,6 @@ function Invoke-ManagementReport {
         return ($base + [int]$add)
     }
 
-    # Baseline=0 curve (scale from Observed)
     function Score-BaselineZeroLog {
         param(
             [string]$Severity,
@@ -250,15 +322,17 @@ function Invoke-ManagementReport {
     }
 
     # ---------------------------
-    # Baseline file parsing FIRST (authoritative for overlap + Schema Admins + etc)
+    # Baseline parsing (authoritative)
     # ---------------------------
     $baselinePath = Join-Path $InputRoot 'ad_high_risk_baseline.txt'
 
-    # Flags so we can suppress duplicate secondary sources (schema_admins.txt, domain_admins.txt, etc)
-    $baselineHasDA = $false
-    $baselineHasEA = $false
-    $baselineHasSA = $false
+    $baselineHasDA        = $false
+    $baselineHasEA        = $false
+    $baselineHasSA        = $false
     $baselineHasDAOverlap = $false
+
+    $baselineHasInactive180 = $false
+    $baselineHasPNE         = $false
 
     if (Test-Path $baselinePath) {
         $lines = Get-Content -LiteralPath $baselinePath -ErrorAction SilentlyContinue
@@ -276,14 +350,13 @@ function Invoke-ManagementReport {
                 $base    = $matches[4].Trim()
                 $sev     = Normalize-Severity $sevRaw
 
-                # IMPORTANT: suppress baseline duplicate-password line (we keep ONLY HighRisk\DUPLICATE_PASSWORDS.csv)
-                if ($title -match '^\s*Duplicate passwords\b') {
-                    continue
-                }
+                # suppress baseline duplicate-password line (keep only HighRisk\DUPLICATE_PASSWORDS.csv)
+                if ($title -match '^\s*Duplicate passwords\b') { continue }
+
+                if ($title -match '^Enabled accounts inactive >\s*180\s*days$') { $baselineHasInactive180 = $true }
+                if ($title -match '^Enabled user accounts with PasswordNeverExpires$') { $baselineHasPNE = $true }
 
                 $evidence = "Observed: $obs | Baseline: $base"
-
-                # Default score = base severity points
                 $score = [int]$SeverityScore[$sev]
 
                 switch -Regex ($title) {
@@ -305,26 +378,20 @@ function Invoke-ManagementReport {
                         $baselineHasDA = $true
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
-
                         $baseCount = 0
                         if ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
-
                         if ($obsCount -gt 0 -and $baseCount -gt 0) {
                             $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
                         }
                     }
 
-                    '^Enterprise Admins$' {
-                        $baselineHasEA = $true
-                    }
+                    '^Enterprise Admins$' { $baselineHasEA = $true }
 
                     '^Schema Admins$' {
                         $baselineHasSA = $true
-
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
 
-                        # Baseline is typically 0 (except during schema change)
                         $baseCount = 0
                         if ($base -match '^\s*0\b') { $baseCount = 0 }
                         elseif ($base -match '([0-9]+)') { $baseCount = [int]$matches[1] }
@@ -343,7 +410,6 @@ function Invoke-ManagementReport {
                         $baselineHasDAOverlap = $true
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
-
                         if ($obsCount -gt 0) {
                             $sev = 'Critical'
                             $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 34 -K 10
@@ -374,9 +440,7 @@ function Invoke-ManagementReport {
                         }
                     }
 
-                    default {
-                        $score = [int]$SeverityScore[$sev]
-                    }
+                    default { $score = [int]$SeverityScore[$sev] }
                 }
 
                 Add-FindingOnce $sev $title $evidence $baselinePath $score
@@ -384,7 +448,9 @@ function Invoke-ManagementReport {
         }
     }
 
-    # --- Domain stats from ADExtract (optional) ---
+    # ---------------------------
+    # Domain stats from ADExtract (optional)
+    # ---------------------------
     $UsersCount  = $null
     $GroupsCount = $null
     $OUsCount    = $null
@@ -400,7 +466,9 @@ function Invoke-ManagementReport {
         }
     } catch { }
 
-    # --- HighRisk CSVs ---
+    # ---------------------------
+    # HighRisk CSVs
+    # ---------------------------
     $highRiskDir = Join-Path $InputRoot 'HighRisk'
     if (Test-Path $highRiskDir) {
         $hrFiles = @{
@@ -414,7 +482,6 @@ function Invoke-ManagementReport {
             Summary                 = Join-Path $highRiskDir 'Summary.csv'
         }
 
-        # Keep ONLY this duplicate password finding (suppress baseline one above)
         $dupRows = Get-CsvSafe $hrFiles.DUPLICATE_PASSWORDS
         if ($dupRows.Count -gt 0) {
             Add-FindingOnce 'Critical' 'Duplicate passwords detected' "Accounts with identical password hashes: $($dupRows.Count)" $hrFiles.DUPLICATE_PASSWORDS (Score-Scaled 'Critical' $dupRows.Count 100)
@@ -441,16 +508,22 @@ function Invoke-ManagementReport {
             Add-FindingOnce $sev 'Large privileged group membership' "Rows: $($privRows.Count)" $hrFiles.PRIVILEGED_GROUPS (Score-Scaled $sev $privRows.Count)
         }
 
-        $inactiveRows = Get-CsvSafe $hrFiles.INACTIVE_ACCOUNTS
-        if ($inactiveRows.Count -gt 0) {
-            $sev = if ($inactiveRows.Count -ge 200) { 'High' } elseif ($inactiveRows.Count -ge 50) { 'Medium' } else { 'Low' }
-            Add-FindingOnce $sev 'Inactive enabled accounts' "Accounts inactive: $($inactiveRows.Count)" $hrFiles.INACTIVE_ACCOUNTS (Score-Scaled $sev $inactiveRows.Count)
+        # Keep ONLY baseline inactive >180 days (renamed), suppress HighRisk\INACTIVE_ACCOUNTS.csv
+        if (-not $baselineHasInactive180) {
+            $inactiveRows = Get-CsvSafe $hrFiles.INACTIVE_ACCOUNTS
+            if ($inactiveRows.Count -gt 0) {
+                $sev = if ($inactiveRows.Count -ge 200) { 'High' } elseif ($inactiveRows.Count -ge 50) { 'Medium' } else { 'Low' }
+                Add-FindingOnce $sev 'Inactive enabled accounts' "Accounts inactive: $($inactiveRows.Count)" $hrFiles.INACTIVE_ACCOUNTS (Score-Scaled $sev $inactiveRows.Count)
+            }
         }
 
-        $pneRows = Get-CsvSafe $hrFiles.PASSWORD_NEVER_EXPIRES
-        if ($pneRows.Count -gt 0) {
-            $sev = if ($pneRows.Count -ge 50) { 'High' } elseif ($pneRows.Count -ge 10) { 'Medium' } else { 'Low' }
-            Add-FindingOnce $sev 'Passwords set to never expire' "Accounts: $($pneRows.Count)" $hrFiles.PASSWORD_NEVER_EXPIRES (Score-Scaled $sev $pneRows.Count)
+        # Keep ONLY baseline PasswordNeverExpires, suppress HighRisk\PASSWORD_NEVER_EXPIRES.csv
+        if (-not $baselineHasPNE) {
+            $pneRows = Get-CsvSafe $hrFiles.PASSWORD_NEVER_EXPIRES
+            if ($pneRows.Count -gt 0) {
+                $sev = if ($pneRows.Count -ge 50) { 'High' } elseif ($pneRows.Count -ge 10) { 'Medium' } else { 'Low' }
+                Add-FindingOnce $sev 'Passwords set to never expire' "Accounts: $($pneRows.Count)" $hrFiles.PASSWORD_NEVER_EXPIRES (Score-Scaled $sev $pneRows.Count)
+            }
         }
 
         $dsRows = Get-CsvSafe $hrFiles.DISABLED_STALE
@@ -473,14 +546,52 @@ function Invoke-ManagementReport {
         }
     }
 
-    # --- Text-based checks ---
+    # ---------------------------
+    # Text-based checks
+    # ---------------------------
     $weakKerbPath = Join-Path $InputRoot 'dcs_weak_kerberos_ciphersuite.txt'
     $weakKerbLines = Get-NonHeaderLines $weakKerbPath
     if ($weakKerbLines.Count -gt 0) {
         Add-FindingOnce 'High' 'Domain controllers allow weak Kerberos ciphers' "DCs flagged: $($weakKerbLines.Count)" $weakKerbPath (Score-Scaled 'High' $weakKerbLines.Count)
     }
 
-    # --- Password quality (reversible encryption) => Critical ---
+    # ---------------------------
+    # Disabled user accounts (accounts_disabled.txt) - UPDATED SCORING
+    # ---------------------------
+    $disabledPath = Join-Path $InputRoot 'accounts_disabled.txt'
+    $disabled = @(Get-DisabledAccounts -Path $disabledPath)
+    $disabledUnique = @(
+        $disabled |
+        Select-Object -ExpandProperty SamAccountName -Unique |
+        Where-Object { $_ -and $_.Trim().Length -gt 0 }
+    )
+    $disabledCount = $disabledUnique.Count
+
+    if ($disabledCount -gt 0) {
+        $base = [int]$Baselines.DisabledUserAccounts
+
+        # Risk-class behavior:
+        # - Medium by default (lifecycle control)
+        # - Escalate to High when volume is large (governance failure signal)
+        $sev = 'Medium'
+        if ($disabledCount -ge 200) { $sev = 'High' }
+
+        $preview = if ($disabledUnique.Count -le 10) {
+            ($disabledUnique -join ', ')
+        } else {
+            (($disabledUnique | Select-Object -First 10) -join ', ') + ', ...'
+        }
+
+        # Stronger scaling than before (so 256 with baseline 20 is not "Low + small bump")
+        # Example for 256: High base(8) + ceil(4*log2(12.8))=8+15 => 23 (capped by MaxAdd 20, not hit)
+        $score = Score-OverBaselineLog -Severity $sev -Observed $disabledCount -Baseline ([Math]::Max($base,1)) -MaxAdd 20 -K 4
+
+        Add-FindingOnce $sev 'Disabled user accounts present (review and cleanup)' ("Disabled accounts: $disabledCount (Baseline: <= $base) | Example: $preview") $disabledPath $score
+    }
+
+    # ---------------------------
+    # Password quality (reversible encryption)
+    # ---------------------------
     $pqPath = Join-Path $InputRoot 'password_quality.txt'
     $revAccounts = @(Get-ReversibleEncryptionAccounts -Path $pqPath)
     $revCount = @($revAccounts).Count
@@ -499,28 +610,16 @@ function Invoke-ManagementReport {
     # AS-REP roastable
     # ---------------------------
     $asrepPath = Join-Path $InputRoot 'ASREP.txt'
-    $asrepAccounts = @(
-        Get-AsrepAccounts -path $asrepPath
-    )
+    $asrepAccounts = @(Get-AsrepAccounts -path $asrepPath)
     $asrepCount = @($asrepAccounts).Count
-
     if ($asrepCount -gt 0) {
         $sev = 'Critical'
-        $score = if ($asrepCount -eq 1) {
-            [int]$SeverityScore.Critical
-        } else {
-            Score-BaselineZeroLog -Severity $sev -Observed $asrepCount -MaxAdd 34 -K 10
-        }
+        $score = if ($asrepCount -eq 1) { [int]$SeverityScore.Critical }
+        else { Score-BaselineZeroLog -Severity $sev -Observed $asrepCount -MaxAdd 34 -K 10 }
 
-        $samList = @(
-            $asrepAccounts | Select-Object -ExpandProperty SamAccountName -Unique
-        )
-
-        $samPreview = if ($samList.Count -le 10) {
-            ($samList -join ', ')
-        } else {
-            (($samList | Select-Object -First 10) -join ', ') + ', ...'
-        }
+        $samList = @($asrepAccounts | Select-Object -ExpandProperty SamAccountName -Unique)
+        $samPreview = if ($samList.Count -le 10) { ($samList -join ', ') }
+        else { (($samList | Select-Object -First 10) -join ', ') + ', ...' }
 
         Add-FindingOnce $sev 'Accounts without Kerberos pre-auth (AS-REP roastable)' "Accounts: $asrepCount | Users: $samPreview" $asrepPath $score
     }
@@ -542,11 +641,14 @@ function Invoke-ManagementReport {
         Add-FindingOnce $sev 'Inactive computer accounts (>90 days)' "Computers inactive: $obs (Baseline: <= $base)" $inactiveCompsPath $score
     }
 
+    # Suppress accounts_passdontexpire.txt when baseline already provides PasswordNeverExpires
     $pndePath = Join-Path $InputRoot 'accounts_passdontexpire.txt'
-    $pndeLines = Get-NonHeaderLines $pndePath
-    if ($pndeLines.Count -gt 0) {
-        $sev = if ($pndeLines.Count -ge 50) { 'High' } elseif ($pndeLines.Count -ge 10) { 'Medium' } else { 'Low' }
-        Add-FindingOnce $sev 'Accounts with password set to not expire' "Accounts: $($pndeLines.Count)" $pndePath (Score-Scaled $sev $pndeLines.Count)
+    if (-not $baselineHasPNE) {
+        $pndeLines = Get-NonHeaderLines $pndePath
+        if ($pndeLines.Count -gt 0) {
+            $sev = if ($pndeLines.Count -ge 50) { 'High' } elseif ($pndeLines.Count -ge 10) { 'Medium' } else { 'Low' }
+            Add-FindingOnce $sev 'Accounts with password set to not expire' "Accounts: $($pndeLines.Count)" $pndePath (Score-Scaled $sev $pndeLines.Count)
+        }
     }
 
     $lapsRightsPath  = Join-Path $InputRoot 'laps_read-extendedrights.txt'
@@ -595,9 +697,7 @@ function Invoke-ManagementReport {
         }
     }
 
-    # ---------------------------
-    # Admin group text files (SUPPRESSED if baseline includes the same finding)
-    # ---------------------------
+    # Admin group text files (suppressed if baseline includes)
     $daPath = Join-Path $InputRoot 'domain_admins.txt'
     $eaPath = Join-Path $InputRoot 'enterprise_admins.txt'
     $saPath = Join-Path $InputRoot 'schema_admins.txt'
@@ -629,7 +729,9 @@ function Invoke-ManagementReport {
         }
     }
 
-    # Severity counts
+    # ---------------------------
+    # Totals
+    # ---------------------------
     $sevCounts = @{
         Critical = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Critical' }).Count
         High     = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'High'     }).Count
@@ -637,7 +739,6 @@ function Invoke-ManagementReport {
         Low      = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Low'      }).Count
     }
 
-    # Overall score
     $TotalScore = 0
     foreach ($f in $Findings) { $TotalScore += [int]$f.Score }
 
@@ -690,7 +791,7 @@ function Invoke-ManagementReport {
     }
 
     # ---------------------------
-    # Modern HTML
+    # HTML output
     # ---------------------------
     $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss "UTC"'
     $computerName = Split-Path -Path $InputRoot -Leaf
@@ -1043,7 +1144,7 @@ $js
     Set-Content -LiteralPath $OutputHtml -Value $html -Encoding UTF8
 
     # ---------------------------
-    # TXT executive summary
+    # TXT output
     # ---------------------------
     $top = ($Findings | Sort-Object -Property @{Expression='Score';Descending=$true}) | Select-Object -First $TopFindings
 
