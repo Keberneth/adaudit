@@ -47,10 +47,11 @@ The output is intended to provide visibility into potential risks, misconfigurat
 <br><br>
 
 ## Mangament Report
-Management report script creates a html file that give a more reprisentible summary of the audit with a overall security score<br>
-The futher something is from the basline the higher risk score. Example, Critical risks start at 12 points, but criticallity and points get higher the futher from basline a risk is.<br>
-If krbtgt password has not been changed in 180 days it is a criticcal risk. (12 points) but if it is not changed in 2000 days it is 31 points.<br>
-This is a way of pinpoint and help prioritize criticalities. A low criticality can become a high if far enough from the basline value. 
+The management report is an HTML file that provides a more presentable summary of the audit, including an overall security score.<br>
+The further a finding deviates from the defined baseline, the higher the risk score becomes. For example, Critical risks start at 12 points, but both criticality and score increase the further the risk is from the baseline.<br>
+If the KRBTGT password has not been changed in 180 days, it is considered a Critical risk (12 points). However, if it has not been changed in 2000 days, the score increases to 31 points.<br>
+Similarly, if there are many accounts that have not been used for a long time, the risk score increases as the number of inactive accounts grows.<br>
+This scoring model helps pinpoint and prioritize security issues and highlights how neglected certain areas are. A finding with low initial criticality can become high or Critical if it deviates far enough from the baseline value.
 <br><br>
 
 
