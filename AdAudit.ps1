@@ -7,7 +7,7 @@
         PowerShell Script to perform a quick AD audit
     .DESCRIPTION
         o Compatibility :
-            * PowerShell v2.0 (PowerShell 5.0 needed if you intend to use DSInternals PowerShell module)
+            * PowerShell v2.0 (PowerShell 5.0 needed if you intend to Added function for checking overlapping group memberships.use DSInternals PowerShell module)
             * Tested on Windows Server 2008R2/2012/2012R2/2016/2019/2022
             * All languages (you may need to adjust $AdministratorTranslation variable)
         o Requirements :
@@ -17,7 +17,9 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.1.5 - 21/01/2026
+            [X] Version 7.1.6 - 21/01/2026
+                Added function for checking overlapping group memberships.
+            [ ] Version 7.1.5 - 21/01/2026
                 Management report added to the script
                 Minor fixes to multiple functions
             [ ] Version 7.1.4 - 28/12/2025
@@ -200,6 +202,7 @@ Param (
     [switch]$DelegIncludeInherited = $false,
     [string]$DelegServer,
     [switch]$highrisk = $false,
+    [switch]$overlappinggroups = $false,
     [switch]$all = $false,
     [string[]]$exclude = @(),
     [string]$select
@@ -208,7 +211,7 @@ Param (
 $selectedChecks = @()
 if ($select) { $selectedChecks = $select.Split(',') }
 
-$versionnum = "v7.1.5"
+$versionnum = "v7.1.6"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 Function Get-Variables() {
@@ -454,6 +457,291 @@ Function Get-PrivilegedGroupAccounts {
         Write-Nessus-Finding "AdminSDHolders" "KB426" ([System.IO.File]::ReadAllText("$outputdir\accounts_userPrivileged.txt"))
     }
 }
+
+function Get-OverlappingGroupMemberships {
+    [CmdletBinding()]
+    param(
+        [string]$OutputDir = $(if ($script:outputdir) { $script:outputdir } else { $outputdir }),
+
+        [string]$UserLdapFilter = "(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
+
+        [ValidateRange(1,100)]
+        [int]$MaxDepth = 15,
+
+        [switch]$IncludeHtml = $true,
+
+        [ValidateRange(0,1000000)]
+        [int]$ProgressEvery = 250
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    function Write-Log {
+        param([string]$Message)
+        if (Get-Command Write-Both -ErrorAction SilentlyContinue) { Write-Both $Message } else { Write-Host $Message }
+    }
+
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    if (-not $OutputDir) {
+        throw "OutputDir is empty. Ensure `$outputdir is set by the main script, or pass -OutputDir."
+    }
+    if (-not (Test-Path -LiteralPath $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+
+    $csvPath  = Join-Path $OutputDir "overlapping_group_memberships.csv"
+    $htmlPath = Join-Path $OutputDir "overlapping_group_memberships.html"
+
+    # Cache groups by DN to reduce LDAP calls
+    $groupCache = @{}
+
+    function Get-CachedGroup {
+        param([Parameter(Mandatory)][string]$DistinguishedName)
+
+        if ($groupCache.ContainsKey($DistinguishedName)) { return $groupCache[$DistinguishedName] }
+
+        try {
+            $g = Get-ADGroup -Identity $DistinguishedName -Properties memberOf, name, samAccountName -ErrorAction Stop
+        } catch {
+            return $null
+        }
+
+        $obj = [pscustomobject]@{
+            DN       = $g.DistinguishedName
+            Name     = $g.Name
+            Sam      = $g.SamAccountName
+            MemberOf = @($g.memberOf)
+        }
+
+        $groupCache[$DistinguishedName] = $obj
+        return $obj
+    }
+
+    function Add-Path {
+        param(
+            [Parameter(Mandatory)][hashtable]$PathsByDn,
+            [Parameter(Mandatory)][string]$TargetDn,
+            [Parameter(Mandatory)][string]$PathString,
+            [Parameter(Mandatory)][string]$StartGroup
+        )
+
+        if (-not $PathsByDn.ContainsKey($TargetDn)) { $PathsByDn[$TargetDn] = @() }
+
+        $PathsByDn[$TargetDn] += [pscustomobject]@{
+            Path  = $PathString
+            Start = $StartGroup
+            Len   = ($PathString -split '\s->\s').Count
+        }
+    }
+
+    Write-Log "    [*] Overlapping group membership routes (domain-wide)"
+
+    $users = Get-ADUser -LDAPFilter $UserLdapFilter -Properties displayName, distinguishedName, samAccountName, memberOf `
+        -ResultPageSize 2000 -ResultSetSize $null
+
+    $total = ($users | Measure-Object).Count
+    Write-Log ("    [*] Users to process: {0}" -f $total)
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    $i = 0
+    foreach ($u in $users) {
+        $i++
+        if ($ProgressEvery -gt 0 -and ($i % $ProgressEvery) -eq 0) {
+            Write-Log ("    [*] Processed {0}/{1} users..." -f $i, $total)
+        }
+
+        # DIRECT groups from memberOf
+        $directGroupDns = @($u.memberOf)
+        if (-not $directGroupDns -or $directGroupDns.Count -eq 0) { continue }
+
+        # Resolve direct groups to names
+        $directGroups = foreach ($gdn in $directGroupDns) {
+            $g = Get-CachedGroup -DistinguishedName $gdn
+            if ($g) { [pscustomobject]@{ Name = $g.Name; DN = $g.DN } }
+        }
+        $directGroups = @($directGroups | Where-Object { $_ })
+        if ($directGroups.Count -eq 0) { continue }
+
+        # targetGroupDN -> list of path objects
+        $pathsByDn = @{}
+
+        foreach ($dg in $directGroups) {
+            $startName = [string]$dg.Name
+            $startDn   = [string]$dg.DN
+
+            $stack = New-Object System.Collections.ArrayList
+            [void]$stack.Add([pscustomobject]@{
+                Dn      = $startDn
+                Path    = @($startName)
+                PathDns = @($startDn)
+                Depth   = 0
+            })
+
+            while ($stack.Count -gt 0) {
+                $node = $stack[$stack.Count - 1]
+                $stack.RemoveAt($stack.Count - 1)
+
+                $currentDn  = $node.Dn
+                $currentStr = ($node.Path -join ' -> ')
+
+                Add-Path -PathsByDn $pathsByDn -TargetDn $currentDn -PathString $currentStr -StartGroup $startName
+
+                if ($node.Depth -ge $MaxDepth) { continue }
+
+                $g = Get-CachedGroup -DistinguishedName $currentDn
+                if (-not $g) { continue }
+
+                foreach ($parentDn in @($g.MemberOf)) {
+                    if (-not $parentDn) { continue }
+                    if ($node.PathDns -contains $parentDn) { continue } # loop guard
+
+                    $parent = Get-CachedGroup -DistinguishedName $parentDn
+                    if (-not $parent) { continue }
+
+                    [void]$stack.Add([pscustomobject]@{
+                        Dn      = $parent.DN
+                        Path    = @($node.Path + @($parent.Name))
+                        PathDns = @($node.PathDns + @($parent.DN))
+                        Depth   = ($node.Depth + 1)
+                    })
+                }
+            }
+        }
+
+        foreach ($targetDn in $pathsByDn.Keys) {
+            $pathObjs = $pathsByDn[$targetDn]
+            if (-not $pathObjs -or $pathObjs.Count -lt 2) { continue }
+
+            $uniquePaths = @($pathObjs | Select-Object -ExpandProperty Path -Unique)
+            if ($uniquePaths.Count -le 1) { continue }
+
+            $targetGroup = Get-CachedGroup -DistinguishedName $targetDn
+            $targetName  = if ($targetGroup) { $targetGroup.Name } else { $targetDn }
+
+            # Path arrays
+            $pathArrays = @()
+            foreach ($p in $uniquePaths) {
+                $arr = @($p -split '\s->\s' | Where-Object { $_ })
+                if ($arr.Count -gt 0) { $pathArrays += ,$arr }
+            }
+            if ($pathArrays.Count -lt 2) { continue }
+
+            # Direct entry groups
+            $directEntryGroups = @($pathArrays | ForEach-Object { $_[0] } | Sort-Object -Unique)
+
+            # Union contributing groups (excluding target)
+            $allGroups = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($arr in $pathArrays) {
+                foreach ($gName in $arr) {
+                    if ($gName -and ($gName -ne $targetName)) { [void]$allGroups.Add($gName) }
+                }
+            }
+            $contribUnion = @($allGroups | Sort-Object)
+
+            # Intersection common groups (excluding target)
+            $common = $null
+            foreach ($arr in $pathArrays) {
+                $set = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+                foreach ($gName in $arr) {
+                    if ($gName -and ($gName -ne $targetName)) { [void]$set.Add($gName) }
+                }
+
+                if ($null -eq $common) { $common = $set }
+                else { $common.IntersectWith($set) }
+            }
+            $commonGroups = if ($common) { @($common | Sort-Object) } else { @() }
+
+            # ContributingGroups output: direct entry + other contributing (dedup)
+            $entrySet = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($e in $directEntryGroups) { [void]$entrySet.Add($e) }
+
+            $nonEntryContrib = @()
+            foreach ($g in $contribUnion) {
+                if (-not $entrySet.Contains($g)) { $nonEntryContrib += $g }
+            }
+
+            $hasDirect = $false
+            $hasIndirect = $false
+            foreach ($p in $pathObjs) {
+                if ($p.Len -eq 1) { $hasDirect = $true } else { $hasIndirect = $true }
+            }
+
+            $overlapType =
+                if ($hasDirect -and $hasIndirect) { "Direct+Indirect" }
+                elseif ($directEntryGroups.Count -gt 1) { "MultipleDirectGroups" }
+                else { "MultiplePaths" }
+
+            $results.Add([pscustomobject]@{
+                UserSamAccountName = $u.SamAccountName
+                UserDisplayName    = $u.DisplayName
+                UserDN             = $u.DistinguishedName
+
+                TargetGroup        = $targetName
+                TargetGroupDN      = $targetDn
+
+                OverlapType        = $overlapType
+                PathCount          = $uniquePaths.Count
+
+                DirectEntryGroups  = ($directEntryGroups -join '; ')
+                ContributingGroups = (($directEntryGroups + $nonEntryContrib) | Sort-Object -Unique) -join '; '
+                CommonGroups       = ($commonGroups -join '; ')
+
+                Paths              = ($uniquePaths -join ' | ')
+            }) | Out-Null
+        }
+    }
+
+    if (Test-Path -LiteralPath $csvPath) { Remove-Item -LiteralPath $csvPath -Force }
+    $results | Sort-Object UserSamAccountName, TargetGroup | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+
+    if ($IncludeHtml) {
+        if (Test-Path -LiteralPath $htmlPath) { Remove-Item -LiteralPath $htmlPath -Force }
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("<html><head><meta charset='utf-8'><title>Overlapping Group Memberships</title>")
+        [void]$sb.AppendLine("<style>body{font-family:Segoe UI,Arial,sans-serif} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:6px;vertical-align:top} th{background:#f2f2f2} details{margin:10px 0} code{white-space:pre-wrap}</style>")
+        [void]$sb.AppendLine("</head><body>")
+        [void]$sb.AppendLine("<h2>Overlapping Group Memberships</h2>")
+        [void]$sb.AppendLine("<p>Users who reach the same target group via multiple distinct membership routes.</p>")
+        [void]$sb.AppendLine(("<p><b>Total findings:</b> {0}</p>" -f ($results.Count)))
+
+        $byUser = $results | Group-Object UserSamAccountName
+        foreach ($ug in $byUser) {
+            $userRows = $ug.Group
+            $dn   = ($userRows | Select-Object -First 1).UserDN
+            $disp = ($userRows | Select-Object -First 1).UserDisplayName
+
+            [void]$sb.AppendLine("<details>")
+            [void]$sb.AppendLine("<summary><b>$($ug.Name)</b> - $disp ($($userRows.Count) target group(s) with overlap)</summary>")
+            [void]$sb.AppendLine("<div style='margin:6px 0 10px 0;'><code>$dn</code></div>")
+            [void]$sb.AppendLine("<table><tr><th>Target Group</th><th>Overlap Type</th><th>Direct Entry Groups</th><th>Contributing Groups</th><th>Common Groups</th><th>Paths</th></tr>")
+
+            foreach ($r in ($userRows | Sort-Object TargetGroup)) {
+                $pathsHtml = ($r.Paths -split '\s\|\s' | ForEach-Object { "<div><code>$($_)</code></div>" }) -join ''
+                [void]$sb.AppendLine("<tr><td>$($r.TargetGroup)</td><td>$($r.OverlapType)</td><td>$($r.DirectEntryGroups)</td><td>$($r.ContributingGroups)</td><td>$($r.CommonGroups)</td><td>$pathsHtml</td></tr>")
+            }
+
+            [void]$sb.AppendLine("</table></details>")
+        }
+
+        [void]$sb.AppendLine("</body></html>")
+        [System.IO.File]::WriteAllText($htmlPath, $sb.ToString(), [System.Text.Encoding]::UTF8)
+    }
+
+    if ($results.Count -gt 0) {
+        Write-Log "    [!] Overlapping membership findings: $($results.Count) row(s)."
+        Write-Log "        - CSV: $(Split-Path -Leaf $csvPath)"
+        if ($IncludeHtml) { Write-Log "        - HTML: $(Split-Path -Leaf $htmlPath)" }
+    } else {
+        Write-Log "    [+] No overlapping group membership routes found."
+        Write-Log "        - CSV (empty): $(Split-Path -Leaf $csvPath)"
+        if ($IncludeHtml) { Write-Log "        - HTML: $(Split-Path -Leaf $htmlPath)" }
+    }
+}
+
+
 Function Get-ProtectedUsers {
     #Lists users in "Protected Users" group (2012R2 and above)
     $DomainLevel = (Get-ADDomain).domainMode
@@ -4920,6 +5208,10 @@ if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or '
     $running = $true
     Write-Both "[*] Inactive Computer Objects Audit"
     Get-InactiveComputerObjects
+}
+if ($all -or $accounts -or $overlappinggroups) {
+    Write-Both "    [+] Running overlapping group membership analysis"
+    Get-OverlappingGroupMemberships
 }
 if ($highrisk -or ($all -and 'highrisk' -notin $exclude) -or 'highrisk' -in $selectedChecks) { $running = $true ; Write-Both "[*] High-Risk AD Baseline Report" ; Get-HighRiskADBaselineReport }
 if ($oldboxes -or ($all -and 'oldboxes' -notin $exclude) -or 'oldboxes' -in $selectedChecks) { $running = $true ; Write-Both "[*] Computer Objects Audit" ; Get-OldBoxes }
