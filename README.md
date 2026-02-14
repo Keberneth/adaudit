@@ -67,7 +67,7 @@ Results should be reviewed, validated, and prioritized according to the organiza
 <br>
 
 ### Purpose
-This script is designed to support informed decision-making and continuous improvement of Active Directory security.
+This script is designed to support informed decision-making and continuous improvement of Active Directory security and operational hygiene.
 <br><br>
 
 # adaudit
