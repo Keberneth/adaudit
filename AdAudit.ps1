@@ -5089,20 +5089,32 @@ $inactiveObj = [pscustomobject]@{
                 }
             }
 
-            $dups = $hashGroups | Group-Object NTHash | Where-Object { $_.Count -gt 1 }
+            $dups = $hashGroups | Group-Object NTHash | Where-Object { $_.Count -gt 1 } |
+                Sort-Object { @(($_.Group | Select-Object -ExpandProperty SamAccountName | Sort-Object))[0] }
+
+            $dupGroupIndex = 0
             foreach ($g in $dups) {
-                $members = ($g.Group | Select-Object -ExpandProperty SamAccountName | Sort-Object)
+                $dupGroupIndex++
+                $members = @($g.Group | Select-Object -ExpandProperty SamAccountName | Sort-Object)
+                $groupLabel = ('PWD-REUSE-{0:d3}' -f $dupGroupIndex)
+                $samePasswordAccounts = [string]::Join('; ', $members)
+
                 foreach ($m in $members) {
+                    $isPrivileged = $privSamSet.Contains([string]$m)
                     $dupDetails += [pscustomobject]@{
                         RiskId='PWD_DUPLICATE'
-                        NTHash=$g.Name
+                        PasswordGroup=$groupLabel
+                        SharedCount=@($members).Count
                         SamAccountName=$m
-                        IsPrivileged=$privSamSet.Contains([string]$m)
-                        Severity= $(if ($privSamSet.Contains([string]$m)) { 'CRITICAL' } else { 'HIGH' })
+                        SamePasswordAccounts=$samePasswordAccounts
+                        IsPrivileged=$isPrivileged
+                        Severity= $(if ($isPrivileged) { 'CRITICAL' } else { 'HIGH' })
                         Baseline='0'
                     }
                 }
             }
+
+            $dupDetails = @($dupDetails | Sort-Object PasswordGroup, SamAccountName)
 
             $dupCount = ($dups | Measure-Object).Count
             $dupSummaryObj = [pscustomobject]@{
@@ -6522,7 +6534,7 @@ function Invoke-ManagementReport {
                 $definition.Type = 'csv'
                 $definition.SourcePath = Join-Path $highRiskDir 'DUPLICATE_PASSWORDS.csv'
                 $definition.DownloadName = 'DUPLICATE_PASSWORDS.csv'
-                $definition.Columns = @('SamAccountName','NTHash','IsPrivileged','Severity','Baseline')
+                $definition.Columns = @('PasswordGroup','SharedCount','SamAccountName','SamePasswordAccounts','IsPrivileged','Severity','Baseline')
                 break
             }
             '^KRBTGT password age is high$|^krbtgt password age$' {
@@ -7622,7 +7634,7 @@ $js
 
         $dupRows = Get-CsvSafe $hrFiles.DUPLICATE_PASSWORDS
         if ($dupRows.Count -gt 0) {
-            Add-FindingOnce 'Critical' 'Duplicate passwords detected' "Accounts with identical password hashes: $($dupRows.Count)" $hrFiles.DUPLICATE_PASSWORDS (Score-Scaled 'Critical' $dupRows.Count 100)
+            Add-FindingOnce 'Critical' 'Duplicate passwords detected' "Affected accounts in shared-password groups: $($dupRows.Count)" $hrFiles.DUPLICATE_PASSWORDS (Score-Scaled 'Critical' $dupRows.Count 100)
         }
 
         $krbtgt = Get-CsvSafe $hrFiles.KRBTGT
