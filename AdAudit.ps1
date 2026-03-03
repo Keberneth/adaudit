@@ -1,6 +1,7 @@
 <#
     .NOTES
         Author       : phillips321.co.uk
+        modified by Keberneth
         Creation Date: 16/08/2018
         Script Name  : ADAudit.ps1
     .SYNOPSIS
@@ -17,7 +18,9 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 7.1.6 - 21/01/2026
+            [X] Version 7.2 - 03/03/2026
+                All reports have been remade
+            [ ] Version 7.1.6 - 21/01/2026
                 Added function for checking overlapping group memberships.
             [ ] Version 7.1.5 - 21/01/2026
                 Management report added to the script
@@ -205,13 +208,14 @@ Param (
     [switch]$overlappinggroups = $false,
     [switch]$all = $false,
     [string[]]$exclude = @(),
-    [string]$select
+    [string]$select,
+    [switch]$KeepLegacyArtifacts = $false
 )
 
 $selectedChecks = @()
 if ($select) { $selectedChecks = $select.Split(',') }
 
-$versionnum = "v7.1.6"
+$versionnum = "v7.2.0"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 Function Get-Variables() {
@@ -253,9 +257,67 @@ Function Get-Variables() {
     Write-Both "    [+] Local Service                : $LocalService"
 }
 Function Write-Both() {
-    #Writes to console screen and output file
+    #Writes to console only. Findings are rendered into the HTML audit and management reports.
     Write-Host "$args"
-    Add-Content -Path "$outputdir\consolelog.txt" -Value "$args"
+}
+Function Get-HtmlReportsDir {
+    param(
+        [string]$BaseRoot = $(if ($script:outputdir) { $script:outputdir } elseif ($outputdir) { $outputdir } else { Join-Path (Get-Location) $env:COMPUTERNAME })
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BaseRoot)) {
+        $BaseRoot = Join-Path (Get-Location) $env:COMPUTERNAME
+    }
+
+    $path = if ($script:HtmlReportsDir) { $script:HtmlReportsDir } else { Join-Path $BaseRoot 'HTML Reports' }
+    if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+    }
+    return $path
+}
+Function Get-RawDataDir {
+    param(
+        [string]$BaseRoot = $(if ($script:outputdir) { $script:outputdir } elseif ($outputdir) { $outputdir } else { Join-Path (Get-Location) $env:COMPUTERNAME })
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BaseRoot)) {
+        $BaseRoot = Join-Path (Get-Location) $env:COMPUTERNAME
+    }
+
+    $path = if ($script:EvidenceFilesDir) { $script:EvidenceFilesDir } else { Join-Path $BaseRoot 'Raw Data' }
+    if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+    }
+    return $path
+}
+Function Get-RawSourceDataDir {
+    param(
+        [string]$BaseRoot = $(if ($script:outputdir) { $script:outputdir } elseif ($outputdir) { $outputdir } else { Join-Path (Get-Location) $env:COMPUTERNAME })
+    )
+
+    $path = if ($script:LegacyArtifactsDir) { $script:LegacyArtifactsDir } else { Join-Path (Get-RawDataDir -BaseRoot $BaseRoot) 'Source' }
+    if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+    }
+    return $path
+}
+Function Get-PreparedDataDir {
+    param(
+        [string]$BaseRoot = $(if ($script:outputdir) { $script:outputdir } elseif ($outputdir) { $outputdir } else { Join-Path (Get-Location) $env:COMPUTERNAME })
+    )
+
+    $path = if ($script:ReportDownloadsDir) { $script:ReportDownloadsDir } else { Join-Path (Get-RawDataDir -BaseRoot $BaseRoot) 'Prepared' }
+    if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+    }
+    return $path
+}
+Function Get-HtmlDownloadsDir {
+    param(
+        [string]$BaseRoot = $(if ($script:outputdir) { $script:outputdir } elseif ($outputdir) { $outputdir } else { Join-Path (Get-Location) $env:COMPUTERNAME })
+    )
+
+    return (Get-PreparedDataDir -BaseRoot $BaseRoot)
 }
 Function Write-Nessus-Header() {
     #Creates nessus XML file header
@@ -491,7 +553,7 @@ function Get-OverlappingGroupMemberships {
     }
 
     $csvPath  = Join-Path $OutputDir "overlapping_group_memberships.csv"
-    $htmlPath = Join-Path $OutputDir "overlapping_group_memberships.html"
+    $htmlPath = Join-Path (Get-HtmlReportsDir -BaseRoot $OutputDir) "overlapping_group_memberships.html"
 
     # Cache groups by DN to reduce LDAP calls
     $groupCache = @{}
@@ -978,9 +1040,10 @@ Function Get-UserPasswordNotChangedRecently {
 }
 Function Get-GPOtoFile {
     #Outputs complete GPO report
-    if (Test-Path "$outputdir\GPOReport.html") { Remove-Item "$outputdir\GPOReport.html" -Recurse }
-    Get-GPOReport -All -ReportType HTML -Path "$outputdir\GPOReport.html"
-    Write-Both "    [+] GPO Report saved to GPOReport.html"
+    $gpoHtmlPath = Join-Path (Get-HtmlReportsDir -BaseRoot $outputdir) 'GPOReport.html'
+    if (Test-Path $gpoHtmlPath) { Remove-Item $gpoHtmlPath -Recurse }
+    Get-GPOReport -All -ReportType HTML -Path $gpoHtmlPath
+    Write-Both "    [+] GPO Report saved to HTML Reports\GPOReport.html"
     if (Test-Path "$outputdir\GPOReport.xml") { Remove-Item "$outputdir\GPOReport.xml" -Recurse }
     Get-GPOReport -All -ReportType XML -Path "$outputdir\GPOReport.xml"
     Write-Both "    [+] GPO Report saved to GPOReport.xml, now run Grouper offline using the following command (KB499)"
@@ -2840,7 +2903,8 @@ function Find-DangerousACLPermissions {
 
     # Output results
     if ($computerResults) {
-        $computerResults | ConvertTo-Html -Property @{ Label = "Type"; Expression = { "Computer" } }, @{ Label = "Computer Name"; Expression = { $_.ObjectName } }, @{ Label = "Allowed Group"; Expression = { $_.IdentityReference } }, AccessControlType, ActiveDirectoryRights | Out-File -Encoding UTF8 $outputdir\dangerousACLs.html -Append
+        $dangerousAclHtmlPath = Join-Path (Get-HtmlReportsDir -BaseRoot $outputdir) 'dangerousACLs.html'
+        $computerResults | ConvertTo-Html -Property @{ Label = "Type"; Expression = { "Computer" } }, @{ Label = "Computer Name"; Expression = { $_.ObjectName } }, @{ Label = "Allowed Group"; Expression = { $_.IdentityReference } }, AccessControlType, ActiveDirectoryRights | Out-File -Encoding UTF8 $dangerousAclHtmlPath -Append
         $computerResults | Format-Table -AutoSize -Property ObjectType, ObjectName, IdentityReference, AccessControlType | Out-File $outputdir\dangerousACL_Computer.txt -Encoding UTF8
         Write-Both "    [!] Issue identified, vulnerable ACL on Computer, see $outputdir\dangerousACL_Computer.txt"
         Write-Nessus-Finding "Weak Computer Permissions" "KB551" ([System.IO.File]::ReadAllText("$outputdir\dangerousACL_Computer.txt"))
@@ -4740,7 +4804,7 @@ Function Get-HighRiskADBaselineReport {
 
     $txtPath = Join-Path $outputdir 'ad_high_risk_baseline.txt'
     $summaryCsv = Join-Path $riskOutDir 'Summary.csv'
-    $indexPath = Join-Path $outputdir 'ad_high_risk_baseline_index.html'
+    $indexPath = Join-Path (Get-HtmlReportsDir -BaseRoot $outputdir) 'ad_high_risk_baseline_index.html'
 
     # Helper: safe group member enumeration
     function _Get-GroupMembersBySidOrName {
@@ -5129,7 +5193,7 @@ $inactiveObj = [pscustomobject]@{
     $dupDetails   | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $riskOutDir 'DUPLICATE_PASSWORDS.csv')
 
     # HTML index (replaces XLSX requirement; no external modules)
-$indexPath = Join-Path $outputdir 'ad_high_risk_baseline_index.html'
+$indexPath = Join-Path (Get-HtmlReportsDir -BaseRoot $outputdir) 'ad_high_risk_baseline_index.html'
 $html = New-Object System.Collections.Generic.List[string]
 $html.Add('<!doctype html>')
 $html.Add('<html><head><meta charset="utf-8" />')
@@ -5151,15 +5215,16 @@ foreach ($k in $baseline.Keys) {
 $html.Add('</tbody></table>')
 
 $html.Add('<h2>Reports</h2><ul>')
-$html.Add("<li><a href='ad_high_risk_baseline.txt'>Executive TXT report (includes baseline + findings)</a></li>")
-$html.Add("<li><a href='HighRisk/Summary.csv'>Summary CSV</a></li>")
-$html.Add("<li><a href='HighRisk/PRIVILEGED_GROUPS.csv'>Privileged group membership (detail)</a></li>")
-$html.Add("<li><a href='HighRisk/KRBTGT.csv'>krbtgt password age (detail)</a></li>")
-$html.Add("<li><a href='HighRisk/INACTIVE_ACCOUNTS.csv'>Inactive enabled accounts (detail)</a></li>")
-$html.Add("<li><a href='HighRisk/PASSWORD_NEVER_EXPIRES.csv'>Password never expires (detail)</a></li>")
-$html.Add("<li><a href='HighRisk/DISABLED_STALE.csv'>Disabled stale accounts (detail)</a></li>")
-$html.Add("<li><a href='HighRisk/MACHINE_ACCOUNT_QUOTA.csv'>MachineAccountQuota (detail)</a></li>")
-$html.Add("<li><a href='HighRisk/DUPLICATE_PASSWORDS.csv'>Duplicate passwords (detail; requires DSInternals + replication privileges)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/ad_high_risk_baseline.txt'>Executive TXT report (includes baseline + findings)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/Summary.csv'>Summary CSV</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/PRIVILEGED_GROUPS.csv'>Privileged group membership (detail)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/accounts_domain_admins_group_overlap.csv'>Domain Admins group overlap (detail)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/KRBTGT.csv'>krbtgt password age (detail)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/INACTIVE_ACCOUNTS.csv'>Inactive enabled accounts (detail)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/PASSWORD_NEVER_EXPIRES.csv'>Password never expires (detail)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/DISABLED_STALE.csv'>Disabled stale accounts (detail)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/MACHINE_ACCOUNT_QUOTA.csv'>MachineAccountQuota (detail)</a></li>")
+$html.Add("<li><a href='../Raw Data/Source/HighRisk/DUPLICATE_PASSWORDS.csv'>Duplicate passwords (detail; requires DSInternals + replication privileges)</a></li>")
 $html.Add('</ul>')
 
 $html.Add('<h2>Finding Counts</h2>')
@@ -5180,6 +5245,15 @@ $outputdir = (Get-Item -Path ".\").FullName + "\" + $env:computername
 $starttime = Get-Date
 $scriptname = $MyInvocation.MyCommand.Name
 if (!(Test-Path "$outputdir")) { New-Item -ItemType Directory -Path $outputdir | Out-Null }
+
+$script:HtmlReportsDir = Join-Path $outputdir 'HTML Reports'
+$script:EvidenceFilesDir = Join-Path $outputdir 'Raw Data'
+$script:ReportDownloadsDir = Join-Path $script:EvidenceFilesDir 'Prepared'
+$script:LegacyArtifactsDir = Join-Path $script:EvidenceFilesDir 'Source'
+if (!(Test-Path $script:HtmlReportsDir)) { New-Item -ItemType Directory -Path $script:HtmlReportsDir -Force | Out-Null }
+if (!(Test-Path $script:EvidenceFilesDir)) { New-Item -ItemType Directory -Path $script:EvidenceFilesDir -Force | Out-Null }
+if (!(Test-Path $script:ReportDownloadsDir)) { New-Item -ItemType Directory -Path $script:ReportDownloadsDir -Force | Out-Null }
+if (!(Test-Path $script:LegacyArtifactsDir)) { New-Item -ItemType Directory -Path $script:LegacyArtifactsDir -Force | Out-Null }
 Write-Both " _____ ____     _____       _ _ _
 |  _  |    \   |  _  |_ _ _| |_| |_
 |     |  |  |  |     | | | . | |  _|
@@ -5269,6 +5343,7 @@ if (!$running) {
     Write-Both "    -delegatedpermissions generates an AD delegated permissions report (alias: -delegated-permissions)"
     Write-Both "        Optional: -DelegIncludeSystemTrustees -DelegIncludeDeny -DelegIncludeInherited -DelegServer <dc> -DelegatedOutputRoot <path>"
     Write-Both "    -all runs all checks, e.g. $scriptname -all"
+    Write-Both "    -KeepLegacyArtifacts is retained for backward compatibility; raw data and evidence files are preserved in .\\<COMPUTERNAME>\\Raw Data by default"
 }
 Write-Nessus-Footer
 
@@ -5295,6 +5370,7 @@ function Invoke-ManagementReport {
         [string]$InputRoot,
         [string]$OutputHtml,
         [string]$OutputTxt,
+        [string]$AuditHtml,
         [int]$TopFindings = 10
     )
 
@@ -5305,8 +5381,13 @@ function Invoke-ManagementReport {
         throw "InputRoot '$InputRoot' does not exist."
     }
 
-    if (-not $OutputHtml) { $OutputHtml = Join-Path $InputRoot 'Management-Report.html' }
-    if (-not $OutputTxt)  { $OutputTxt  = Join-Path $InputRoot 'Management-Summary.txt' }
+    if (-not $OutputHtml) { $OutputHtml = Join-Path (Get-HtmlReportsDir -BaseRoot $InputRoot) 'Management-Report.html' }
+    if (-not $AuditHtml)  { $AuditHtml  = Join-Path (Get-HtmlReportsDir -BaseRoot $InputRoot) 'ADAudit-Results.html' }
+    $outputHtmlDir = Split-Path -Path $OutputHtml -Parent
+    if ($outputHtmlDir -and -not (Test-Path -LiteralPath $outputHtmlDir)) { New-Item -ItemType Directory -Path $outputHtmlDir -Force | Out-Null }
+    $auditHtmlDir = Split-Path -Path $AuditHtml -Parent
+    if ($auditHtmlDir -and -not (Test-Path -LiteralPath $auditHtmlDir)) { New-Item -ItemType Directory -Path $auditHtmlDir -Force | Out-Null }
+    if (-not $PSBoundParameters.ContainsKey('OutputTxt') -or [string]::IsNullOrWhiteSpace($OutputTxt)) { $OutputTxt = $null }
 
     $ErrorActionPreference = 'Stop'
 
@@ -5343,16 +5424,75 @@ function Invoke-ManagementReport {
         return [System.IO.Path]::GetFileName($path)
     }
 
+    function Resolve-AuditArtifactPath([string]$Path) {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+        $rawDataRoot   = Get-RawDataDir -BaseRoot $InputRoot
+        $rawSourceRoot = Get-RawSourceDataDir -BaseRoot $InputRoot
+
+        $candidateList = New-Object 'System.Collections.Generic.List[string]'
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+        function Add-Candidate([string]$Value) {
+            if ([string]::IsNullOrWhiteSpace($Value)) { return }
+            if ($seen.Add($Value)) { $candidateList.Add($Value) | Out-Null }
+        }
+
+        $isRooted = $false
+        try { $isRooted = [System.IO.Path]::IsPathRooted($Path) } catch { $isRooted = $false }
+
+        if ($isRooted) {
+            Add-Candidate $Path
+            try {
+                $full = [System.IO.Path]::GetFullPath($Path)
+                Add-Candidate $full
+
+                $rootAbs = [System.IO.Path]::GetFullPath($InputRoot)
+                if ($full.StartsWith($rootAbs, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $relative = $full.Substring($rootAbs.Length).TrimStart('\','/')
+                    if (-not [string]::IsNullOrWhiteSpace($relative)) {
+                        Add-Candidate (Join-Path $rawSourceRoot $relative)
+                        Add-Candidate (Join-Path $rawDataRoot $relative)
+                    }
+                }
+            } catch { }
+        }
+        else {
+            Add-Candidate (Join-Path $InputRoot $Path)
+            Add-Candidate (Join-Path $rawSourceRoot $Path)
+            Add-Candidate (Join-Path $rawDataRoot $Path)
+        }
+
+        foreach ($candidate in $candidateList) {
+            try {
+                if (Test-Path -LiteralPath $candidate) {
+                    return [System.IO.Path]::GetFullPath($candidate)
+                }
+            } catch { }
+        }
+
+        try { return [System.IO.Path]::GetFullPath($Path) } catch { return $Path }
+    }
+
     function Get-NonHeaderLines([string]$path) {
-        if (-not (Test-Path $path)) { return @() }
+        $path = Resolve-AuditArtifactPath $path
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { return @() }
         try {
             return (Get-Content -LiteralPath $path -ErrorAction Stop) |
-                Where-Object { $_ -and $_.Trim().Length -gt 0 -and ($_ -notmatch '^[\s]*@') }
+                ForEach-Object {
+                    $line = ([string]$_).Trim()
+                    if ($line.StartsWith('@') -and $line.Length -gt 1) {
+                        $line = $line.Substring(1).Trim()
+                    }
+                    $line
+                } |
+                Where-Object { $_ -and $_.Trim().Length -gt 0 }
         } catch { return @() }
     }
 
     function Get-CsvSafe([string]$path) {
-        if (-not (Test-Path $path)) { return @() }
+        $path = Resolve-AuditArtifactPath $path
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { return @() }
         try { return Import-Csv -LiteralPath $path -ErrorAction Stop } catch { return @() }
     }
 
@@ -5364,7 +5504,8 @@ function Invoke-ManagementReport {
     function Get-DisabledAccounts {
         param([string]$Path)
 
-        if (-not (Test-Path -LiteralPath $Path)) { return @() }
+        $Path = Resolve-AuditArtifactPath $Path
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
 
         $lines = @()
         try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { return @() }
@@ -5406,7 +5547,8 @@ function Invoke-ManagementReport {
 
     # ASREP.txt parsing
     function Get-AsrepAccounts([string]$path) {
-        if (-not (Test-Path -LiteralPath $path)) { return @() }
+        $path = Resolve-AuditArtifactPath $path
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { return @() }
 
         $lines = @()
         try { $lines = Get-Content -LiteralPath $path -ErrorAction Stop } catch { return @() }
@@ -5438,7 +5580,8 @@ function Invoke-ManagementReport {
     function Get-ReversibleEncryptionAccounts {
         param([string]$Path)
 
-        if (-not (Test-Path -LiteralPath $Path)) { return @() }
+        $Path = Resolve-AuditArtifactPath $Path
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
 
         $lines = @()
         try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { return @() }
@@ -5477,10 +5620,11 @@ function Invoke-ManagementReport {
     $Findings = New-Object System.Collections.Generic.List[object]
 
     $SeverityScore = @{
-        Critical = 12
-        High     = 8
-        Medium   = 5
-        Low      = 2
+        Critical    = 12
+        High        = 8
+        Medium      = 5
+        Low         = 2
+        Information = 0
     }
 
     function Normalize-Severity([string]$sev) {
@@ -5492,6 +5636,7 @@ function Invoke-ManagementReport {
             '^HIGH'  { return 'High' }
             '^MED'   { return 'Medium' }
             '^LOW'   { return 'Low' }
+            '^INFO'  { return 'Information' }
             default  { return 'Low' }
         }
     }
@@ -5529,11 +5674,16 @@ function Invoke-ManagementReport {
             $score = [int]$ScoreOverride
         }
 
+        $resolvedPath = $null
+        if (-not [string]::IsNullOrWhiteSpace($Path)) {
+            try { $resolvedPath = [System.IO.Path]::GetFullPath($Path) } catch { $resolvedPath = $Path }
+        }
+
         $Findings.Add([PSCustomObject]@{
             Severity = $Severity
             Title    = $Title
             Evidence = $Evidence
-            Link     = Get-RelPath $Path
+            Link     = $resolvedPath
             Score    = $score
         }) | Out-Null
     }
@@ -5550,7 +5700,11 @@ function Invoke-ManagementReport {
         $Severity = Normalize-Severity $Severity
         $Title = Get-CanonicalTitle $Title
 
-        $k = '{0}|{1}|{2}' -f $Severity, (($Title -as [string]).Trim()), (Get-RelPath $Path)
+        $pathKey = $null
+        if (-not [string]::IsNullOrWhiteSpace($Path)) {
+            try { $pathKey = [System.IO.Path]::GetFullPath($Path) } catch { $pathKey = $Path }
+        }
+        $k = '{0}|{1}|{2}' -f $Severity, (($Title -as [string]).Trim()), $pathKey
         if ($dedup.Add($k)) {
             Add-Finding -Severity $Severity -Title $Title -Evidence $Evidence -Path $Path -ScoreOverride $ScoreOverride
         }
@@ -5611,10 +5765,1704 @@ function Invoke-ManagementReport {
         return (HtmlEncode $s)
     }
 
+    function Get-SeverityRank([string]$Severity) {
+        switch (Normalize-Severity $Severity) {
+            'Critical'    { return 5 }
+            'High'        { return 4 }
+            'Medium'      { return 3 }
+            'Low'         { return 2 }
+            'Information' { return 1 }
+            default       { return 0 }
+        }
+    }
+
+    function New-Slug([string]$Value) {
+        $slug = (($Value -as [string]) -replace '[^A-Za-z0-9]+','-').Trim('-').ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($slug)) { return 'finding' }
+        return $slug
+    }
+
+    function New-FindingAnchor([object]$Finding) {
+        return ('finding-' + (New-Slug ('{0}-{1}' -f $Finding.Title, $Finding.Link)))
+    }
+
+    function Get-FindingCategory([string]$Title) {
+        switch -Regex ($Title) {
+            'Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|privileged|overlap|Delegated permissions' { return 'Privileged access' }
+            'password|Password|KRBTGT|Kerberos|AS-REP|SPN|reversible'                                { return 'Authentication and password security' }
+            'LAPS|LDAP|NTLM|cipher'                                                                  { return 'Identity hardening' }
+            'DNS'                                                                                    { return 'DNS security' }
+            'computer|MachineAccountQuota'                                                           { return 'Computer hygiene' }
+            'disabled|inactive'                                                                      { return 'Account hygiene' }
+            'GPO|Group Policy'                                                                       { return 'Group policy' }
+            'ACL'                                                                                    { return 'Access control' }
+            default                                                                                  { return 'General' }
+        }
+    }
+
+    function Get-FindingWhyItMatters([string]$Title) {
+        switch -Regex ($Title) {
+            'Duplicate passwords' {
+                return 'Password reuse across privileged or service accounts can materially reduce the effort required to expand access after a single compromise.'
+            }
+            'KRBTGT password age' {
+                return 'A stale KRBTGT password extends the lifetime of forged Kerberos tickets and weakens incident response after domain compromise.'
+            }
+            'AS-REP roastable|without Kerberos pre-auth' {
+                return 'Accounts without Kerberos pre-auth can be targeted offline, allowing attackers to attempt password cracking without interacting further with the domain.'
+            }
+            'Kerberoastable SPNs|SPN' {
+                return 'Service accounts with SPNs can be targeted for offline ticket cracking, especially when passwords are static, old, or weak.'
+            }
+            'reversible encryption' {
+                return 'Reversible password storage materially weakens credential protection and should only exist for rare legacy compatibility requirements.'
+            }
+            'privileged group|Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|overlap' {
+                return 'Excessive or overlapping privilege expands blast radius and increases the probability of privileged misuse or lateral movement.'
+            }
+            'inactive|disabled stale|Inactive computer' {
+                return 'Inactive objects increase attack surface, complicate review, and often indicate weak lifecycle controls.'
+            }
+            'PasswordNeverExpires|never expire' {
+                return 'Passwords that never expire are frequently associated with unmanaged service accounts and create long-lived credential exposure.'
+            }
+            'MachineAccountQuota' {
+                return 'Allowing standard users to join computers can be abused to create attack paths and should be tightly controlled.'
+            }
+            'weak Kerberos ciphers' {
+                return 'Legacy Kerberos ciphers reduce cryptographic strength and should be retired in favor of AES-only configurations where possible.'
+            }
+            'LAPS' {
+                return 'Overly broad local administrator password access or expired LAPS passwords weakens workstation and server credential hygiene.'
+            }
+            'LDAP security|NTLM' {
+                return 'Weak LDAP or NTLM settings enable downgrade and relay scenarios and indicate incomplete hardening of identity protocols.'
+            }
+            'DNS zones allowing insecure updates' {
+                return 'Insecure dynamic updates allow unauthenticated or weakly authenticated name changes and can enable spoofing or persistence.'
+            }
+            default {
+                return 'This finding indicates a deviation from common Active Directory hardening expectations and should be reviewed in context.'
+            }
+        }
+    }
+
+    function Get-FindingRecommendation([string]$Title) {
+        switch -Regex ($Title) {
+            'Duplicate passwords' {
+                return 'Reset affected passwords, eliminate password reuse, prefer gMSA where applicable, and verify privileged accounts follow a separate credential standard.'
+            }
+            'KRBTGT password age' {
+                return 'Plan and execute a controlled double KRBTGT rotation, validate ticket lifetimes, and document the ongoing rotation cadence.'
+            }
+            'AS-REP roastable|without Kerberos pre-auth' {
+                return 'Re-enable Kerberos pre-auth unless a documented exception exists, and review service account usage and password quality.'
+            }
+            'Kerberoastable SPNs|SPN' {
+                return 'Review each service account, prefer gMSA, require strong unique passwords, and enforce modern Kerberos encryption types.'
+            }
+            'reversible encryption' {
+                return 'Disable reversible password storage, identify the legacy dependency, and reset affected account passwords after policy change.'
+            }
+            'privileged group|Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|overlap' {
+                return 'Reduce standing privilege, separate admin tiers, remove stale memberships, and require approval and periodic recertification for privileged access.'
+            }
+            'inactive|disabled stale|Inactive computer' {
+                return 'Review ownership, disable or remove stale accounts and computer objects, and enforce a documented lifecycle and exception process.'
+            }
+            'PasswordNeverExpires|never expire' {
+                return 'Minimize PasswordNeverExpires usage, migrate eligible services to gMSA, and maintain approved exceptions with regular review.'
+            }
+            'MachineAccountQuota' {
+                return 'Set MachineAccountQuota to 0 unless there is a defined business need, and delegate computer join rights only to approved processes or groups.'
+            }
+            'weak Kerberos ciphers' {
+                return 'Remove legacy cipher support where supported, validate application compatibility, and standardize on stronger Kerberos encryption.'
+            }
+            'LAPS' {
+                return 'Restrict password readers to the minimum required set, rotate expired passwords, and validate LAPS policy application across managed systems.'
+            }
+            'LDAP security|NTLM' {
+                return 'Harden LDAP signing and channel binding, reduce NTLM usage, and validate compatibility before enforcing stricter settings.'
+            }
+            'DNS zones allowing insecure updates' {
+                return 'Change affected zones to secure-only dynamic updates and verify DHCP/DNS integration and update ownership.'
+            }
+            default {
+                return 'Review the affected configuration, identify the owning team, and document a remediation plan with validation after implementation.'
+            }
+        }
+    }
+
+    function Get-FindingSourceLabel([string]$Path) {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return 'Embedded evidence' }
+        try {
+            return [System.IO.Path]::GetFileName($Path)
+        } catch {
+            return $Path
+        }
+    }
+
+    function Get-EvidencePreviewLines([string]$Path, [int]$MaxLines = 10) {
+        $preview = New-Object 'System.Collections.Generic.List[string]'
+        $Path = Resolve-AuditArtifactPath $Path
+        if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return @() }
+
+        $ext = ''
+        try { $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant() } catch { }
+
+        switch ($ext) {
+            '.csv' {
+                try {
+                    $rows = Import-Csv -LiteralPath $Path -ErrorAction Stop | Select-Object -First $MaxLines
+                    foreach ($row in $rows) {
+                        $parts = @()
+                        foreach ($prop in ($row.PSObject.Properties | Where-Object { $_.Value -ne $null -and ([string]$_.Value).Trim().Length -gt 0 } | Select-Object -First 4)) {
+                            $parts += ('{0}={1}' -f $prop.Name, ([string]$prop.Value))
+                        }
+                        if ($parts.Count -gt 0) {
+                            $preview.Add(($parts -join ' | ')) | Out-Null
+                        }
+                    }
+                } catch { }
+            }
+            '.txt' {
+                try {
+                    $lines = Get-Content -LiteralPath $Path -ErrorAction Stop |
+                        Where-Object { $_ -and $_.Trim().Length -gt 0 -and ($_ -notmatch '^[\s]*@') } |
+                        Select-Object -First $MaxLines
+                    foreach ($line in $lines) {
+                        $preview.Add(([string]$line).Trim()) | Out-Null
+                    }
+                } catch { }
+            }
+            '.html' {
+                $preview.Add('Detailed HTML companion report generated for this check.') | Out-Null
+            }
+            default {
+                $preview.Add(('Source: {0}' -f (Get-FindingSourceLabel $Path))) | Out-Null
+            }
+        }
+
+        return $preview.ToArray()
+    }
+
+    function Get-CompanionHtmlReports([string]$Root, [string[]]$Exclude = @()) {
+        $items = New-Object 'System.Collections.Generic.List[object]'
+        $seen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+        $excludeMap = @{}
+        foreach ($p in $Exclude) {
+            if (-not [string]::IsNullOrWhiteSpace($p)) {
+                try { $excludeMap[[System.IO.Path]::GetFullPath($p)] = $true } catch { }
+            }
+        }
+
+        $candidates = New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'
+
+        $htmlRoot = Get-HtmlReportsDir -BaseRoot $Root
+        if (Test-Path -LiteralPath $htmlRoot) {
+            foreach ($f in (Get-ChildItem -Path $htmlRoot -File -Filter '*.html' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.source\.html$' })) {
+                $candidates.Add($f) | Out-Null
+            }
+        }
+
+        foreach ($f in (Get-ChildItem -Path $Root -File -Filter '*.html' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.source\.html$' })) {
+            $candidates.Add($f) | Out-Null
+        }
+
+        $delegIndex = Get-ChildItem -Path (Join-Path $Root 'DelegatedPermissions') -Recurse -File -Filter 'index.html' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($delegIndex) { $candidates.Add($delegIndex) | Out-Null }
+
+        $dnsAudit = Get-ChildItem -Path $Root -Recurse -File -Filter 'DNSAudit-*.html' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '\.source\.html$' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($dnsAudit) { $candidates.Add($dnsAudit) | Out-Null }
+
+        $dnsReco = Get-ChildItem -Path $Root -Recurse -File -Filter 'DNS-Recommendations-*.html' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '\.source\.html$' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($dnsReco) { $candidates.Add($dnsReco) | Out-Null }
+
+        foreach ($file in $candidates) {
+            if (-not $file) { continue }
+
+            $full = $null
+            try { $full = [System.IO.Path]::GetFullPath($file.FullName) } catch { $full = $file.FullName }
+            if ($excludeMap.ContainsKey($full)) { continue }
+            if (-not $seen.Add($full)) { continue }
+
+            $title = switch -Regex ($file.Name) {
+                '^GPOReport\.html$'                      { 'Group Policy report' ; break }
+                '^overlapping_group_memberships\.html$'  { 'Overlapping group membership report' ; break }
+                '^dangerousACLs\.html$'                 { 'Dangerous ACL report' ; break }
+                '^ad_high_risk_baseline_index\.html$'   { 'High-risk baseline report' ; break }
+                '^index\.html$'                         { 'Delegated permissions report' ; break }
+                '^DNSAudit-.*\.html$'                   { 'DNS audit report' ; break }
+                '^DNS-Recommendations-.*\.html$'        { 'DNS recommendations report' ; break }
+                default                                 { ($file.BaseName -replace '[-_]+',' ') }
+            }
+
+            $items.Add([pscustomobject]@{
+                Title    = $title
+                FullPath = $full
+            }) | Out-Null
+        }
+
+        return $items.ToArray()
+    }
+
+    function Ensure-DirectoryPath([string]$Path) {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return }
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        }
+    }
+
+    function Get-NormalizedAbsolutePath([string]$Path) {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        try { return [System.IO.Path]::GetFullPath($Path) } catch { return $Path }
+    }
+
+    function Get-RelativeHref([string]$FromFile, [string]$ToPath) {
+        if ([string]::IsNullOrWhiteSpace($ToPath)) { return '' }
+
+        try {
+            $fromDir = Split-Path -Path $FromFile -Parent
+            if ([string]::IsNullOrWhiteSpace($fromDir)) { $fromDir = Split-Path -Path (Get-NormalizedAbsolutePath $FromFile) -Parent }
+            $fromAbs = [System.IO.Path]::GetFullPath($fromDir)
+            $targetAbs = [System.IO.Path]::GetFullPath($ToPath)
+
+            $baseUri = New-Object System.Uri(($fromAbs.TrimEnd('\') + '\'))
+            $targetUri = New-Object System.Uri($targetAbs)
+            return ([System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()) -replace '\\','/')
+        } catch {
+            return [System.IO.Path]::GetFileName($ToPath)
+        }
+    }
+
+    function Format-PreviewValue($Value) {
+        if ($null -eq $Value) { return '' }
+        if ($Value -is [datetime]) { return $Value.ToString('yyyy-MM-dd HH:mm:ss') }
+        return [string]$Value
+    }
+
+    function New-PreviewTableHtml {
+        param(
+            [object[]]$Rows,
+            [string[]]$Columns,
+            [int]$MaxRows = 250
+        )
+
+        if (-not $Rows -or $Rows.Count -eq 0) {
+            return "<div class='result-empty'>No detailed rows were available for this finding.</div>"
+        }
+
+        $displayRows = @($Rows | Select-Object -First $MaxRows)
+        $availableColumns = @()
+        try { $availableColumns = @($displayRows[0].PSObject.Properties.Name) } catch { $availableColumns = @() }
+
+        if (-not $Columns -or $Columns.Count -eq 0) {
+            $Columns = @($availableColumns | Select-Object -First 8)
+        } else {
+            $Columns = @($Columns | Where-Object { $_ -in $availableColumns })
+            if ($Columns.Count -eq 0) {
+                $Columns = @($availableColumns | Select-Object -First 8)
+            }
+        }
+
+        if (-not $Columns -or $Columns.Count -eq 0) {
+            return "<div class='result-empty'>Detailed rows were detected, but no displayable columns were available.</div>"
+        }
+
+        $headHtml = ($Columns | ForEach-Object { "<th>$(HtmlEncode ([string]$_))</th>" }) -join ''
+        $rowHtml = New-Object 'System.Collections.Generic.List[string]'
+
+        foreach ($row in $displayRows) {
+            $cellHtml = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($col in $Columns) {
+                $val = $null
+                try {
+                    if ($row.PSObject.Properties[$col]) {
+                        $val = $row.PSObject.Properties[$col].Value
+                    } else {
+                        $val = $row.$col
+                    }
+                } catch { $val = $null }
+
+                $cellHtml.Add("<td>$(HtmlEncode (Format-PreviewValue $val))</td>") | Out-Null
+            }
+            $rowHtml.Add("<tr>$($cellHtml -join '')</tr>") | Out-Null
+        }
+
+        $note = if ($Rows.Count -gt $displayRows.Count) {
+            "Showing the first $($displayRows.Count) of $($Rows.Count) rows. Use the download link for the complete result."
+        } else {
+            "Rows: $($Rows.Count)"
+        }
+
+        return @"
+<div class="result-note">$(HtmlEncode $note)</div>
+<div class="result-scroll">
+  <table class="result-table">
+    <thead>
+      <tr>$headHtml</tr>
+    </thead>
+    <tbody>
+      $($rowHtml -join "`n")
+    </tbody>
+  </table>
+</div>
+"@
+    }
+
+    function New-PreviewTextHtml {
+        param(
+            [string[]]$Lines,
+            [int]$MaxLines = 300
+        )
+
+        if (-not $Lines -or $Lines.Count -eq 0) {
+            return "<div class='result-empty'>No detailed lines were available for this finding.</div>"
+        }
+
+        $displayLines = @($Lines | Select-Object -First $MaxLines)
+        $note = if ($Lines.Count -gt $displayLines.Count) {
+            "Showing the first $($displayLines.Count) of $($Lines.Count) lines. Use the download link for the complete result."
+        } else {
+            "Lines: $($Lines.Count)"
+        }
+
+        $content = HtmlEncode (($displayLines | ForEach-Object { [string]$_ }) -join "`r`n")
+        return @"
+<div class="result-note">$(HtmlEncode $note)</div>
+<div class="result-scroll">
+  <pre class="result-pre">$content</pre>
+</div>
+"@
+    }
+
+    function Get-CsvDownloadName {
+        param(
+            [string]$Name,
+            [string]$Fallback = 'result.csv'
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Name)) { return $Fallback }
+
+        $base = ''
+        try { $base = [System.IO.Path]::GetFileNameWithoutExtension($Name) } catch { $base = $Name }
+        if ([string]::IsNullOrWhiteSpace($base)) { $base = 'result' }
+        return ('{0}.csv' -f $base)
+    }
+
+    function Convert-LinesToTableRows {
+        param(
+            [string[]]$Lines,
+            [string]$PrimaryColumn = 'Result'
+        )
+
+        $rows = New-Object 'System.Collections.Generic.List[object]'
+        if (-not $Lines) { return @() }
+
+        $lineNumber = 1
+        foreach ($line in $Lines) {
+            if ($null -eq $line) { continue }
+            $text = ([string]$line).Trim()
+            if ($text.Length -eq 0) { continue }
+
+            $rows.Add([pscustomobject]@{
+                Line = $lineNumber
+                $PrimaryColumn = $text
+            }) | Out-Null
+
+            $lineNumber++
+        }
+
+        return $rows.ToArray()
+    }
+
+    function Get-TextFindingTableData {
+        param(
+            [object]$Finding,
+            [object]$Definition,
+            [string]$SourcePath
+        )
+
+        $SourcePath = Resolve-AuditArtifactPath $SourcePath
+        $title = Get-CanonicalTitle $Finding.Title
+        $rows = @()
+        $columns = @()
+        $lines = if ($SourcePath) { @(Get-NonHeaderLines $SourcePath) } else { @() }
+
+        switch -Regex ($title) {
+            '^Inactive computer accounts \(>90 days\)$' {
+                $tmp = New-Object 'System.Collections.Generic.List[object]'
+                foreach ($line in $lines) {
+                    if ($line -match '^Computer\s+(?<Name>\S+)\s+\((?<DNSHostName>.*?)\)\s+OS:\s+(?<OperatingSystem>.*?)\s+last logon:\s+(?<LastLogon>.+)$') {
+                        $tmp.Add([pscustomobject]@{
+                            Name            = $matches['Name'].Trim()
+                            DNSHostName     = $matches['DNSHostName'].Trim()
+                            OperatingSystem = $matches['OperatingSystem'].Trim()
+                            LastLogon       = $matches['LastLogon'].Trim()
+                        }) | Out-Null
+                    }
+                }
+                $rows = $tmp.ToArray()
+                $columns = @('Name','DNSHostName','OperatingSystem','LastLogon')
+                break
+            }
+
+            '^Domain controllers allow weak Kerberos ciphers$' {
+                $tmp = New-Object 'System.Collections.Generic.List[object]'
+                $current = [ordered]@{}
+                foreach ($line in $lines) {
+                    $t = ([string]$line).Trim()
+                    if ($t -match '^Link:') { continue }
+
+                    if ($t -match '^Decimal Value:\s*(?<Value>.+)$') {
+                        $current['DecimalValue'] = $matches['Value'].Trim()
+                        continue
+                    }
+                    if ($t -match '^Hex Value:\s*(?<Value>.+)$') {
+                        $current['HexValue'] = $matches['Value'].Trim()
+                        continue
+                    }
+                    if ($t -match '^Supported Encryption Types:\s*(?<Value>.+)$') {
+                        $current['SupportedEncryptionTypes'] = $matches['Value'].Trim()
+                        if ($current.Contains('DomainController')) {
+                            $tmp.Add([pscustomobject]@{
+                                DomainController          = [string]$current['DomainController']
+                                DecimalValue              = [string]$current['DecimalValue']
+                                HexValue                  = [string]$current['HexValue']
+                                SupportedEncryptionTypes  = [string]$current['SupportedEncryptionTypes']
+                            }) | Out-Null
+                        }
+                        $current = [ordered]@{}
+                        continue
+                    }
+
+                    if (-not $t.Contains(':')) {
+                        if ($current.Contains('DomainController')) {
+                            $tmp.Add([pscustomobject]@{
+                                DomainController          = [string]$current['DomainController']
+                                DecimalValue              = [string]$current['DecimalValue']
+                                HexValue                  = [string]$current['HexValue']
+                                SupportedEncryptionTypes  = [string]$current['SupportedEncryptionTypes']
+                            }) | Out-Null
+                        }
+                        $current = [ordered]@{ DomainController = $t }
+                    }
+                }
+
+                if ($current.Contains('DomainController')) {
+                    $tmp.Add([pscustomobject]@{
+                        DomainController          = [string]$current['DomainController']
+                        DecimalValue              = [string]$current['DecimalValue']
+                        HexValue                  = [string]$current['HexValue']
+                        SupportedEncryptionTypes  = [string]$current['SupportedEncryptionTypes']
+                    }) | Out-Null
+                }
+
+                $rows = $tmp.ToArray()
+                $columns = @('DomainController','DecimalValue','HexValue','SupportedEncryptionTypes')
+                break
+            }
+
+            '^Kerberoastable SPNs present \(review high-value service accounts\)$' {
+                $rows = @(
+                    $lines |
+                    Where-Object { $_ -and $_ -notmatch '^No high value kerberoastable user accounts identified\.$' } |
+                    ForEach-Object {
+                        [pscustomobject]@{ AccountName = ([string]$_).Trim() }
+                    }
+                )
+                $columns = @('AccountName')
+                break
+            }
+
+            '^LAPS password read rights widely delegated$' {
+                $tmp = New-Object 'System.Collections.Generic.List[object]'
+                foreach ($line in $lines) {
+                    if ($line -match '^(?<Trustee>.+?) can read password attribute of (?<ObjectDN>.+)$') {
+                        $tmp.Add([pscustomobject]@{
+                            Trustee  = $matches['Trustee'].Trim()
+                            ObjectDN = $matches['ObjectDN'].Trim()
+                        }) | Out-Null
+                    }
+                }
+                $rows = $tmp.ToArray()
+                $columns = @('Trustee','ObjectDN')
+                break
+            }
+
+            '^LAPS passwords expired$' {
+                $tmp = New-Object 'System.Collections.Generic.List[object]'
+                foreach ($line in $lines) {
+                    if ($line -match '^(?<Computer>.+?) password is expired since (?<Expiration>.+)$') {
+                        $tmp.Add([pscustomobject]@{
+                            Computer   = $matches['Computer'].Trim()
+                            Expiration = $matches['Expiration'].Trim()
+                        }) | Out-Null
+                    }
+                }
+                $rows = $tmp.ToArray()
+                $columns = @('Computer','Expiration')
+                break
+            }
+
+            '^LDAP security misconfiguration detected$' {
+                $rows = @(Convert-LinesToTableRows -Lines $lines -PrimaryColumn 'Issue')
+                $columns = @('Issue')
+                break
+            }
+
+            '^NTLM restrictions require hardening$' {
+                $tmp = New-Object 'System.Collections.Generic.List[object]'
+                foreach ($line in $lines) {
+                    if ($line -match '^NTLM restricted by GPO \[(?<GPO>.+?)\] with value \[(?<Value>.+?)\]$') {
+                        $tmp.Add([pscustomobject]@{
+                            Type  = 'RestrictedByGPO'
+                            GPO   = $matches['GPO'].Trim()
+                            Value = $matches['Value'].Trim()
+                        }) | Out-Null
+                        continue
+                    }
+                    if ($line -match '^NTLM audit GPO \[(?<GPO>.+?)\] with value \[(?<Value>.+?)\]$') {
+                        $tmp.Add([pscustomobject]@{
+                            Type  = 'AuditByGPO'
+                            GPO   = $matches['GPO'].Trim()
+                            Value = $matches['Value'].Trim()
+                        }) | Out-Null
+                        continue
+                    }
+                    if ($line -match '^NTLM auth exceptions (?<Value>.+)$') {
+                        $tmp.Add([pscustomobject]@{
+                            Type  = 'Exceptions'
+                            GPO   = ''
+                            Value = $matches['Value'].Trim()
+                        }) | Out-Null
+                        continue
+                    }
+
+                    $tmp.Add([pscustomobject]@{
+                        Type  = 'Detail'
+                        GPO   = ''
+                        Value = ([string]$line).Trim()
+                    }) | Out-Null
+                }
+                $rows = $tmp.ToArray()
+                $columns = @('Type','GPO','Value')
+                break
+            }
+
+            '^DNS zones allowing insecure updates$' {
+                $tmp = New-Object 'System.Collections.Generic.List[object]'
+                foreach ($line in $lines) {
+                    if ($line -match '^The DNS Zone (?<ZoneName>.+?) on DNS server (?<DnsServer>.+?) allows insecure updates \((?<DynamicUpdate>.+)\)$') {
+                        $tmp.Add([pscustomobject]@{
+                            ZoneName      = $matches['ZoneName'].Trim()
+                            DnsServer     = $matches['DnsServer'].Trim()
+                            DynamicUpdate = $matches['DynamicUpdate'].Trim()
+                        }) | Out-Null
+                    }
+                }
+                $rows = $tmp.ToArray()
+                $columns = @('ZoneName','DnsServer','DynamicUpdate')
+                break
+            }
+
+            '^Delegated permissions risks detected$|^Delegated permissions recommendations available$' {
+                $rows = @(Convert-LinesToTableRows -Lines $lines -PrimaryColumn 'Note')
+                $columns = @('Note')
+                break
+            }
+        }
+
+        if (-not $rows -or $rows.Count -eq 0) {
+            $rows = @(Convert-LinesToTableRows -Lines $lines -PrimaryColumn 'Result')
+            $columns = @('Result')
+        }
+
+        return [pscustomobject]@{
+            Rows    = @($rows)
+            Columns = @($columns)
+            Lines   = @($lines)
+        }
+    }
+
+    function Get-FindingArtifactDefinition {
+        param([object]$Finding)
+
+        $title = Get-CanonicalTitle $Finding.Title
+        $highRiskDir = Resolve-AuditArtifactPath (Join-Path $InputRoot 'HighRisk')
+        $htmlRoot = Get-HtmlReportsDir -BaseRoot $InputRoot
+        $sourcePath = Resolve-AuditArtifactPath (Get-NormalizedAbsolutePath $Finding.Link)
+        $sourceExt = ''
+        try { $sourceExt = [System.IO.Path]::GetExtension($sourcePath).ToLowerInvariant() } catch { }
+
+        $definition = [ordered]@{
+            Type        = 'auto'
+            SourcePath  = $sourcePath
+            DownloadName = if ($sourcePath) { [System.IO.Path]::GetFileName($sourcePath) } else { ('{0}.txt' -f (New-Slug $title)) }
+            ButtonText  = 'Download Result'
+            Columns     = @()
+            FilterColumn = $null
+            FilterValue  = $null
+        }
+
+        switch -Regex ($title) {
+            '^Domain Admins group overlap \(extra group memberships\)$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'accounts_domain_admins_group_overlap.csv'
+                $definition.DownloadName = 'accounts_domain_admins_group_overlap.csv'
+                $definition.Columns = @('SamAccountName','Name','Enabled','ExtraGroupCount','ExtraGroups','Tier1GroupsFound','Flags')
+                break
+            }
+            '^Domain Admins$|^Domain Admins membership size$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'Domain_Admins.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'Domain Admins'
+                break
+            }
+            '^Enterprise Admins$|^Enterprise Admins membership size$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'Enterprise_Admins.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'Enterprise Admins'
+                break
+            }
+            '^Schema Admins$|^Schema Admins membership size$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'Schema_Admins.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'Schema Admins'
+                break
+            }
+            '^BUILTIN\\Administrators$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'BUILTIN_Administrators.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'BUILTIN\Administrators'
+                break
+            }
+            '^BUILTIN\\Account Operators$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'BUILTIN_Account_Operators.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'BUILTIN\Account Operators'
+                break
+            }
+            '^BUILTIN\\Server Operators$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'BUILTIN_Server_Operators.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'BUILTIN\Server Operators'
+                break
+            }
+            '^BUILTIN\\Backup Operators$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'BUILTIN_Backup_Operators.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'BUILTIN\Backup Operators'
+                break
+            }
+            '^BUILTIN\\Print Operators$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'BUILTIN_Print_Operators.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass')
+                $definition.FilterColumn = 'Group'
+                $definition.FilterValue = 'BUILTIN\Print Operators'
+                break
+            }
+            '^Large privileged group membership$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PRIVILEGED_GROUPS.csv'
+                $definition.DownloadName = 'PRIVILEGED_GROUPS.csv'
+                $definition.Columns = @('Group','MemberSam','MemberName','ObjectClass','Baseline','Severity')
+                break
+            }
+            '^Observed inactive enabled accounts \(>180 days\)$|^Inactive enabled accounts$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'INACTIVE_ACCOUNTS.csv'
+                $definition.DownloadName = 'INACTIVE_ACCOUNTS.csv'
+                $definition.Columns = @('SamAccountName','Name','LastLogonDate','WhenCreated','IsPrivileged')
+                break
+            }
+            '^Enabled user accounts with PasswordNeverExpires$|^Accounts with password set to not expire$|^Passwords set to never expire$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'PASSWORD_NEVER_EXPIRES.csv'
+                $definition.DownloadName = 'PASSWORD_NEVER_EXPIRES.csv'
+                break
+            }
+            '^Disabled stale accounts$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'DISABLED_STALE.csv'
+                $definition.DownloadName = 'DISABLED_STALE.csv'
+                break
+            }
+            '^Duplicate passwords detected$|^Duplicate passwords' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'DUPLICATE_PASSWORDS.csv'
+                $definition.DownloadName = 'DUPLICATE_PASSWORDS.csv'
+                $definition.Columns = @('SamAccountName','NTHash','IsPrivileged','Severity','Baseline')
+                break
+            }
+            '^KRBTGT password age is high$|^krbtgt password age$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'KRBTGT.csv'
+                $definition.DownloadName = 'KRBTGT.csv'
+                break
+            }
+            '^ms-DS-MachineAccountQuota$|^MachineAccountQuota permits user-created computers$' {
+                $definition.Type = 'csv'
+                $definition.SourcePath = Join-Path $highRiskDir 'MACHINE_ACCOUNT_QUOTA.csv'
+                $definition.DownloadName = 'MACHINE_ACCOUNT_QUOTA.csv'
+                break
+            }
+            '^Passwords stored using reversible encryption$' {
+                $definition.Type = 'reversible'
+                $definition.SourcePath = Join-Path $InputRoot 'password_quality.txt'
+                $definition.DownloadName = 'reversible_encryption_accounts.txt'
+                break
+            }
+            '^Accounts without Kerberos pre-auth \(AS-REP roastable\)$' {
+                $definition.Type = 'asrep'
+                $definition.SourcePath = Join-Path $InputRoot 'ASREP.txt'
+                $definition.DownloadName = 'ASREP.txt'
+                break
+            }
+            '^Disabled user accounts present \(review and cleanup\)$' {
+                $definition.Type = 'disabled-accounts'
+                $definition.SourcePath = Join-Path $InputRoot 'accounts_disabled.txt'
+                $definition.DownloadName = 'accounts_disabled.txt'
+                break
+            }
+            '^Domain controllers allow weak Kerberos ciphers$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'dcs_weak_kerberos_ciphersuite.txt'
+                $definition.DownloadName = 'dcs_weak_kerberos_ciphersuite.txt'
+                break
+            }
+            '^Kerberoastable SPNs present \(review high-value service accounts\)$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'SPNs.txt'
+                $definition.DownloadName = 'SPNs.txt'
+                break
+            }
+            '^Inactive computer accounts \(>90 days\)$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'computers_inactive_90days.txt'
+                $definition.DownloadName = 'computers_inactive_90days.txt'
+                break
+            }
+            '^LAPS password read rights widely delegated$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'laps_read-extendedrights.txt'
+                $definition.DownloadName = 'laps_read-extendedrights.txt'
+                break
+            }
+            '^LAPS passwords expired$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'laps_expired-passwords.txt'
+                $definition.DownloadName = 'laps_expired-passwords.txt'
+                break
+            }
+            '^LDAP security misconfiguration detected$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'LDAPSecurity.txt'
+                $definition.DownloadName = 'LDAPSecurity.txt'
+                break
+            }
+            '^NTLM restrictions require hardening$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'ntlm_restrictions.txt'
+                $definition.DownloadName = 'ntlm_restrictions.txt'
+                break
+            }
+            '^DNS zones allowing insecure updates$' {
+                $definition.Type = 'text'
+                $definition.SourcePath = Join-Path $InputRoot 'insecure_dns_zones.txt'
+                $definition.DownloadName = 'insecure_dns_zones.txt'
+                break
+            }
+            '^Delegated permissions risks detected$|^Delegated permissions recommendations available$' {
+                $definition.Type = 'text'
+                if ($sourcePath) { $definition.DownloadName = [System.IO.Path]::GetFileName($sourcePath) }
+                break
+            }
+            '^Group Policy report available$' {
+                $definition.Type = 'html'
+                $definition.SourcePath = Join-Path $htmlRoot 'GPOReport.html'
+                $definition.DownloadName = 'GPOReport.html'
+                $definition.ButtonText = 'Open Report'
+                break
+            }
+            '^Overlapping group membership report available$' {
+                $definition.Type = 'html'
+                $definition.SourcePath = Join-Path $htmlRoot 'overlapping_group_memberships.html'
+                $definition.DownloadName = 'overlapping_group_memberships.html'
+                $definition.ButtonText = 'Open Report'
+                break
+            }
+            '^Dangerous ACL report available$' {
+                $definition.Type = 'html'
+                $definition.SourcePath = Join-Path $htmlRoot 'dangerousACLs.html'
+                $definition.DownloadName = 'dangerousACLs.html'
+                $definition.ButtonText = 'Open Report'
+                break
+            }
+            '^Delegated permissions report available$|^DNS audit report available$|^DNS recommendations report available$|^High-risk baseline report available$' {
+                $definition.Type = 'html'
+                if ($sourcePath) { $definition.DownloadName = [System.IO.Path]::GetFileName($sourcePath) }
+                $definition.ButtonText = 'Open Report'
+                break
+            }
+        }
+
+        if ($definition.Type -eq 'auto') {
+            switch ($sourceExt) {
+                '.csv'  { $definition.Type = 'csv' }
+                '.txt'  { $definition.Type = 'text' }
+                '.html' { $definition.Type = 'html'; $definition.ButtonText = 'Open Report' }
+                default { $definition.Type = 'text' }
+            }
+        }
+
+        $definition.SourcePath = Resolve-AuditArtifactPath (Get-NormalizedAbsolutePath $definition.SourcePath)
+        return [pscustomobject]$definition
+    }
+
+    function Copy-DownloadFile([string]$SourcePath, [string]$DestinationPath) {
+        if ([string]::IsNullOrWhiteSpace($SourcePath) -or [string]::IsNullOrWhiteSpace($DestinationPath)) { return $false }
+        if (-not (Test-Path -LiteralPath $SourcePath)) { return $false }
+
+        try {
+            Ensure-DirectoryPath (Split-Path -Path $DestinationPath -Parent)
+            Copy-Item -LiteralPath $SourcePath -Destination $DestinationPath -Force -ErrorAction Stop
+            return $true
+        } catch {
+            return $false
+        }
+    }
+
+    function Publish-CommonDownloadArtifacts {
+        param(
+            [string]$Root,
+            [string]$DownloadRoot
+        )
+
+        Ensure-DirectoryPath $DownloadRoot
+        Ensure-DirectoryPath (Join-Path $DownloadRoot 'HighRisk')
+    }
+
+    function New-FindingResultPresentation {
+        param(
+            [object]$Finding,
+            [string]$AuditReportPath,
+            [string]$DownloadRoot
+        )
+
+        $definition = Get-FindingArtifactDefinition -Finding $Finding
+        $sourcePath = $definition.SourcePath
+        $downloadPath = $null
+        $downloadHref = ''
+        $downloadLabel = ''
+        $resultsHtml = "<div class='result-empty'>Detailed result data was not available for this finding.</div>"
+        $buttonText = if ($definition.ButtonText) { [string]$definition.ButtonText } else { 'Download Result' }
+        $openInNewTab = $false
+
+        switch ($definition.Type) {
+            'html' {
+                if ($sourcePath -and (Test-Path -LiteralPath $sourcePath)) {
+                    $downloadPath = $sourcePath
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                    $resultsHtml = "<div class='result-empty'>This finding is backed by a companion HTML report. Use the button below to open the full report.</div>"
+                    $openInNewTab = $true
+                }
+            }
+
+            'csv' {
+                $rows = if ($sourcePath) { @(Get-CsvSafe $sourcePath) } else { @() }
+                $filtered = $false
+                if ($rows.Count -gt 0 -and $definition.FilterColumn -and $definition.FilterValue) {
+                    $rows = @(
+                        $rows | Where-Object {
+                            $_.PSObject.Properties[$definition.FilterColumn] -and
+                            ([string]$_.PSObject.Properties[$definition.FilterColumn].Value).Trim() -eq [string]$definition.FilterValue
+                        }
+                    )
+                    $filtered = $true
+                }
+
+                if ($rows.Count -gt 0) {
+                    if ($filtered) {
+                        $downloadPath = Join-Path $DownloadRoot $definition.DownloadName
+                        Ensure-DirectoryPath (Split-Path -Path $downloadPath -Parent)
+                        $rows | Export-Csv -LiteralPath $downloadPath -NoTypeInformation -Encoding UTF8
+                    }
+                    else {
+                        $downloadPath = $sourcePath
+                    }
+
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                    $resultsHtml = New-PreviewTableHtml -Rows $rows -Columns $definition.Columns -MaxRows 250
+                }
+                elseif ($sourcePath -and (Test-Path -LiteralPath $sourcePath)) {
+                    $resultsHtml = "<div class='result-empty'>The source CSV exists, but no rows matched this finding after filtering.</div>"
+                }
+            }
+
+            'text' {
+                $tableData = Get-TextFindingTableData -Finding $Finding -Definition $definition -SourcePath $sourcePath
+                $rows = @($tableData.Rows)
+
+                if ($rows.Count -gt 0) {
+                    $downloadPath = Join-Path $DownloadRoot (Get-CsvDownloadName -Name $definition.DownloadName -Fallback ('{0}.csv' -f (New-Slug $Finding.Title)))
+                    Ensure-DirectoryPath (Split-Path -Path $downloadPath -Parent)
+                    $rows | Export-Csv -LiteralPath $downloadPath -NoTypeInformation -Encoding UTF8
+
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                    $resultsHtml = New-PreviewTableHtml -Rows $rows -Columns $tableData.Columns -MaxRows 250
+                }
+                elseif ($sourcePath -and (Test-Path -LiteralPath $sourcePath)) {
+                    $downloadPath = $sourcePath
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                    $resultsHtml = "<div class='result-empty'>A source text file exists for this finding, but no detailed rows could be parsed into a table.</div>"
+                }
+            }
+
+            'disabled-accounts' {
+                $rows = if ($sourcePath) { @(Get-DisabledAccounts -Path $sourcePath) } else { @() }
+                if ($rows.Count -gt 0) {
+                    $downloadPath = Join-Path $DownloadRoot (Get-CsvDownloadName -Name $definition.DownloadName -Fallback 'accounts_disabled.csv')
+                    Ensure-DirectoryPath (Split-Path -Path $downloadPath -Parent)
+                    $rows | Export-Csv -LiteralPath $downloadPath -NoTypeInformation -Encoding UTF8
+
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                    $resultsHtml = New-PreviewTableHtml -Rows $rows -Columns @('SamAccountName','DisplayName') -MaxRows 250
+                }
+            }
+
+            'asrep' {
+                $rows = if ($sourcePath) { @(Get-AsrepAccounts -Path $sourcePath) } else { @() }
+                if ($rows.Count -gt 0) {
+                    $downloadPath = Join-Path $DownloadRoot (Get-CsvDownloadName -Name $definition.DownloadName -Fallback 'ASREP.csv')
+                    Ensure-DirectoryPath (Split-Path -Path $downloadPath -Parent)
+                    $rows | Export-Csv -LiteralPath $downloadPath -NoTypeInformation -Encoding UTF8
+
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                    $resultsHtml = New-PreviewTableHtml -Rows $rows -Columns @('SamAccountName','DisplayName') -MaxRows 250
+                }
+            }
+
+            'reversible' {
+                $lines = if ($sourcePath) { @(Get-ReversibleEncryptionAccounts -Path $sourcePath) } else { @() }
+                if ($lines.Count -gt 0) {
+                    $rows = @(
+                        $lines | ForEach-Object {
+                            [pscustomobject]@{ Account = ([string]$_).Trim() }
+                        }
+                    )
+
+                    $downloadPath = Join-Path $DownloadRoot (Get-CsvDownloadName -Name $definition.DownloadName -Fallback 'reversible_encryption_accounts.csv')
+                    Ensure-DirectoryPath (Split-Path -Path $downloadPath -Parent)
+                    $rows | Export-Csv -LiteralPath $downloadPath -NoTypeInformation -Encoding UTF8
+
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                    $resultsHtml = New-PreviewTableHtml -Rows $rows -Columns @('Account') -MaxRows 250
+                }
+            }
+
+            default {
+                if ($sourcePath -and (Test-Path -LiteralPath $sourcePath)) {
+                    $downloadPath = $sourcePath
+                    $downloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                    $downloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                }
+            }
+        }
+
+        return [pscustomobject]@{
+            DownloadHref  = $downloadHref
+            DownloadLabel = $downloadLabel
+            DownloadText  = $buttonText
+            ResultsHtml   = $resultsHtml
+            OpenInNewTab  = $openInNewTab
+            ResolvedSourcePath = $sourcePath
+        }
+    }
+
+    function Write-AuditHtmlReport {
+        [CmdletBinding()]
+        param(
+            [string]$Path,
+            [object[]]$Items,
+            [hashtable]$Counts,
+            [string]$ComputerName,
+            [string]$GeneratedOn,
+            [string]$ManagementReportPath,
+            [object[]]$CompanionReports
+        )
+
+        $severityOrder = @('Critical','High','Medium','Low','Information')
+        $totalCount = if ($Items) { $Items.Count } else { 0 }
+        $managementRel = Get-RelativeHref -FromFile $Path -ToPath $ManagementReportPath
+
+        $priorityItems = @(
+            $Items |
+            Where-Object { (Normalize-Severity $_.Severity) -in @('Critical','High') } |
+            Sort-Object -Property @{Expression={ Get-SeverityRank $_.Severity }; Descending=$true}, @{Expression='Score';Descending=$true}, @{Expression='Title';Descending=$false} |
+            Select-Object -First 8
+        )
+
+        $countCards = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($sev in $severityOrder) {
+            $count = 0
+            if ($Counts.ContainsKey($sev)) { $count = [int]$Counts[$sev] }
+            $countCards.Add(@"
+<div class="metric sev-$sev">
+  <div class="metric-label">$sev</div>
+  <div class="metric-value">$count</div>
+</div>
+"@) | Out-Null
+        }
+
+        $priorityHtml = @()
+        if ($priorityItems.Count -gt 0) {
+            foreach ($item in $priorityItems) {
+                $anchor = New-FindingAnchor $item
+                $priorityHtml += @"
+<li>
+  <span class="badge sev-$(Normalize-Severity $item.Severity)">$(Normalize-Severity $item.Severity)</span>
+  <a class="priority-title" href="#$anchor">$(HtmlEncode $item.Title)</a>
+  <span class="priority-evidence">$(HtmlEncode $item.Evidence)</span>
+</li>
+"@
+            }
+        } else {
+            $priorityHtml += '<li>No high-priority findings were identified from the collected results.</li>'
+        }
+
+        $findingIndexHtml = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($sev in $severityOrder) {
+            $bucket = @(
+                $Items |
+                Where-Object { (Normalize-Severity $_.Severity) -eq $sev } |
+                Sort-Object -Property @{Expression='Score';Descending=$true}, @{Expression='Title';Descending=$false}
+            )
+
+            if ($bucket.Count -eq 0) { continue }
+
+            $indexRows = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($item in $bucket) {
+                $anchor = New-FindingAnchor $item
+                $indexRows.Add("<li><a href='#$(HtmlAttrEncode $anchor)'>$(HtmlEncode $item.Title)</a></li>") | Out-Null
+            }
+
+            $findingIndexHtml.Add(@"
+<details class="index-detail">
+  <summary>$sev ($($bucket.Count))</summary>
+  <ol>
+    $($indexRows -join "`n")
+  </ol>
+</details>
+"@) | Out-Null
+        }
+
+        if ($findingIndexHtml.Count -eq 0) {
+            $findingIndexHtml.Add('<div class="empty">No finding index entries were available.</div>') | Out-Null
+        }
+
+        $sectionHtml = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($sev in $severityOrder) {
+            $bucket = @(
+                $Items |
+                Where-Object { (Normalize-Severity $_.Severity) -eq $sev } |
+                Sort-Object -Property @{Expression='Score';Descending=$true}, @{Expression='Title';Descending=$false}
+            )
+
+            $bucketHtml = New-Object 'System.Collections.Generic.List[string]'
+            if ($bucket.Count -eq 0) {
+                $bucketHtml.Add('<div class="empty">No findings in this severity band.</div>') | Out-Null
+            }
+            else {
+                foreach ($item in $bucket) {
+                    $sevNorm = Normalize-Severity $item.Severity
+                    $anchor  = New-FindingAnchor $item
+                    $category = Get-FindingCategory $item.Title
+
+                    $downloadHref = ''
+                    $downloadLabel = ''
+                    $downloadText = 'Download Result'
+                    $resultPanelHtml = "<div class='result-empty'>Detailed result data was not available for this finding.</div>"
+                    $downloadModeAttrs = ''
+
+                    if ($item.PSObject.Properties['DownloadHref'] -and $item.DownloadHref) { $downloadHref = [string]$item.DownloadHref }
+                    if ($item.PSObject.Properties['DownloadLabel'] -and $item.DownloadLabel) { $downloadLabel = [string]$item.DownloadLabel }
+                    if ($item.PSObject.Properties['DownloadText'] -and $item.DownloadText) { $downloadText = [string]$item.DownloadText }
+                    if ($item.PSObject.Properties['ResultsHtml'] -and $item.ResultsHtml) { $resultPanelHtml = [string]$item.ResultsHtml }
+                    if ($item.PSObject.Properties['OpenInNewTab'] -and $item.OpenInNewTab) {
+                        $downloadModeAttrs = " target='_blank' rel='noopener'"
+                    }
+                    elseif (-not [string]::IsNullOrWhiteSpace($downloadLabel)) {
+                        $downloadModeAttrs = " download='" + (HtmlAttrEncode $downloadLabel) + "'"
+                    }
+
+                    $downloadHtml = if (-not [string]::IsNullOrWhiteSpace($downloadHref)) {
+                        @"
+<a class="download-link" href="$(HtmlAttrEncode $downloadHref)"$downloadModeAttrs>$(HtmlEncode $downloadText)</a>
+<div class="download-name mono">$(HtmlEncode $downloadLabel)</div>
+"@
+                    } else {
+                        "<span class='mono'>No downloadable result file was generated for this finding.</span>"
+                    }
+
+                    $bucketHtml.Add(@"
+<details class="finding sev-$sevNorm" data-sev="$sevNorm" data-category="$(HtmlAttrEncode $category)" id="$anchor">
+  <summary>
+    <div class="finding-head">
+      <div class="finding-title-wrap">
+        <span class="badge sev-$sevNorm">$sevNorm</span>
+        <span class="category">$(HtmlEncode $category)</span>
+        <span class="finding-title">$(HtmlEncode $item.Title)</span>
+      </div>
+      <div class="finding-summary">$(HtmlEncode $item.Evidence)</div>
+    </div>
+  </summary>
+  <div class="finding-body">
+    <div class="finding-grid">
+      <div class="panel">
+        <h4>What was observed</h4>
+        <p>$(HtmlEncode $item.Evidence)</p>
+      </div>
+      <div class="panel">
+        <h4>Why it matters</h4>
+        <p>$(HtmlEncode (Get-FindingWhyItMatters $item.Title))</p>
+      </div>
+      <div class="panel">
+        <h4>Recommended action</h4>
+        <p>$(HtmlEncode (Get-FindingRecommendation $item.Title))</p>
+      </div>
+      <div class="panel">
+        <h4>Download Result</h4>
+        <div class="download-wrap">
+          $downloadHtml
+        </div>
+      </div>
+    </div>
+    <div class="panel evidence">
+      <h4>Result details</h4>
+      $resultPanelHtml
+    </div>
+  </div>
+</details>
+"@) | Out-Null
+                }
+            }
+
+            $sectionHtml.Add(@"
+<section class="severity-section" id="section-$(New-Slug $sev)">
+  <div class="section-header">
+    <h2>$sev</h2>
+    <div class="section-count">$($bucket.Count) findings</div>
+  </div>
+  $($bucketHtml -join "`n")
+</section>
+"@) | Out-Null
+        }
+
+        $companionHtml = New-Object 'System.Collections.Generic.List[string]'
+        if ($CompanionReports -and $CompanionReports.Count -gt 0) {
+            foreach ($report in $CompanionReports) {
+                $reportHref = ''
+                if ($report.PSObject.Properties['FullPath'] -and $report.FullPath) {
+                    $reportHref = Get-RelativeHref -FromFile $Path -ToPath $report.FullPath
+                }
+                elseif ($report.PSObject.Properties['RelativePath'] -and $report.RelativePath) {
+                    $reportHref = [string]$report.RelativePath
+                }
+
+                if ($reportHref) {
+                    $companionHtml.Add("<li><a href='$(HtmlAttrEncode $reportHref)'>$(HtmlEncode $report.Title)</a></li>") | Out-Null
+                }
+            }
+        }
+        if ($companionHtml.Count -eq 0) {
+            $companionHtml.Add('<li>No additional HTML companion reports were detected.</li>') | Out-Null
+        }
+
+        $css = @"
+<style>
+:root{
+  --bg:#f5f7fb;
+  --panel:#ffffff;
+  --text:#1b2430;
+  --muted:#5f6b7a;
+  --line:#d9e0ea;
+  --shadow:0 10px 24px rgba(15,23,42,.08);
+  --critical:#c62828;
+  --high:#ef6c00;
+  --medium:#0277bd;
+  --low:#2e7d32;
+  --information:#6c757d;
+  --critical-soft:#fdecec;
+  --high-soft:#fff2e5;
+  --medium-soft:#e8f4fd;
+  --low-soft:#edf8ee;
+  --information-soft:#f2f4f6;
+  --result-panel:#ffffff;
+}
+body[data-theme="dark"]{
+  --bg:#0f172a;
+  --panel:#111827;
+  --text:#e5e7eb;
+  --muted:#94a3b8;
+  --line:#334155;
+  --shadow:0 10px 24px rgba(0,0,0,.35);
+  --critical:#f87171;
+  --high:#fb923c;
+  --medium:#60a5fa;
+  --low:#4ade80;
+  --information:#cbd5e1;
+  --critical-soft:rgba(248,113,113,.15);
+  --high-soft:rgba(251,146,60,.14);
+  --medium-soft:rgba(96,165,250,.14);
+  --low-soft:rgba(74,222,128,.14);
+  --information-soft:rgba(203,213,225,.12);
+  --result-panel:#0b1220;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  font-family:Segoe UI,Arial,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+}
+a{color:#0f5cb8;text-decoration:none}
+body[data-theme="dark"] a{color:#93c5fd}
+a:hover{text-decoration:underline}
+.container{max-width:1280px;margin:0 auto;padding:28px 22px 48px}
+.hero{
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:18px;
+  box-shadow:var(--shadow);
+  padding:24px;
+}
+.hero-top{
+  display:flex;
+  justify-content:space-between;
+  gap:20px;
+  flex-wrap:wrap;
+  align-items:flex-start;
+}
+.hero-actions{
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:12px;
+}
+.theme-toggle{
+  border:1px solid var(--line);
+  background:var(--panel);
+  color:var(--text);
+  border-radius:999px;
+  padding:10px 14px;
+  font-size:13px;
+  font-weight:700;
+  cursor:pointer;
+}
+.theme-toggle:hover{transform:translateY(-1px)}
+h1{margin:0 0 8px;font-size:28px}
+.meta{color:var(--muted);font-size:14px;line-height:1.6}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-top:22px}
+.metric{
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:14px 16px;
+  background:var(--panel);
+}
+.metric-label{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}
+.metric-value{font-size:30px;font-weight:800;margin-top:6px}
+.metric.sev-Critical{background:var(--critical-soft)}
+.metric.sev-High{background:var(--high-soft)}
+.metric.sev-Medium{background:var(--medium-soft)}
+.metric.sev-Low{background:var(--low-soft)}
+.metric.sev-Information{background:var(--information-soft)}
+.layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:20px;margin-top:20px}
+.sidebar{
+  position:sticky;top:18px;align-self:start;
+  background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px;
+}
+.sidebar h3,.content h2{margin-top:0}
+.sidebar ul{list-style:none;padding:0;margin:0}
+.sidebar li{margin:10px 0}
+.index-group{margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}
+.index-group h4{margin:0 0 10px;font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.index-detail{border:1px solid var(--line);border-radius:12px;padding:8px 10px;background:#f8fafc;margin-bottom:10px}
+body[data-theme="dark"] .index-detail{background:var(--result-panel)}
+.index-detail summary{cursor:pointer;font-weight:700;list-style:none}
+.index-detail summary::-webkit-details-marker{display:none}
+.index-detail ol{margin:10px 0 0 18px;padding:0;max-height:260px;overflow:auto}
+.index-detail li{margin:6px 0}
+.index-detail a{color:var(--text)}
+.badge{
+  display:inline-flex;
+  align-items:center;
+  border-radius:999px;
+  padding:4px 10px;
+  font-size:12px;
+  font-weight:800;
+  letter-spacing:.02em;
+  margin-right:8px;
+  border:1px solid transparent;
+}
+.badge.sev-Critical{background:var(--critical-soft);color:var(--critical);border-color:rgba(198,40,40,.25)}
+.badge.sev-High{background:var(--high-soft);color:var(--high);border-color:rgba(239,108,0,.25)}
+.badge.sev-Medium{background:var(--medium-soft);color:var(--medium);border-color:rgba(2,119,189,.25)}
+.badge.sev-Low{background:var(--low-soft);color:var(--low);border-color:rgba(46,125,50,.25)}
+.badge.sev-Information{background:var(--information-soft);color:var(--information);border-color:rgba(108,117,125,.25)}
+.category{
+  display:inline-flex;
+  align-items:center;
+  border-radius:999px;
+  padding:4px 10px;
+  font-size:12px;
+  font-weight:700;
+  color:var(--muted);
+  background:#f4f6f9;
+  border:1px solid var(--line);
+  margin-right:8px;
+}
+body[data-theme="dark"] .category{background:#1f2937}
+.toolbar{
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:18px;
+  box-shadow:var(--shadow);
+  padding:16px;
+  margin-bottom:18px;
+}
+.toolbar-row{
+  display:flex;
+  gap:12px;
+  flex-wrap:wrap;
+  align-items:flex-end;
+}
+label{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+select,input{
+  width:100%;
+  min-height:42px;
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:10px 12px;
+  background:var(--panel);
+  color:var(--text);
+}
+.filter{min-width:220px;flex:1}
+.section-header{
+  display:flex;justify-content:space-between;align-items:center;gap:12px;
+  margin:0 0 12px;
+}
+.section-header h2{margin:0;font-size:24px}
+.section-count{color:var(--muted);font-size:14px;font-weight:700}
+.finding{
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-left:6px solid var(--information);
+  border-radius:16px;
+  box-shadow:var(--shadow);
+  margin-bottom:14px;
+  overflow:hidden;
+}
+.finding.sev-Critical{border-left-color:var(--critical)}
+.finding.sev-High{border-left-color:var(--high)}
+.finding.sev-Medium{border-left-color:var(--medium)}
+.finding.sev-Low{border-left-color:var(--low)}
+.finding.sev-Information{border-left-color:var(--information)}
+.finding summary{
+  list-style:none;
+  cursor:pointer;
+  padding:18px 18px 16px;
+}
+.finding summary::-webkit-details-marker{display:none}
+.finding-head{display:flex;flex-direction:column;gap:10px}
+.finding-title-wrap{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.finding-title{font-size:18px;font-weight:800}
+.finding-summary{color:var(--muted);line-height:1.5}
+.finding-body{padding:0 18px 18px}
+.finding-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.panel{
+  background:#f8fafc;
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:14px;
+}
+body[data-theme="dark"] .panel{background:var(--result-panel)}
+.panel h4{margin:0 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.panel p{margin:0;line-height:1.55}
+.panel.evidence{margin-top:12px}
+.priority{background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px;margin-bottom:18px}
+.priority ul{margin:0;padding-left:18px}
+.priority li{margin:10px 0;line-height:1.5}
+.priority-title{font-weight:700;color:var(--text)}
+.priority-evidence{display:block;color:var(--muted);margin-top:4px}
+.empty{background:var(--panel);border:1px dashed var(--line);border-radius:14px;padding:16px;color:var(--muted)}
+.companion{background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:18px;margin-top:18px}
+.companion ul{margin:0;padding-left:18px}
+.mono{font-family:Consolas,Menlo,Monaco,monospace}
+.download-wrap{display:flex;flex-direction:column;gap:10px}
+.download-link{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:40px;
+  padding:10px 14px;
+  border-radius:10px;
+  border:1px solid var(--line);
+  background:var(--panel);
+  color:var(--text);
+  font-weight:700;
+  max-width:220px;
+}
+.download-name{font-size:13px;color:var(--muted);word-break:break-word}
+.result-note{font-size:13px;color:var(--muted);margin-bottom:10px}
+.result-scroll{
+  max-height:360px;
+  overflow:auto;
+  border:1px solid var(--line);
+  border-radius:10px;
+  background:var(--panel);
+}
+.result-table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:13px;
+}
+.result-table th,.result-table td{
+  border-bottom:1px solid var(--line);
+  padding:10px 12px;
+  vertical-align:top;
+  text-align:left;
+}
+.result-table th{
+  position:sticky;
+  top:0;
+  background:#eef2f7;
+  z-index:1;
+}
+body[data-theme="dark"] .result-table th{background:#0b1220}
+.result-pre{
+  margin:0;
+  padding:12px;
+  white-space:pre-wrap;
+  word-break:break-word;
+  font-family:Consolas,Menlo,Monaco,monospace;
+  color:var(--text);
+}
+.result-empty{color:var(--muted);line-height:1.5}
+@media (max-width: 980px){
+  .layout{grid-template-columns:1fr}
+  .sidebar{position:static}
+  .hero-actions{align-items:flex-start}
+}
+</style>
+"@
+
+        $js = @"
+<script>
+(function(){
+  function q(sel){return document.querySelector(sel);}
+  function qa(sel){return Array.prototype.slice.call(document.querySelectorAll(sel));}
+  function findings(){return qa('.finding');}
+
+  function applyTheme(theme){
+    document.body.setAttribute('data-theme', theme);
+    var btn = q('#themeToggle');
+    if (btn) {
+      btn.innerText = theme === 'dark' ? 'Light mode' : 'Dark mode';
+      btn.setAttribute('aria-pressed', theme === 'dark' ? 'true' : 'false');
+    }
+    try { localStorage.setItem('adaudit-theme', theme); } catch (e) {}
+  }
+
+  function applyFilters(){
+    var sev = q('#severityFilter').value;
+    var query = (q('#searchFilter').value || '').toLowerCase().trim();
+    var visible = 0;
+
+    findings().forEach(function(item){
+      var itemSev = item.getAttribute('data-sev');
+      var text = (item.innerText || '').toLowerCase();
+      var show = (sev === 'All' || itemSev === sev) && (!query || text.indexOf(query) >= 0);
+      item.style.display = show ? '' : 'none';
+      if(show){ visible++; }
+    });
+
+    var el = q('#visibleFindings');
+    if (el) { el.value = visible; }
+  }
+
+  var btn = q('#themeToggle');
+  if (btn) {
+    btn.addEventListener('click', function(){
+      var next = document.body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      applyTheme(next);
+    });
+  }
+
+  var storedTheme = null;
+  try { storedTheme = localStorage.getItem('adaudit-theme'); } catch (e) {}
+  applyTheme(storedTheme === 'dark' ? 'dark' : 'light');
+
+  q('#severityFilter').addEventListener('change', applyFilters);
+  q('#searchFilter').addEventListener('input', applyFilters);
+  applyFilters();
+})();
+</script>
+"@
+
+        $html = @"
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADAudit - Audit Results</title>
+$css
+</head>
+<body data-theme="light">
+<div class="container">
+  <section class="hero">
+    <div class="hero-top">
+      <div>
+        <h1>Active Directory Audit Results</h1>
+        <div class="meta">
+          Target: <span class="mono">$(HtmlEncode $ComputerName)</span><br>
+          Generated: $(HtmlEncode $GeneratedOn)<br>
+          Report style: HTML audit summary with severity-based findings and embedded evidence<br>
+          Finding details include in-report result previews with per-finding downloads.<br>
+          Downloaded evidence is written to the <span class="mono">Raw Data</span> folder for technician handoff and follow-up work.
+        </div>
+      </div>
+      <div class="hero-actions">
+        <button type="button" class="theme-toggle" id="themeToggle" aria-pressed="false">Dark mode</button>
+        <div class="meta">
+          Total findings: <b>$totalCount</b><br>
+          Management summary: <a href="$(HtmlAttrEncode $managementRel)">$(HtmlEncode ([System.IO.Path]::GetFileName($ManagementReportPath)))</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="metrics">
+      $($countCards -join "`n")
+    </div>
+  </section>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <h3>Navigate</h3>
+      <ul>
+        <li><a href="#priority-actions">Priority actions</a></li>
+        <li><a href="#section-critical">Critical findings</a></li>
+        <li><a href="#section-high">High findings</a></li>
+        <li><a href="#section-medium">Medium findings</a></li>
+        <li><a href="#section-low">Low findings</a></li>
+        <li><a href="#section-information">Information</a></li>
+        <li><a href="#companion-reports">Companion reports</a></li>
+      </ul>
+      <div class="index-group">
+        <h4>Finding index</h4>
+        $($findingIndexHtml -join "`n")
+      </div>
+    </aside>
+
+    <main class="content">
+      <section class="priority" id="priority-actions">
+        <div class="section-header">
+          <h2>Priority actions</h2>
+          <div class="section-count">Highest-severity findings first</div>
+        </div>
+        <ul>
+          $($priorityHtml -join "`n")
+        </ul>
+      </section>
+
+      <section class="toolbar">
+        <div class="toolbar-row">
+          <div class="filter">
+            <label for="severityFilter">Severity</label>
+            <select id="severityFilter">
+              <option>All</option>
+              <option>Critical</option>
+              <option>High</option>
+              <option>Medium</option>
+              <option>Low</option>
+              <option>Information</option>
+            </select>
+          </div>
+          <div class="filter">
+            <label for="searchFilter">Search</label>
+            <input id="searchFilter" type="text" placeholder="Search findings, evidence, result details, category">
+          </div>
+          <div class="filter">
+            <label>Visible findings</label>
+            <input type="text" value="$totalCount" id="visibleFindings" readonly>
+          </div>
+        </div>
+      </section>
+
+      $($sectionHtml -join "`n")
+
+      <section class="companion" id="companion-reports">
+        <div class="section-header">
+          <h2>Companion reports</h2>
+          <div class="section-count">Additional HTML outputs detected</div>
+        </div>
+        <ul>
+          $($companionHtml -join "`n")
+        </ul>
+      </section>
+    </main>
+  </div>
+</div>
+$js
+</body>
+</html>
+"@
+
+        Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+    }
+
     # ---------------------------
     # Baseline parsing (authoritative)
     # ---------------------------
-    $baselinePath = Join-Path $InputRoot 'ad_high_risk_baseline.txt'
+    $baselinePath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ad_high_risk_baseline.txt')
 
     $baselineHasDA        = $false
     $baselineHasEA        = $false
@@ -5745,7 +7593,7 @@ function Invoke-ManagementReport {
     $GroupsCount = $null
     $OUsCount    = $null
     try {
-        $adExtract = Join-Path $InputRoot 'ADExtract'
+        $adExtract = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ADExtract')
         if (Test-Path $adExtract) {
             $usersCsv  = Get-ChildItem -Path $adExtract -Recurse -File -Filter '*-Users.csv'  | Select-Object -First 1
             $groupsCsv = Get-ChildItem -Path $adExtract -Recurse -File -Filter '*-Groups.csv' | Select-Object -First 1
@@ -5759,7 +7607,7 @@ function Invoke-ManagementReport {
     # ---------------------------
     # HighRisk CSVs
     # ---------------------------
-    $highRiskDir = Join-Path $InputRoot 'HighRisk'
+    $highRiskDir = Resolve-AuditArtifactPath (Join-Path $InputRoot 'HighRisk')
     if (Test-Path $highRiskDir) {
         $hrFiles = @{
             DUPLICATE_PASSWORDS     = Join-Path $highRiskDir 'DUPLICATE_PASSWORDS.csv'
@@ -5839,7 +7687,7 @@ function Invoke-ManagementReport {
     # ---------------------------
     # Text-based checks
     # ---------------------------
-    $weakKerbPath = Join-Path $InputRoot 'dcs_weak_kerberos_ciphersuite.txt'
+    $weakKerbPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dcs_weak_kerberos_ciphersuite.txt')
     $weakKerbLines = Get-NonHeaderLines $weakKerbPath
     if ($weakKerbLines.Count -gt 0) {
         Add-FindingOnce 'High' 'Domain controllers allow weak Kerberos ciphers' "DCs flagged: $($weakKerbLines.Count)" $weakKerbPath (Score-Scaled 'High' $weakKerbLines.Count)
@@ -5848,7 +7696,7 @@ function Invoke-ManagementReport {
     # ---------------------------
     # Disabled user accounts (accounts_disabled.txt) - UPDATED SCORING
     # ---------------------------
-    $disabledPath = Join-Path $InputRoot 'accounts_disabled.txt'
+    $disabledPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'accounts_disabled.txt')
     $disabled = @(Get-DisabledAccounts -Path $disabledPath)
     $disabledUnique = @(
         $disabled |
@@ -5882,7 +7730,7 @@ function Invoke-ManagementReport {
     # ---------------------------
     # Password quality (reversible encryption)
     # ---------------------------
-    $pqPath = Join-Path $InputRoot 'password_quality.txt'
+    $pqPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'password_quality.txt')
     $revAccounts = @(Get-ReversibleEncryptionAccounts -Path $pqPath)
     $revCount = @($revAccounts).Count
     if ($revCount -gt 0) {
@@ -5899,7 +7747,7 @@ function Invoke-ManagementReport {
     # ---------------------------
     # AS-REP roastable
     # ---------------------------
-    $asrepPath = Join-Path $InputRoot 'ASREP.txt'
+    $asrepPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ASREP.txt')
     $asrepAccounts = @(Get-AsrepAccounts -path $asrepPath)
     $asrepCount = @($asrepAccounts).Count
     if ($asrepCount -gt 0) {
@@ -5914,14 +7762,14 @@ function Invoke-ManagementReport {
         Add-FindingOnce $sev 'Accounts without Kerberos pre-auth (AS-REP roastable)' "Accounts: $asrepCount | Users: $samPreview" $asrepPath $score
     }
 
-    $spnPath = Join-Path $InputRoot 'SPNs.txt'
+    $spnPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'SPNs.txt')
     $spnLines = Get-NonHeaderLines $spnPath
     if ($spnLines.Count -gt 0) {
         Add-FindingOnce 'Medium' 'Kerberoastable SPNs present (review high-value service accounts)' "Lines: $($spnLines.Count)" $spnPath (Score-Scaled 'Medium' $spnLines.Count)
     }
 
     # Inactive computer objects (>90 days)
-    $inactiveCompsPath = Join-Path $InputRoot 'computers_inactive_90days.txt'
+    $inactiveCompsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'computers_inactive_90days.txt')
     $inactiveCompsLines = Get-NonHeaderLines $inactiveCompsPath
     if ($inactiveCompsLines.Count -gt 0) {
         $obs = $inactiveCompsLines.Count
@@ -5932,7 +7780,7 @@ function Invoke-ManagementReport {
     }
 
     # Suppress accounts_passdontexpire.txt when baseline already provides PasswordNeverExpires
-    $pndePath = Join-Path $InputRoot 'accounts_passdontexpire.txt'
+    $pndePath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'accounts_passdontexpire.txt')
     if (-not $baselineHasPNE) {
         $pndeLines = Get-NonHeaderLines $pndePath
         if ($pndeLines.Count -gt 0) {
@@ -5941,8 +7789,8 @@ function Invoke-ManagementReport {
         }
     }
 
-    $lapsRightsPath  = Join-Path $InputRoot 'laps_read-extendedrights.txt'
-    $lapsExpiredPath = Join-Path $InputRoot 'laps_expired-passwords.txt'
+    $lapsRightsPath  = Resolve-AuditArtifactPath (Join-Path $InputRoot 'laps_read-extendedrights.txt')
+    $lapsExpiredPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'laps_expired-passwords.txt')
     if ((Test-Path $lapsRightsPath) -or (Test-Path $lapsExpiredPath)) {
         $rightsCount  = (Get-NonHeaderLines $lapsRightsPath).Count
         $expiredCount = (Get-NonHeaderLines $lapsExpiredPath).Count
@@ -5950,24 +7798,24 @@ function Invoke-ManagementReport {
         if ($expiredCount -gt 0) { Add-FindingOnce 'Medium' 'LAPS passwords expired' "Computers flagged: $expiredCount" $lapsExpiredPath (Score-Scaled 'Medium' $expiredCount) }
     }
 
-    $ldapSecPath = Join-Path $InputRoot 'LDAPSecurity.txt'
+    $ldapSecPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'LDAPSecurity.txt')
     if ((Get-NonHeaderLines $ldapSecPath).Count -gt 0) {
         Add-FindingOnce 'High' 'LDAP security misconfiguration detected' 'See LDAPSecurity.txt for details' $ldapSecPath $SeverityScore.High
     }
 
-    $ntlmRestrictPath = Join-Path $InputRoot 'ntlm_restrictions.txt'
+    $ntlmRestrictPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ntlm_restrictions.txt')
     if ((Get-NonHeaderLines $ntlmRestrictPath).Count -gt 0) {
         Add-FindingOnce 'Medium' 'NTLM restrictions require hardening' 'Review NTLM configuration and restrictions' $ntlmRestrictPath $SeverityScore.Medium
     }
 
-    $dnsInsecureZonesPath = Join-Path $InputRoot 'insecure_dns_zones.txt'
+    $dnsInsecureZonesPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'insecure_dns_zones.txt')
     $dnsInsecureLines = Get-NonHeaderLines $dnsInsecureZonesPath
     if ($dnsInsecureLines.Count -gt 0) {
         Add-FindingOnce 'High' 'DNS zones allowing insecure updates' "Zones flagged: $($dnsInsecureLines.Count)" $dnsInsecureZonesPath (Score-Scaled 'High' $dnsInsecureLines.Count)
     }
 
     # Delegated Permissions
-    $delegRoot = Join-Path $InputRoot 'DelegatedPermissions'
+    $delegRoot = Resolve-AuditArtifactPath (Join-Path $InputRoot 'DelegatedPermissions')
     if (Test-Path $delegRoot) {
         $repFolder = Get-ChildItem -Path $delegRoot -Directory | Sort-Object Name | Select-Object -Last 1
         if ($repFolder) {
@@ -5988,9 +7836,9 @@ function Invoke-ManagementReport {
     }
 
     # Admin group text files (suppressed if baseline includes)
-    $daPath = Join-Path $InputRoot 'domain_admins.txt'
-    $eaPath = Join-Path $InputRoot 'enterprise_admins.txt'
-    $saPath = Join-Path $InputRoot 'schema_admins.txt'
+    $daPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'domain_admins.txt')
+    $eaPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'enterprise_admins.txt')
+    $saPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'schema_admins.txt')
 
     if (-not $baselineHasDA) {
         $daCount = (Get-NonHeaderLines $daPath).Count
@@ -6019,14 +7867,70 @@ function Invoke-ManagementReport {
         }
     }
 
+    # Companion HTML outputs
+    $gpoReportPath = Join-Path (Get-HtmlReportsDir -BaseRoot $InputRoot) 'GPOReport.html'
+    if (Test-Path $gpoReportPath) {
+        Add-FindingOnce 'Information' 'Group Policy report available' 'Detailed GPO export generated as HTML.' $gpoReportPath $SeverityScore.Information
+    }
+
+    $overlapHtmlPath = Join-Path (Get-HtmlReportsDir -BaseRoot $InputRoot) 'overlapping_group_memberships.html'
+    if (Test-Path $overlapHtmlPath) {
+        Add-FindingOnce 'Information' 'Overlapping group membership report available' 'Detailed overlapping membership report generated as HTML.' $overlapHtmlPath $SeverityScore.Information
+    }
+
+    $dangerousAclHtmlPath = Join-Path (Get-HtmlReportsDir -BaseRoot $InputRoot) 'dangerousACLs.html'
+    if (Test-Path $dangerousAclHtmlPath) {
+        Add-FindingOnce 'Information' 'Dangerous ACL report available' 'Detailed ACL findings generated as HTML.' $dangerousAclHtmlPath $SeverityScore.Information
+    }
+
+    $delegatedIndexPath = Get-ChildItem -Path (Join-Path $InputRoot 'DelegatedPermissions') -Recurse -File -Filter 'index.html' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($delegatedIndexPath) {
+        Add-FindingOnce 'Information' 'Delegated permissions report available' 'Detailed delegated permissions HTML report generated.' $delegatedIndexPath.FullName $SeverityScore.Information
+    }
+
+    $dnsAuditHtmlPath = Get-ChildItem -Path $InputRoot -Recurse -File -Filter 'DNSAudit-*.html' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '\.source\.html$' } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($dnsAuditHtmlPath) {
+        Add-FindingOnce 'Information' 'DNS audit report available' 'Detailed DNS audit HTML report generated.' $dnsAuditHtmlPath.FullName $SeverityScore.Information
+    }
+
+    $dnsRecoHtmlPath = Get-ChildItem -Path $InputRoot -Recurse -File -Filter 'DNS-Recommendations-*.html' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '\.source\.html$' } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($dnsRecoHtmlPath) {
+        Add-FindingOnce 'Information' 'DNS recommendations report available' 'Supplementary DNS recommendations HTML report generated.' $dnsRecoHtmlPath.FullName $SeverityScore.Information
+    }
+
+    # ---------------------------
+    # Prepare report download artifacts and in-report result previews
+    # ---------------------------
+    $htmlReportsDirLocal = Get-HtmlReportsDir -BaseRoot $InputRoot
+    $downloadsDirLocal = Get-HtmlDownloadsDir -BaseRoot $InputRoot
+    Publish-CommonDownloadArtifacts -Root $InputRoot -DownloadRoot $downloadsDirLocal
+
+    foreach ($finding in $Findings) {
+        $presentation = New-FindingResultPresentation -Finding $finding -AuditReportPath $AuditHtml -DownloadRoot $downloadsDirLocal
+        $finding | Add-Member -NotePropertyName DownloadHref -NotePropertyValue $presentation.DownloadHref -Force
+        $finding | Add-Member -NotePropertyName DownloadLabel -NotePropertyValue $presentation.DownloadLabel -Force
+        $finding | Add-Member -NotePropertyName DownloadText -NotePropertyValue $presentation.DownloadText -Force
+        $finding | Add-Member -NotePropertyName ResultsHtml -NotePropertyValue $presentation.ResultsHtml -Force
+        $finding | Add-Member -NotePropertyName OpenInNewTab -NotePropertyValue $presentation.OpenInNewTab -Force
+        if ($presentation.ResolvedSourcePath) {
+            $finding.Link = $presentation.ResolvedSourcePath
+        }
+    }
+
     # ---------------------------
     # Totals
     # ---------------------------
     $sevCounts = @{
-        Critical = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Critical' }).Count
-        High     = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'High'     }).Count
-        Medium   = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Medium'   }).Count
-        Low      = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Low'      }).Count
+        Critical    = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Critical'    }).Count
+        High        = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'High'        }).Count
+        Medium      = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Medium'      }).Count
+        Low         = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Low'         }).Count
+        Information = ($Findings | Where-Object { (($_.Severity -as [string]).Trim()) -ieq 'Information' }).Count
     }
 
     $TotalScore = 0
@@ -6083,7 +7987,7 @@ function Invoke-ManagementReport {
     # ---------------------------
     # HTML output
     # ---------------------------
-    $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss "UTC"'
+    $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
     $computerName = Split-Path -Path $InputRoot -Leaf
 
     $domainInfoBlock = ''
@@ -6093,18 +7997,25 @@ function Invoke-ManagementReport {
         }
     } catch { }
 
-    $sortedFindings = $Findings | Sort-Object -Property @{Expression='Score';Descending=$true}, @{Expression='Severity';Descending=$false}
+    $sortedFindings = $Findings | Sort-Object -Property @{Expression={ Get-SeverityRank $_.Severity };Descending=$true}, @{Expression='Score';Descending=$true}, @{Expression='Title';Descending=$false}
+
+    $companionReports = Get-CompanionHtmlReports -Root $InputRoot -Exclude @($AuditHtml, $OutputHtml)
+    Write-AuditHtmlReport -Path $AuditHtml -Items $sortedFindings -Counts $sevCounts -ComputerName $computerName -GeneratedOn $now -ManagementReportPath $OutputHtml -CompanionReports $companionReports
+
+    $auditRel = [System.IO.Path]::GetFileName($AuditHtml)
     $tableRows = foreach ($f in $sortedFindings) {
-        $link  = if ($f.Link) { $f.Link } else { '' }
-        $sev   = ($f.Severity -as [string]).Trim()
-        $score = [int]$f.Score
+        $sev      = Normalize-Severity $f.Severity
+        $score    = [int]$f.Score
+        $anchorId = New-FindingAnchor $f
+        $auditRef = '{0}#{1}' -f $auditRel, $anchorId
+        $sourceLabel = Get-FindingSourceLabel $f.Link
 @"
 <tr data-sev="$sev" data-score="$score">
   <td><span class="pill sev-$sev">$sev</span></td>
   <td class="title">$(HtmlEncode $f.Title)</td>
   <td class="evidence">$(HtmlEncode $f.Evidence)</td>
   <td class="score">$score</td>
-  <td class="source"><a href="$(HtmlAttrEncode $link)"><span class="mono">$(HtmlEncode $link)</span></a></td>
+  <td class="source"><a href="$(HtmlAttrEncode $auditRef)" title="$(HtmlAttrEncode $sourceLabel)"><span class="mono">Audit details</span></a></td>
 </tr>
 "@
     }
@@ -6152,6 +8063,7 @@ function Invoke-ManagementReport {
   --shadow:0 10px 30px rgba(0,0,0,.35); --radius:14px;
   --critical-bg:rgba(255,77,79,.18); --high-bg:rgba(255,169,64,.18);
   --medium-bg:rgba(105,177,255,.18); --low-bg:rgba(149,222,100,.18);
+  --info-bg:rgba(160,160,160,.18);
 }
 *{box-sizing:border-box}
 body{
@@ -6180,7 +8092,7 @@ h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
 .badge .grade{font-size:13px;color:var(--muted);font-weight:600}
 .badge .value{font-size:15px}
 .badge.Critical{background:var(--critical-bg)} .badge.High{background:var(--high-bg)}
-.badge.Medium{background:var(--medium-bg)} .badge.Low{background:var(--low-bg)}
+.badge.Medium{background:var(--medium-bg)} .badge.Low{background:var(--low-bg)} .badge.Information{background:var(--info-bg)}
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;margin-top:14px}
 .card{
   background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
@@ -6198,7 +8110,7 @@ h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
   min-width:86px;
 }
 .sev-Critical{background:var(--critical-bg)} .sev-High{background:var(--high-bg)}
-.sev-Medium{background:var(--medium-bg)} .sev-Low{background:var(--low-bg)}
+.sev-Medium{background:var(--medium-bg)} .sev-Low{background:var(--low-bg)} .sev-Information{background:var(--info-bg)}
 .section{margin-top:18px} .section h2{margin:0 0 10px;font-size:16px}
 .callout{border:1px solid var(--line);border-radius: var(--radius);padding:14px;background: rgba(255,255,255,.05)}
 .callout p{margin:0;line-height:1.4} .callout ul{margin:10px 0 0 18px} .callout li{margin:6px 0}
@@ -6261,7 +8173,7 @@ table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-l
 
   var sortCol = null;
   var sortAsc = false;
-  var order = ['Critical','High','Medium','Low'];
+  var order = ['Critical','High','Medium','Low','Information'];
 
   function sortBy(col){
     sortAsc = (sortCol === col) ? !sortAsc : true;
@@ -6318,7 +8230,7 @@ $css
     <div class="h-title">
       <div>
         <h1>Active Directory Audit - Management Summary</h1>
-        <div class="meta">Target: <span class="mono">$(HtmlEncode $computerName)</span> | Generated: $(HtmlEncode $now)</div>
+        <div class="meta">Target: <span class="mono">$(HtmlEncode $computerName)</span> | Generated: $(HtmlEncode $now) | <a href="$(HtmlAttrEncode ([System.IO.Path]::GetFileName($AuditHtml)))">Detailed audit report</a></div>
       </div>
       <div class="badge $OverallLevel">
         <div>
@@ -6371,7 +8283,7 @@ $css
         $nextStepsHtml
       </ul>
 
-      <div class="footer">Note: This score is an index based on the findings included in this report and the evidence files available under the input folder. Validate scope and collection completeness.</div>
+      <div class="footer">Note: This score is an index based on the findings included in this report and the collected audit data embedded into the generated HTML reports. Validate scope and collection completeness.</div>
     </div>
   </div>
 
@@ -6387,6 +8299,7 @@ $css
             <option>High</option>
             <option>Medium</option>
             <option>Low</option>
+            <option>Information</option>
           </select>
         </label>
         <label>
@@ -6406,7 +8319,7 @@ $css
           <th data-sort="title">Finding</th>
           <th>Evidence</th>
           <th data-sort="score">Score</th>
-          <th>Source</th>
+          <th>Details</th>
         </tr>
       </thead>
       <tbody id="findings-body">
@@ -6421,7 +8334,7 @@ $css
   </div>
 
   <div class="footer">
-    Generated by the Management Report script. Review detailed findings and evidence files for remediation actions.<br>
+    Generated by the Management Report script. Review the linked ADAudit-Results.html findings for remediation actions.<br>
     This report summarizes configuration and baseline observations. It should be reviewed alongside operational context and existing compensating controls.
   </div>
 </div>
@@ -6433,34 +8346,415 @@ $js
 
     Set-Content -LiteralPath $OutputHtml -Value $html -Encoding UTF8
 
-    # ---------------------------
-    # TXT output
-    # ---------------------------
-    $top = ($Findings | Sort-Object -Property @{Expression='Score';Descending=$true}) | Select-Object -First $TopFindings
+    if ($OutputTxt) {
+        # ---------------------------
+        # Optional TXT output
+        # ---------------------------
+        $top = ($Findings | Sort-Object -Property @{Expression='Score';Descending=$true}) | Select-Object -First $TopFindings
 
-    $txt = @()
-    $txt += "Active Directory Audit - Management Summary"
-    $txt += "Target: $computerName"
-    $txt += "Generated: $now"
-    $txt += "Overall risk level: $OverallLevel (Score=$TotalScore)"
-    $txt += "Score matrix: Low=0-49; Medium=50-99; High=100-149; Critical=150+"
-    if ($UsersCount)  { $txt += "Users: $UsersCount" }
-    if ($GroupsCount) { $txt += "Groups: $GroupsCount" }
-    if ($OUsCount)    { $txt += "OUs: $OUsCount" }
-    $txt += ""
-    $txt += "Top findings:"
-    foreach ($f in $top) { $txt += "- [$($f.Severity)] $($f.Title) - $($f.Evidence) (source: $($f.Link))" }
-    $txt += ""
-    $txt += "See HTML report for links to detailed evidence."
+        $txt = @()
+        $txt += "Active Directory Audit - Management Summary"
+        $txt += "Target: $computerName"
+        $txt += "Generated: $now"
+        $txt += "Overall risk level: $OverallLevel (Score=$TotalScore)"
+        $txt += "Score matrix: Low=0-49; Medium=50-99; High=100-149; Critical=150+"
+        if ($UsersCount)  { $txt += "Users: $UsersCount" }
+        if ($GroupsCount) { $txt += "Groups: $GroupsCount" }
+        if ($OUsCount)    { $txt += "OUs: $OUsCount" }
+        $txt += ""
+        $txt += "Top findings:"
+        foreach ($f in $top) { $txt += "- [$($f.Severity)] $($f.Title) - $($f.Evidence) (source: $($f.Link))" }
+        $txt += ""
+        $txt += "See HTML report for linked detailed findings."
 
-    Set-Content -LiteralPath $OutputTxt -Value ($txt -join "`r`n") -Encoding UTF8
+        Set-Content -LiteralPath $OutputTxt -Value ($txt -join "`r`n") -Encoding UTF8
+        Write-Host "[+] Executive TXT summary written:" (Get-RelPath $OutputTxt)
+    }
 
+    Write-Host "[+] Audit results written:" (Get-RelPath $AuditHtml)
     Write-Host "[+] Management report written:" (Get-RelPath $OutputHtml)
-    Write-Host "[+] Executive TXT summary written:" (Get-RelPath $OutputTxt)
 }
 
-Invoke-ManagementReport
+function Get-RelativeReportHref {
+    [CmdletBinding()]
+    param(
+        [string]$FromFile,
+        [string]$ToPath
+    )
 
+    if ([string]::IsNullOrWhiteSpace($FromFile) -or [string]::IsNullOrWhiteSpace($ToPath)) { return '' }
+
+    try {
+        $fromDir = Split-Path -Path $FromFile -Parent
+        $fromAbs = [System.IO.Path]::GetFullPath($fromDir)
+        $targetAbs = [System.IO.Path]::GetFullPath($ToPath)
+
+        $baseUri = New-Object System.Uri(($fromAbs.TrimEnd('\') + '\'))
+        $targetUri = New-Object System.Uri($targetAbs)
+        return ([System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()) -replace '\\','/')
+    } catch {
+        return [System.IO.Path]::GetFileName($ToPath)
+    }
+}
+
+function Get-CompanionHtmlReportTitle {
+    [CmdletBinding()]
+    param([string]$FileName)
+
+    switch -Regex ($FileName) {
+        '^GPOReport\.html$'                     { return 'Group Policy report' }
+        '^overlapping_group_memberships\.html$' { return 'Overlapping group membership report' }
+        '^dangerousACLs\.html$'                { return 'Dangerous ACL report' }
+        '^ad_high_risk_baseline_index\.html$'  { return 'High-risk baseline report' }
+        '^index\.html$'                        { return 'Delegated permissions report' }
+        '^DNSAudit-.*\.html$'                  { return 'DNS audit report' }
+        '^DNS-Recommendations-.*\.html$'       { return 'DNS recommendations report' }
+        default                                { return ($FileName -replace '\.html$','' -replace '[-_]+',' ') }
+    }
+}
+
+function Get-CompanionHtmlShellCandidates {
+    [CmdletBinding()]
+    param([string]$Root)
+
+    $items = New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'
+    $seen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    function Add-File([System.IO.FileInfo]$File) {
+        if (-not $File) { return }
+        $full = $null
+        try { $full = [System.IO.Path]::GetFullPath($File.FullName) } catch { $full = $File.FullName }
+        if ($seen.Add($full)) { $items.Add($File) | Out-Null }
+    }
+
+    $htmlRoot = Get-HtmlReportsDir -BaseRoot $Root
+    if (Test-Path -LiteralPath $htmlRoot) {
+        foreach ($file in (Get-ChildItem -LiteralPath $htmlRoot -File -Filter '*.html' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notin @('Management-Report.html','ADAudit-Results.html') -and $_.Name -notmatch '\.source\.html$' })) {
+            Add-File $file
+        }
+    }
+
+    foreach ($file in (Get-ChildItem -Path (Join-Path $Root 'DelegatedPermissions') -Recurse -File -Filter 'index.html' -ErrorAction SilentlyContinue)) {
+        Add-File $file
+    }
+
+    foreach ($file in (Get-ChildItem -Path $Root -Recurse -File -Include 'DNSAudit-*.html','DNS-Recommendations-*.html' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.source\.html$' })) {
+        Add-File $file
+    }
+
+    return $items.ToArray()
+}
+
+function Update-CompanionHtmlReports {
+    [CmdletBinding()]
+    param([string]$Root)
+
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return }
+
+    $auditPath = Join-Path (Get-HtmlReportsDir -BaseRoot $Root) 'ADAudit-Results.html'
+
+    foreach ($file in (Get-CompanionHtmlShellCandidates -Root $Root)) {
+        $targetPath = $file.FullName
+        $rawHtml = ''
+        try { $rawHtml = Get-Content -LiteralPath $targetPath -Raw -ErrorAction Stop } catch { continue }
+        if ([string]::IsNullOrWhiteSpace($rawHtml)) { continue }
+        if ($rawHtml -match 'adaudit-companion-wrapper') { continue }
+
+        $bodyHtml = $rawHtml
+        if ($rawHtml -match '(?is)<body[^>]*>(?<body>.*)</body>') {
+            $bodyHtml = $matches['body']
+        }
+
+        $styleBlocks = @(
+            [regex]::Matches($rawHtml, '(?is)<style[^>]*>.*?</style>') |
+            ForEach-Object { $_.Value }
+        )
+
+        $sourcePath = Join-Path $file.DirectoryName (([System.IO.Path]::GetFileNameWithoutExtension($file.Name)) + '.source.html')
+        if (Test-Path -LiteralPath $sourcePath) {
+            Remove-Item -LiteralPath $sourcePath -Force -ErrorAction SilentlyContinue
+        }
+
+        Move-Item -LiteralPath $targetPath -Destination $sourcePath -Force -ErrorAction SilentlyContinue
+
+        $title = Get-CompanionHtmlReportTitle -FileName $file.Name
+        $generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
+        $auditHref = if (Test-Path -LiteralPath $auditPath) { Get-RelativeReportHref -FromFile $targetPath -ToPath $auditPath } else { '' }
+        $sourceHref = Get-RelativeReportHref -FromFile $targetPath -ToPath $sourcePath
+
+        $wrapper = @"
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="adaudit-companion-wrapper" content="1">
+<title>ADAudit - $title</title>
+$($styleBlocks -join "`n")
+<style>
+:root{
+  --bg:#f5f7fb;
+  --panel:#ffffff;
+  --text:#1b2430;
+  --muted:#5f6b7a;
+  --line:#d9e0ea;
+  --shadow:0 10px 24px rgba(15,23,42,.08);
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  font-family:Segoe UI,Arial,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+}
+a{color:#0f5cb8;text-decoration:none}
+a:hover{text-decoration:underline}
+.container{max-width:1280px;margin:0 auto;padding:28px 22px 48px}
+.hero,.panel{
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:18px;
+  box-shadow:var(--shadow);
+}
+.hero{padding:24px}
+.panel{padding:22px;margin-top:20px}
+.hero-top{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;align-items:flex-start}
+.meta{color:var(--muted);font-size:14px;line-height:1.6}
+.actions{display:flex;gap:10px;flex-wrap:wrap}
+.btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:40px;
+  padding:10px 14px;
+  border-radius:10px;
+  border:1px solid var(--line);
+  background:var(--panel);
+  color:var(--text);
+  font-weight:700;
+}
+.embedded-report{margin-top:8px}
+.embedded-report table{border-collapse:collapse;width:100%}
+.embedded-report th,.embedded-report td{border:1px solid var(--line);padding:8px 10px;vertical-align:top;text-align:left}
+.embedded-report th{background:#eef2f7}
+.embedded-report pre{
+  white-space:pre-wrap;
+  word-break:break-word;
+  background:#f8fafc;
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:14px;
+}
+.embedded-report code{
+  font-family:Consolas,Menlo,Monaco,monospace;
+  background:#f3f4f6;
+  padding:2px 4px;
+  border-radius:4px;
+}
+.embedded-report details{
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:12px;
+  margin:12px 0;
+  background:#fafcff;
+}
+.embedded-report summary{cursor:pointer;font-weight:700}
+.embedded-report h1,.embedded-report h2,.embedded-report h3,.embedded-report h4{margin-top:0}
+</style>
+</head>
+<body>
+<div class="container">
+  <section class="hero">
+    <div class="hero-top">
+      <div>
+        <h1>$title</h1>
+        <div class="meta">
+          Companion HTML report generated by ADAudit.<br>
+          Generated wrapper: $generated
+        </div>
+      </div>
+      <div class="actions">
+        $(if ($auditHref) { "<a class='btn' href='$auditHref'>Back to ADAudit-Results</a>" } else { '' })
+        <a class="btn" href="$sourceHref" target="_blank" rel="noopener">Open original HTML</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="embedded-report">
+      $bodyHtml
+    </div>
+  </section>
+</div>
+</body>
+</html>
+"@
+
+        Set-Content -LiteralPath $targetPath -Value $wrapper -Encoding UTF8
+    }
+}
+
+function Get-LegacyArtifactCandidates {
+    [CmdletBinding()]
+    param(
+        [string]$Root
+    )
+
+    $items = New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return @() }
+
+    $rootExts = @('.txt','.csv','.xml','.json','.nessus')
+    $highRiskExts = @('.txt','.csv','.json')
+
+    foreach ($file in (Get-ChildItem -LiteralPath $Root -File -ErrorAction SilentlyContinue | Where-Object { $rootExts -contains $_.Extension.ToLowerInvariant() })) {
+        $items.Add($file) | Out-Null
+    }
+
+    $highRiskDir = Join-Path $Root 'HighRisk'
+    if (Test-Path -LiteralPath $highRiskDir) {
+        foreach ($file in (Get-ChildItem -LiteralPath $highRiskDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $highRiskExts -contains $_.Extension.ToLowerInvariant() })) {
+            $items.Add($file) | Out-Null
+        }
+    }
+
+    return @($items | Sort-Object FullName -Unique)
+}
+
+function Remove-EmptyAuditDirectories {
+    [CmdletBinding()]
+    param(
+        [string]$Root,
+        [string[]]$Exclude = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return }
+
+    $excludeMap = @{}
+    foreach ($path in $Exclude) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+            try { $excludeMap[[System.IO.Path]::GetFullPath($path)] = $true } catch { }
+        }
+    }
+
+    foreach ($dir in (Get-ChildItem -Path $Root -Recurse -Directory -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)) {
+        $full = $null
+        try { $full = [System.IO.Path]::GetFullPath($dir.FullName) } catch { $full = $dir.FullName }
+        if ($excludeMap.ContainsKey($full)) { continue }
+
+        try {
+            if (-not (Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
+    }
+}
+
+function Remove-LegacyAuditArtifacts {
+    [CmdletBinding()]
+    param(
+        [string]$Root
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return }
+
+    $removed = 0
+    foreach ($file in (Get-LegacyArtifactCandidates -Root $Root)) {
+        try {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            $removed++
+        } catch { }
+    }
+
+    Remove-EmptyAuditDirectories -Root $Root -Exclude @((Get-HtmlReportsDir -BaseRoot $Root), (Get-RawDataDir -BaseRoot $Root))
+
+    if ($removed -gt 0) {
+        Write-Host "[+] Removed raw TXT/CSV/XML/JSON/NESSUS audit artifacts from the output tree."
+    }
+}
+
+function Move-LegacyAuditArtifacts {
+    [CmdletBinding()]
+    param(
+        [string]$Root,
+        [string]$ArchiveRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return }
+    if ([string]::IsNullOrWhiteSpace($ArchiveRoot)) { $ArchiveRoot = Get-RawSourceDataDir -BaseRoot $Root }
+
+    if (-not (Test-Path -LiteralPath $ArchiveRoot)) {
+        New-Item -ItemType Directory -Path $ArchiveRoot -Force | Out-Null
+    }
+
+    $rootAbs = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $moved = 0
+
+    foreach ($file in (Get-LegacyArtifactCandidates -Root $Root)) {
+        try {
+            $full = [System.IO.Path]::GetFullPath($file.FullName)
+            $relative = $full.Substring($rootAbs.Length).TrimStart('\','/')
+            $destination = Join-Path $ArchiveRoot $relative
+            $destinationDir = Split-Path -Path $destination -Parent
+            if ($destinationDir -and -not (Test-Path -LiteralPath $destinationDir)) {
+                New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+            }
+
+            Move-Item -LiteralPath $file.FullName -Destination $destination -Force -ErrorAction Stop
+            $moved++
+        } catch { }
+    }
+
+    Remove-EmptyAuditDirectories -Root $Root -Exclude @((Get-HtmlReportsDir -BaseRoot $Root), $ArchiveRoot)
+
+    if ($moved -gt 0) {
+        Write-Host "[+] Moved raw TXT/CSV/XML/JSON/NESSUS audit artifacts to:" $ArchiveRoot
+    }
+}
+
+function Move-RootHtmlReports {
+    [CmdletBinding()]
+    param(
+        [string]$Root,
+        [string]$Destination
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return }
+    if ([string]::IsNullOrWhiteSpace($Destination)) { $Destination = Get-HtmlReportsDir -BaseRoot $Root }
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    }
+
+    foreach ($file in (Get-ChildItem -LiteralPath $Root -File -Filter '*.html' -ErrorAction SilentlyContinue)) {
+        $destFile = Join-Path $Destination $file.Name
+        try {
+            $srcFull = [System.IO.Path]::GetFullPath($file.FullName)
+            $destFull = [System.IO.Path]::GetFullPath($destFile)
+            if ($srcFull -ieq $destFull) { continue }
+            Move-Item -LiteralPath $file.FullName -Destination $destFile -Force -ErrorAction Stop
+        } catch { }
+    }
+}
+
+Move-RootHtmlReports -Root $outputdir -Destination (Get-HtmlReportsDir -BaseRoot $outputdir)
+Move-LegacyAuditArtifacts -Root $outputdir -ArchiveRoot (Get-RawSourceDataDir -BaseRoot $outputdir)
+Invoke-ManagementReport -InputRoot $outputdir -OutputHtml (Join-Path (Get-HtmlReportsDir -BaseRoot $outputdir) 'Management-Report.html') -AuditHtml (Join-Path (Get-HtmlReportsDir -BaseRoot $outputdir) 'ADAudit-Results.html')
+Update-CompanionHtmlReports -Root $outputdir
+
+# <<< add cleanup here (absolute last action) >>>
+$__htmlReportsDir = Get-HtmlReportsDir -BaseRoot $outputdir
+$__remove = @(
+    'ad_high_risk_baseline_index.source.html'
+    'GPOReport.html'
+    'overlapping_group_memberships.source.html'
+)
+foreach ($name in $__remove) {
+    $p = Join-Path $__htmlReportsDir $name
+    if (Test-Path -LiteralPath $p) {
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    }
+}
 }
 finally {
     $ErrorActionPreference = $oldEap
