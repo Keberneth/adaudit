@@ -1,4 +1,5 @@
-while ($true) {
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+ while ($true) {
     Write-Host "1: Install Dependencies"
     Write-Host "2: Install Dependencies Offline"
     Write-Host "3: Host Details"
@@ -64,3 +65,7 @@ while ($true) {
         default { Write-Host "Invalid choice, please try again." }
     }
 }   
+}
+else{
+  Write-Host "Script should run in PowerShell 5"
+}
