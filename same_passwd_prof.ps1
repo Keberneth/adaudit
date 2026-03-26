@@ -6,8 +6,6 @@ Runs only the duplicate-password check and exports DUPLICATE_PASSWORDS.csv.
 Standalone script that reads replicated AD account data directly with DSInternals,
 groups accounts by NTLM hash, and exports only accounts that share the same password.
 
-It does not create password_quality.txt and does not depend on parsing any text report.
-
 Requirements:
 - ActiveDirectory PowerShell module
 - DSInternals PowerShell module
