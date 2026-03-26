@@ -45,7 +45,7 @@ The API returns **many suffixes** that share the same prefix, along with how man
 <br>
 A1B2C3D4E5F60718293A4B5C6D7:2
 
-Each line consists of:
+Each line consists of:<br>
 `<SUFFIX>:<COUNT>`
 
 - `SUFFIX` = remaining 27 characters of the NTLM hash  
