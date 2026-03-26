@@ -1,5 +1,7 @@
 # Script description
-
+Run scripts:
+**Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "FULL PATH TO SCRIPT"**
+<br>
 `pwned_passwd_prof.ps1` checks Active Directory account NTLM hashes against the  
 https://api.pwnedpasswords.com service using a **k-anonymity range query**.
 
