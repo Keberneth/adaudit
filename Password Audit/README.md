@@ -42,11 +42,12 @@ This is not enough to reconstruct the original hash or password.
 The API returns **many suffixes** that share the same prefix, along with how many times they appear in breach data:
 
 7EAEE8FB117AD06BDD830B7586C:12345
+<br>
 A1B2C3D4E5F60718293A4B5C6D7:2
 
 Each line consists of:
 
-<SUFFIX>:<COUNT>
+**<SUFFIX>:<COUNT>**
 
 - `SUFFIX` = remaining 27 characters of the NTLM hash  
 - `COUNT` = number of times this password appears in breach datasets  
