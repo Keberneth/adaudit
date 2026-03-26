@@ -1,26 +1,29 @@
 <#
 .SYNOPSIS
-Exports accounts that share duplicate NTLM passwords from AD replication data.
+Checks AD account NTLM hashes against Have I Been Pwned and exports pwned accounts.
 
 .DESCRIPTION
-Reads replicated AD account data with DSInternals, groups accounts by NTLM hash,
-and exports only accounts that share the same password.
+Reads replicated AD account data with DSInternals, extracts NTLM hashes, checks each
+unique hash against the Have I Been Pwned Pwned Passwords range API in NTLM mode,
+and exports only accounts whose NTLM hash is found in the breach corpus.
 
-Optionally checks each unique duplicate NTLM hash against the Have I Been Pwned
-Pwned Passwords range API when -Pwned is used.
+By default, only user accounts are checked.
+Use -IncludeComputers to include computer accounts as well.
 
-.NOTES
-Requirements:
+If no matching accounts are found, the script still creates the CSV and writes
+a single informational row.
+
+.REQUIREMENTS
 - ActiveDirectory PowerShell module
 - DSInternals PowerShell module
 - Account with rights required for Get-ADReplAccount
 - Internet access to api.pwnedpasswords.com
 
-Examples:
-.\same_passwd_prof.ps1
-.\same_passwd_prof.ps1 -UsersOnly
-.\same_passwd_prof.ps1 -Pwned
-.\same_passwd_prof.ps1 -Server dc01.contoso.local -OutCsv C:\Temp\DUPLICATE_PASSWORDS.csv -Pwned
+.EXAMPLES
+.\pwned_users_prof.ps1
+.\pwned_users_prof.ps1 -Server dc01.contoso.local
+.\pwned_users_prof.ps1 -OutCsv C:\Temp\PWNED_USERS.csv
+.\pwned_users_prof.ps1 -IncludeComputers
 #>
 
 [CmdletBinding()]
@@ -32,10 +35,7 @@ param(
     [string]$OutCsv,
 
     [Parameter(Mandatory = $false)]
-    [switch]$UsersOnly,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$Pwned
+    [switch]$IncludeComputers
 )
 
 Set-StrictMode -Version Latest
@@ -130,17 +130,23 @@ function Test-NtlmHashPwned {
 
     try {
         $response = Invoke-WebRequest -Uri $uri -Method Get -Headers @{
-            'User-Agent'  = 'same_passwd_prof.ps1'
+            'User-Agent'  = 'pwned_users_prof.ps1'
             'Add-Padding' = 'true'
         } -TimeoutSec 30 -ErrorAction Stop
     }
     catch {
         Write-Warning ("Failed pwned lookup for hash prefix {0}: {1}" -f $prefix, $_.Exception.Message)
-        return 'LookupFailed'
+        return [pscustomobject]@{
+            Pwned      = 'LookupFailed'
+            PwnedCount = $null
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($response.Content)) {
-        return 'No'
+        return [pscustomobject]@{
+            Pwned      = 'No'
+            PwnedCount = 0
+        }
     }
 
     foreach ($line in ($response.Content -split "(`r`n|`n|`r)")) {
@@ -154,19 +160,28 @@ function Test-NtlmHashPwned {
         }
 
         $returnedSuffix = $parts[0].Trim().ToUpperInvariant()
-        $count = $parts[1].Trim()
+        $countText = $parts[1].Trim()
 
         # Ignore padded fake rows when Add-Padding=true
-        if ($count -eq '0') {
+        if ($countText -eq '0') {
             continue
         }
 
         if ($returnedSuffix -eq $suffix) {
-            return 'Yes'
+            $countValue = 0
+            [void][int64]::TryParse($countText, [ref]$countValue)
+
+            return [pscustomobject]@{
+                Pwned      = 'Yes'
+                PwnedCount = $countValue
+            }
         }
     }
 
-    return 'No'
+    return [pscustomobject]@{
+        Pwned      = 'No'
+        PwnedCount = 0
+    }
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -175,7 +190,7 @@ if ([string]::IsNullOrWhiteSpace($scriptDir)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutCsv)) {
-    $OutCsv = Join-Path $scriptDir 'DUPLICATE_PASSWORDS.csv'
+    $OutCsv = Join-Path $scriptDir 'PWNED_USERS.csv'
 }
 
 Ensure-DirectoryPath -Path (Resolve-ParentDirectory -Path $OutCsv)
@@ -190,8 +205,8 @@ if ([string]::IsNullOrWhiteSpace($Server)) {
 $domain = Get-ADDomain -Server $Server -ErrorAction Stop
 $domainDN = $domain.DistinguishedName
 
-Write-Host ("Running duplicate password check against: {0}" -f $Server)
-Write-Host ("Pwned password lookup: {0}" -f $(if ($Pwned) { 'ENABLED' } else { 'DISABLED' }))
+Write-Host ("Running pwned password check against: {0}" -f $Server)
+Write-Host ("Include computer accounts: {0}" -f $(if ($IncludeComputers) { 'YES' } else { 'NO' }))
 
 $replAccounts = @(Get-ADReplAccount -All -Server $Server -NamingContext $domainDN -ErrorAction Stop)
 
@@ -199,16 +214,16 @@ if ($replAccounts.Count -eq 0) {
     throw "No replication accounts were returned from $Server."
 }
 
-$hashRows = New-Object System.Collections.Generic.List[object]
+$accountRows = New-Object System.Collections.Generic.List[object]
 
 foreach ($ra in $replAccounts) {
-    $sam = $ra.SamAccountName
+    $sam = [string]$ra.SamAccountName
 
     if ([string]::IsNullOrWhiteSpace($sam)) {
         continue
     }
 
-    if ($UsersOnly -and $sam -match '\$$') {
+    if (-not $IncludeComputers -and $sam -match '\$$') {
         continue
     }
 
@@ -217,75 +232,90 @@ foreach ($ra in $replAccounts) {
         continue
     }
 
-    $hashRows.Add([pscustomobject]@{
-        SamAccountName = [string]$sam
-        NTHash         = [string]$ntlmHash
+    $accountRows.Add([pscustomobject]@{
+        SamAccountName = $sam
+        NTHash         = $ntlmHash
         AccountType    = Get-AccountTypeLabel -AccountName $sam
         SourceServer   = [string]$Server
     })
 }
 
-$duplicateGroups = @(
-    $hashRows |
-        Group-Object -Property NTHash |
-        Where-Object { $_.Count -gt 1 } |
-        Sort-Object -Property Count, Name -Descending
+if ($accountRows.Count -eq 0) {
+    $emptyResult = @(
+        [pscustomobject]([ordered]@{
+            SamAccountName = ''
+            NTHash         = ''
+            AccountType    = ''
+            SourceServer   = [string]$Server
+            Pwned          = 'NoAccountsProcessed'
+            PwnedCount     = ''
+            Comment        = 'No matching accounts were available for processing.'
+        })
+    )
+
+    $emptyResult | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+    Write-Host ("CSV written to: {0}" -f $OutCsv)
+    return
+}
+
+$uniqueHashes = @(
+    $accountRows |
+        Select-Object -ExpandProperty NTHash -Unique |
+        Sort-Object
 )
+
+Write-Host ("Checking {0} unique NTLM hash(es) against HIBP..." -f $uniqueHashes.Count)
 
 $pwnedCache = @{}
 
-if ($Pwned -and $duplicateGroups.Count -gt 0) {
-    Write-Host ("Checking {0} unique duplicate NTLM hash(es) against HIBP..." -f $duplicateGroups.Count)
-
-    foreach ($group in $duplicateGroups) {
-        $hash = [string]$group.Name
-
-        if (-not $pwnedCache.ContainsKey($hash)) {
-            $pwnedCache[$hash] = Test-NtlmHashPwned -NtlmHash $hash
-        }
+foreach ($hash in $uniqueHashes) {
+    if (-not $pwnedCache.ContainsKey($hash)) {
+        $pwnedCache[$hash] = Test-NtlmHashPwned -NtlmHash $hash
     }
 }
 
 $results = New-Object System.Collections.Generic.List[object]
-$groupNumber = 0
 
-foreach ($group in $duplicateGroups) {
-    $members = @(
-        $group.Group |
-            Sort-Object -Property SamAccountName -Unique
-    )
+foreach ($row in $accountRows) {
+    $lookup = $pwnedCache[$row.NTHash]
 
-    if ($members.Count -lt 2) {
-        continue
-    }
-
-    $groupNumber++
-
-    $pwnedValue = 'NotChecked'
-    if ($Pwned) {
-        $pwnedValue = [string]$pwnedCache[[string]$group.Name]
-    }
-
-    foreach ($member in $members) {
+    if ($lookup.Pwned -eq 'Yes') {
         $results.Add([pscustomobject]([ordered]@{
-            DuplicatePasswordGroup     = $groupNumber
-            DuplicatePasswordGroupSize = $members.Count
-            SamAccountName             = $member.SamAccountName
-            NTHash                     = $member.NTHash
-            AccountType                = $member.AccountType
-            SourceServer               = $member.SourceServer
-            Pwned                      = $pwnedValue
+            SamAccountName = $row.SamAccountName
+            NTHash         = $row.NTHash
+            AccountType    = $row.AccountType
+            SourceServer   = $row.SourceServer
+            Pwned          = $lookup.Pwned
+            PwnedCount     = $lookup.PwnedCount
+            Comment        = 'NTLM hash found in Have I Been Pwned Pwned Passwords corpus.'
         }))
     }
 }
 
-$sortedResults = @(
-    $results |
-        Sort-Object -Property DuplicatePasswordGroup, SamAccountName
-)
+if ($results.Count -eq 0) {
+    $noPwnedResult = @(
+        [pscustomobject]([ordered]@{
+            SamAccountName = ''
+            NTHash         = ''
+            AccountType    = if ($IncludeComputers) { 'UserAndComputerScope' } else { 'UserScope' }
+            SourceServer   = [string]$Server
+            Pwned          = 'No'
+            PwnedCount     = 0
+            Comment        = 'No processed accounts were found in the Have I Been Pwned password corpus.'
+        })
+    )
 
-$sortedResults | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+    $noPwnedResult | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+}
+else {
+    $sortedResults = @(
+        $results |
+            Sort-Object -Property AccountType, SamAccountName
+    )
 
-Write-Host ("Duplicate password groups found: {0}" -f $groupNumber)
-Write-Host ("Affected accounts exported: {0}" -f $sortedResults.Count)
+    $sortedResults | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+}
+
+Write-Host ("Processed accounts: {0}" -f $accountRows.Count)
+Write-Host ("Pwned accounts exported: {0}" -f $results.Count)
 Write-Host ("CSV written to: {0}" -f $OutCsv)
