@@ -10,6 +10,11 @@ and exports only accounts whose NTLM hash is found in the breach corpus.
 By default, only user accounts are checked.
 Use -IncludeComputers to include computer accounts as well.
 
+Adds AccountStatus to the CSV output:
+- Active
+- Disabled
+- Unknown
+
 If no matching accounts are found, the script still creates the CSV and writes
 a single informational row.
 
@@ -17,12 +22,11 @@ a single informational row.
 - ActiveDirectory PowerShell module
 - DSInternals PowerShell module
 - Account with rights required for Get-ADReplAccount
-- Internet access to api.pwnedpasswords.com
 
 .EXAMPLES
 .\pwned_users_prof.ps1
 .\pwned_users_prof.ps1 -Server dc01.contoso.local
-.\pwned_users_prof.ps1 -OutCsv C:\Temp\PWNED_USERS.csv
+.\pwned_users_prof.ps1 -OutCsv C:\Temp\PWNED_PASSWORD_HASH.csv
 .\pwned_users_prof.ps1 -IncludeComputers
 #>
 
@@ -111,6 +115,36 @@ function Get-AccountTypeLabel {
     return 'User'
 }
 
+function Get-AccountStatusLabel {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SamAccountName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Server
+    )
+
+    try {
+        if ($SamAccountName -match '\$$') {
+            $adObject = Get-ADComputer -Identity $SamAccountName -Properties Enabled -Server $Server -ErrorAction Stop
+        }
+        else {
+            $adObject = Get-ADUser -Identity $SamAccountName -Properties Enabled -Server $Server -ErrorAction Stop
+        }
+
+        switch ($adObject.Enabled) {
+            $true  { return 'Active' }
+            $false { return 'Disabled' }
+            default { return 'Unknown' }
+        }
+    }
+    catch {
+        Write-Warning ("Could not resolve account status for {0}: {1}" -f $SamAccountName, $_.Exception.Message)
+        return 'Unknown'
+    }
+}
+
 function Test-NtlmHashPwned {
     [CmdletBinding()]
     param(
@@ -190,7 +224,7 @@ if ([string]::IsNullOrWhiteSpace($scriptDir)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutCsv)) {
-    $OutCsv = Join-Path $scriptDir 'PWNED_USERS.csv'
+    $OutCsv = Join-Path $scriptDir 'PWNED_PASSWORD_HASH.csv'
 }
 
 Ensure-DirectoryPath -Path (Resolve-ParentDirectory -Path $OutCsv)
@@ -237,6 +271,7 @@ foreach ($ra in $replAccounts) {
         NTHash         = $ntlmHash
         AccountType    = Get-AccountTypeLabel -AccountName $sam
         SourceServer   = [string]$Server
+        AccountStatus  = Get-AccountStatusLabel -SamAccountName $sam -Server $Server
     })
 }
 
@@ -247,6 +282,7 @@ if ($accountRows.Count -eq 0) {
             NTHash         = ''
             AccountType    = ''
             SourceServer   = [string]$Server
+            AccountStatus  = ''
             Pwned          = 'NoAccountsProcessed'
             PwnedCount     = ''
             Comment        = 'No matching accounts were available for processing.'
@@ -285,6 +321,7 @@ foreach ($row in $accountRows) {
             NTHash         = $row.NTHash
             AccountType    = $row.AccountType
             SourceServer   = $row.SourceServer
+            AccountStatus  = $row.AccountStatus
             Pwned          = $lookup.Pwned
             PwnedCount     = $lookup.PwnedCount
             Comment        = 'NTLM hash found in Have I Been Pwned Pwned Passwords corpus.'
@@ -299,6 +336,7 @@ if ($results.Count -eq 0) {
             NTHash         = ''
             AccountType    = if ($IncludeComputers) { 'UserAndComputerScope' } else { 'UserScope' }
             SourceServer   = [string]$Server
+            AccountStatus  = ''
             Pwned          = 'No'
             PwnedCount     = 0
             Comment        = 'No processed accounts were found in the Have I Been Pwned password corpus.'

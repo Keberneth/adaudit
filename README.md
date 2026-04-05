@@ -1,3 +1,5 @@
+### The PS5 script will not be developted anymore. The PS7 is a converted version of the PS5 script and have more adudit functions and improved reports
+
 # Fork Explination
 Copy the ADAudit folder to the DC Server or a server with the RSAT tools installed and can manage active directory. The account running the script need to be Domain Admin to run the full audit. <br><br>
 

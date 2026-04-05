@@ -14,7 +14,6 @@ Requirements:
 - ActiveDirectory PowerShell module
 - DSInternals PowerShell module
 - Account with rights required for Get-ADReplAccount
-- Internet access to api.pwnedpasswords.com
 
 Examples:
 .\same_passwd_prof.ps1
