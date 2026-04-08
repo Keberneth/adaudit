@@ -18,7 +18,15 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 8.2 - 05/04/2026
+            [X] Version 8.3 - 08/04/2026
+                Added Get-RC4OnlyAccounts function (KB1205) to detect AD accounts whose
+                    msDS-SupportedEncryptionTypes lacks AES128/AES256 support and are therefore
+                    affected by Microsoft's CVE-2026-20833 Kerberos RC4 hardening update.
+                    Generates rc4_only_accounts.txt (with remediation guidance and CVE links),
+                    rc4_only_accounts.csv, and best-effort rc4_authentication_events.txt that
+                    parses DC Security log events 4768/4769 for RC4 ticket exchanges in the
+                    last 7 days. Hooked into the accounts audit and the management report.
+            [ ] Version 8.2 - 05/04/2026
                 Fixed KRBTGT password age scoring: no longer adds risk points when age is within 180-day baseline
                 Fixed password quality account counts: header/footer lines in pq_*.txt files were inflating counts
                     (added Get-PqAccountLines helper to extract only DOMAIN\account entries)
@@ -252,7 +260,7 @@ Param (
 $selectedChecks = @()
 if ($select) { $selectedChecks = $select.Split(',') }
 
-$versionnum = "v8.2"
+$versionnum = "v8.3"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 $script:ADAuditIsWindows = ($env:OS -eq 'Windows_NT')
@@ -6294,6 +6302,292 @@ Function Get-SMBSigningStatus {
     }
 }
 
+Function Get-RC4OnlyAccounts {
+    <#
+        Detects AD accounts (users, computers, gMSA, krbtgt, trust accounts) whose
+        msDS-SupportedEncryptionTypes attribute does NOT include AES128 (0x8) or
+        AES256 (0x10). Such accounts are affected by the RC4 hardening shipped with
+        Microsoft's CVE-2026-20833 update: once the KDC enforces the change, the
+        KDC will no longer issue RC4-encrypted service tickets for these accounts
+        and authentication can break unless AES support is enabled.
+
+        Bitmask reference (msDS-SupportedEncryptionTypes):
+            0x1  DES_CBC_CRC
+            0x2  DES_CBC_MD5
+            0x4  RC4_HMAC_MD5
+            0x8  AES128_CTS_HMAC_SHA1_96
+            0x10 AES256_CTS_HMAC_SHA1_96
+            0x20 AES256_CTS_HMAC_SHA1_96_SK (session key, newer)
+            0x40 FAST supported
+            0x80 Compound identity supported
+        Recommended value for AES-only: 24 (0x18 = AES128 + AES256).
+
+        References:
+        - https://www.cayosoft.com/blog/kerberos-rc4-hardening-what-microsoft-s-cve-2026-20833-update-really-means-for-active-directory-admins/
+        - https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc
+    #>
+
+    $evidencePath = Get-EvidencePath 'rc4_only_accounts.txt'
+    $csvPath      = Get-EvidencePath 'rc4_only_accounts.csv'
+    $authPath     = Get-EvidencePath 'rc4_authentication_events.txt'
+    Remove-Item -LiteralPath $evidencePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $csvPath      -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $authPath     -Force -ErrorAction SilentlyContinue
+
+    $header = @"
+# RC4-only accounts (CVE-2026-20833 / Kerberos RC4 hardening)
+#
+# These accounts have msDS-SupportedEncryptionTypes set such that no AES key
+# (AES128 0x8 / AES256 0x10) is advertised. After Microsoft's RC4 hardening
+# update (CVE-2026-20833) the KDC stops issuing RC4-encrypted service tickets
+# for affected accounts and authentication will fail unless AES is enabled.
+#
+# How to remediate (per account):
+#   1. Add AES support to the account:
+#        Set-ADUser     <account> -Replace @{'msDS-SupportedEncryptionTypes'=24}
+#        Set-ADComputer <account> -Replace @{'msDS-SupportedEncryptionTypes'=24}
+#      Value 24 = AES128 + AES256 (recommended). Use 28 if RC4 must coexist.
+#   2. Force a password change so AES keys are actually generated in the KDS:
+#        - User / service account: reset the password
+#        - Computer account:       Reset-ComputerMachinePassword (or rejoin)
+#        - Service account with SPN: rotate password or migrate to gMSA
+#   3. Validate the account no longer requests RC4 by inspecting DC event 4769
+#      (TicketEncryptionType 0x17 = RC4-HMAC, 0x12 = AES256, 0x11 = AES128).
+#   4. For the krbtgt account, perform a planned double-rotation - do NOT use
+#      this script's remediation steps directly on krbtgt.
+#
+# Domain-wide controls referenced by the CVE update:
+#   - DefaultDomainSupportedEncTypes (HKLM\SYSTEM\CCS\Services\Kdc) controls
+#     the fallback used when an account's attribute is unset (0). Set to 0x18
+#     so blank accounts negotiate AES rather than RC4.
+#   - KrbtgtFullPacSignature / Audit mode registry knobs may need to be
+#     reviewed alongside the RC4 hardening update.
+#
+# References:
+#   https://www.cayosoft.com/blog/kerberos-rc4-hardening-what-microsoft-s-cve-2026-20833-update-really-means-for-active-directory-admins/
+#   https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc
+
+"@
+    Add-Content -Path $evidencePath -Value $header
+
+    # Pull all security principals that can hold a Kerberos key
+    $props = @('SamAccountName','DistinguishedName','ObjectClass','Enabled','msDS-SupportedEncryptionTypes','PasswordLastSet','ServicePrincipalName','userAccountControl')
+
+    $allAccounts = New-Object System.Collections.Generic.List[object]
+    try { Get-ADUser     -Filter * -Properties $props -ErrorAction SilentlyContinue | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { }
+    try { Get-ADComputer -Filter * -Properties $props -ErrorAction SilentlyContinue | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { }
+
+    # Domain default fallback (when attribute is null/0). Best effort - read from PDC.
+    $domainDefault = $null
+    try {
+        $pdc = (Get-ADDomain -ErrorAction SilentlyContinue).PDCEmulator
+        if ($pdc) {
+            $reg = Invoke-CimMethod -ClassName StdRegProv -Namespace 'root/default' -MethodName GetDWORDValue -Arguments @{
+                hDefKey     = [uint32]2147483650
+                sSubKeyName = 'SYSTEM\CurrentControlSet\Services\Kdc'
+                sValueName  = 'DefaultDomainSupportedEncTypes'
+            } -CimSession (New-CimSession -ComputerName $pdc -ErrorAction Stop) -ErrorAction Stop
+            $domainDefault = $reg.uValue
+        }
+    } catch { }
+    # OS hardcoded fallback used by Windows DCs (Server 2008+) when neither the
+    # account's msDS-SupportedEncryptionTypes nor DefaultDomainSupportedEncTypes is
+    # set. Value 0x1C = AES256 (0x10) + AES128 (0x8) + RC4_HMAC (0x4). This is what
+    # the KDC actually uses at ticket-issuance time, and why most accounts with a
+    # null attribute negotiate AES in practice (verifiable via DSInternals - the
+    # KerberosNew credentials block contains AES256/AES128 keys for these accounts).
+    $osHardcodedFallback = 0x1C
+
+    if ($null -ne $domainDefault) {
+        $domainDefaultHex = '0x{0:X}' -f [int]$domainDefault
+        Add-Content -Path $evidencePath -Value "# Domain DefaultDomainSupportedEncTypes (KDC fallback) = $domainDefault ($domainDefaultHex)`n"
+    } else {
+        Add-Content -Path $evidencePath -Value "# Domain DefaultDomainSupportedEncTypes is not set on the PDC. Using Windows OS hardcoded fallback 0x1C (AES256+AES128+RC4) for accounts with a null msDS-SupportedEncryptionTypes attribute.`n"
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($acct in $allAccounts) {
+        $encType = $acct.'msDS-SupportedEncryptionTypes'
+        $effective = $encType
+        $effectiveSource = 'attribute'
+        if ($null -eq $encType -or $encType -eq 0) {
+            # Attribute is unset - the KDC falls back to DefaultDomainSupportedEncTypes
+            # if that registry value is configured on the PDC, otherwise to the Windows
+            # OS hardcoded default (0x1C = AES256+AES128+RC4). Only treat the account
+            # as at-risk when the *fallback itself* lacks AES bits - a null attribute
+            # alone is not a problem on a modern DC where the OS default already
+            # includes AES and the KDS holds AES keys for the account.
+            if ($null -ne $domainDefault) {
+                $effective = $domainDefault
+                $effectiveSource = 'DefaultDomainSupportedEncTypes'
+            } else {
+                $effective = $osHardcodedFallback
+                $effectiveSource = 'OS hardcoded default'
+            }
+        }
+
+        $hasAes128 = (($effective -band 0x8)  -ne 0)
+        $hasAes256 = (($effective -band 0x10) -ne 0)
+        $hasRc4    = (($effective -band 0x4)  -ne 0)
+        $hasDes    = (($effective -band 0x3)  -ne 0)
+
+        if (-not $hasAes128 -and -not $hasAes256) {
+            $supported = @()
+            if ($hasDes)    { $supported += 'DES' }
+            if ($hasRc4)    { $supported += 'RC4_HMAC_MD5' }
+            if (-not $supported) { $supported += '(none)' }
+
+            $rows.Add([pscustomobject]@{
+                ObjectClass     = $acct.ObjectClass
+                SamAccountName  = $acct.SamAccountName
+                Enabled         = $acct.Enabled
+                RawValue        = $encType
+                EffectiveValue  = $effective
+                EffectiveHex    = ('0x{0:X}' -f [int]$effective)
+                EffectiveSource = $effectiveSource
+                Supported       = ($supported -join ', ')
+                PasswordLastSet = $acct.PasswordLastSet
+                HasSPN          = [bool]($acct.ServicePrincipalName -and $acct.ServicePrincipalName.Count -gt 0)
+                DistinguishedName = $acct.DistinguishedName
+            }) | Out-Null
+
+            $line = "{0,-8} {1,-35} Enabled={2,-5} Raw={3,-6} Effective={4,-6} ({5}) Source={6} Supports=[{7}] PwdLastSet={8} DN={9}" -f `
+                $acct.ObjectClass, $acct.SamAccountName, $acct.Enabled, ($encType), $effective, ('0x{0:X}' -f [int]$effective), $effectiveSource, ($supported -join ','), $acct.PasswordLastSet, $acct.DistinguishedName
+            Add-Content -Path $evidencePath -Value $line
+        }
+    }
+
+    if ($rows.Count -gt 0) {
+        $rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+        Write-Both "    [!] $($rows.Count) account(s) lack AES Kerberos support and are affected by CVE-2026-20833 RC4 hardening (KB1205)"
+        Write-Both "    [!] Set msDS-SupportedEncryptionTypes to 24 (AES128+AES256) and rotate passwords - see rc4_only_accounts.txt"
+        Write-Nessus-Finding "RC4OnlyAccountsCVE202620833" "KB1205" ([System.IO.File]::ReadAllText($evidencePath))
+    } else {
+        Write-Both "    [+] No accounts found that rely solely on RC4/DES for Kerberos (CVE-2026-20833)"
+    }
+
+    # ---- Best-effort runtime check: query DC security logs for RC4 service ticket events ----
+    # Event 4769 (Kerberos service ticket request). TicketEncryptionType:
+    #   0x12 = AES256-CTS-HMAC-SHA1-96
+    #   0x11 = AES128-CTS-HMAC-SHA1-96
+    #   0x17 = RC4-HMAC
+    #   0x18 = RC4-HMAC-EXP
+    # Event 4768 (TGT request) uses the same field for TGT key.
+    $authHeader = @"
+# Accounts observed using RC4 in Kerberos exchanges (best-effort)
+#
+# Source: Security event log on each domain controller, events 4768 (TGT) and
+# 4769 (service ticket), filtered to TicketEncryptionType 0x17 (RC4-HMAC) or
+# 0x18 (RC4-HMAC-EXP). Lookback window: last 7 days, capped per DC.
+#
+# Note: this requires the DC to be auditing Kerberos Service Ticket Operations
+# (Audit Kerberos Authentication Service / Audit Kerberos Service Ticket
+# Operations - both Success). If logging is disabled the section will be empty
+# even though RC4 may still be in use.
+#
+# Use this list together with rc4_only_accounts.txt to identify which clients
+# or services are still negotiating RC4 against the KDC.
+
+"@
+    # Buffer the auth-events output instead of writing it directly. The file is only
+    # created on disk if we actually have something to report (hits or query errors),
+    # so empty checks don't leave behind a misleading "header-only" evidence file.
+    $authLines = New-Object System.Collections.Generic.List[string]
+    $authHasContent = $false
+
+    $startTime = (Get-Date).AddDays(-7)
+    $perDcCap  = 5000
+    $dcs = @()
+    try { $dcs = @(Get-ADDomainController -Filter * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty HostName) } catch { }
+
+    $rc4UserHits = @{}
+    foreach ($dc in $dcs) {
+        try {
+            $events = Get-WinEvent -ComputerName $dc -FilterHashtable @{
+                LogName   = 'Security'
+                Id        = @(4768,4769)
+                StartTime = $startTime
+            } -MaxEvents $perDcCap -ErrorAction Stop
+        } catch {
+            $authLines.Add("# Could not query Security log on ${dc}: $($_.Exception.Message)") | Out-Null
+            $authHasContent = $true
+            continue
+        }
+
+        foreach ($evt in $events) {
+            # TicketEncryptionType is exposed as an integer (UInt32) in event Properties.
+            # 0x17 (23) = RC4-HMAC, 0x18 (24) = RC4-HMAC-EXP
+            # 0x11 (17) = AES128, 0x12 (18) = AES256
+            $encVal = $null
+            try {
+                # 4769: Properties index 5 = TicketEncryptionType ; 4768: index 8 (varies by OS)
+                if ($evt.Id -eq 4769 -and $evt.Properties.Count -ge 6) {
+                    $encVal = $evt.Properties[5].Value
+                } elseif ($evt.Id -eq 4768 -and $evt.Properties.Count -ge 9) {
+                    $encVal = $evt.Properties[8].Value
+                }
+            } catch { }
+            if ($null -eq $encVal) { continue }
+
+            # Coerce to integer (Properties.Value may already be UInt32, or a hex string in some locales)
+            $encInt = 0
+            if ($encVal -is [string] -and $encVal -match '^0x') {
+                try { $encInt = [Convert]::ToInt32($encVal, 16) } catch { continue }
+            } else {
+                try { $encInt = [int]$encVal } catch { continue }
+            }
+            $encStr = '0x{0:X2}' -f $encInt
+
+            if ($encInt -eq 0x17 -or $encInt -eq 0x18) {
+                $user   = $null
+                $svc    = $null
+                try {
+                    if ($evt.Id -eq 4769) {
+                        $user = [string]$evt.Properties[0].Value
+                        $svc  = [string]$evt.Properties[2].Value
+                    } else {
+                        $user = [string]$evt.Properties[0].Value
+                    }
+                } catch { }
+                if (-not $user) { continue }
+
+                $key = "$user|$svc|$($evt.Id)"
+                if (-not $rc4UserHits.ContainsKey($key)) {
+                    $rc4UserHits[$key] = [pscustomobject]@{
+                        DC          = $dc
+                        EventId     = $evt.Id
+                        User        = $user
+                        Service     = $svc
+                        EncType     = $encStr
+                        FirstSeen   = $evt.TimeCreated
+                        Count       = 0
+                    }
+                }
+                $rc4UserHits[$key].Count++
+            }
+        }
+    }
+
+    if ($rc4UserHits.Count -gt 0) {
+        $rc4UserHits.Values | Sort-Object User, Service | ForEach-Object {
+            $line = "{0,-30} svc={1,-40} event={2} encType={3} count={4} firstSeen={5} dc={6}" -f `
+                $_.User, ($_.Service), $_.EventId, $_.EncType, $_.Count, $_.FirstSeen, $_.DC
+            $authLines.Add($line) | Out-Null
+        }
+        $authHasContent = $true
+        Write-Both "    [!] Detected $($rc4UserHits.Count) distinct RC4 Kerberos exchanges in the last 7 days - see rc4_authentication_events.txt"
+    } else {
+        Write-Both "    [+] No RC4 Kerberos events observed in the last 7 days (or Kerberos auditing not enabled on DCs)"
+    }
+
+    # Only materialise rc4_authentication_events.txt if we have something to report
+    # (actual hits or per-DC query errors). A clean run with no hits leaves no file.
+    if ($authHasContent) {
+        Add-Content -Path $authPath -Value $authHeader
+        foreach ($l in $authLines) { Add-Content -Path $authPath -Value $l }
+    }
+}
+
 $outputdir = Join-Path -Path (Get-Item -Path '.').FullName -ChildPath $env:COMPUTERNAME
 $script:outputdir = $outputdir
 $starttime = Get-Date
@@ -6425,7 +6719,7 @@ if ($installdeps) { $running = $true ; Write-Both "[*] Installing optionnal feat
 if ($hostdetails -or ($all -and 'hostdetails' -notin $exclude) -or 'hostdetails' -in $selectedChecks) { $running = $true ; Write-Both "[*] Device Information" ; Get-HostDetails }
 if ($domainaudit -or ($all -and 'domainaudit' -notin $exclude) -or 'domainaudit' -in $selectedChecks) { $running = $true ; Write-Both "[*] Domain Audit" ; Get-LastWUDate ; Get-DCEval ; Get-TimeSource ; Get-PrivilegedGroupMembership ; Get-MachineAccountQuota; Get-DefaultDomainControllersPolicy ; Get-SMB1Support ; Get-FunctionalLevel ; Get-DCsNotOwnedByDA ; Get-ReplicationType ; Check-Shares ; Get-RecycleBinState ; Get-CriticalServicesStatus ; Get-RODC ; Get-KerberosUnconstrainedDelegation ; Get-TombstoneLifetime ; Get-PrintSpoolerOnDCs ; Get-SMBSigningStatus }
 if ($trusts -or ($all -and 'trusts' -notin $exclude) -or 'trusts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Domain Trust Audit" ; Get-DomainTrusts }
-if ($accounts -or ($all -and 'accounts' -notin $exclude) -or 'accounts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Accounts Audit" ; Get-InactiveAccounts ; Get-DisabledAccounts ; Get-LockedAccounts ; Get-AdminAccountChecks ; Get-NULLSessions ; Get-PrivilegedGroupAccounts ; Get-ProtectedUsers ; Get-DomainAdminsGroupOverlap ; Get-GMSAStatus }
+if ($accounts -or ($all -and 'accounts' -notin $exclude) -or 'accounts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Accounts Audit" ; Get-InactiveAccounts ; Get-DisabledAccounts ; Get-LockedAccounts ; Get-AdminAccountChecks ; Get-NULLSessions ; Get-PrivilegedGroupAccounts ; Get-ProtectedUsers ; Get-DomainAdminsGroupOverlap ; Get-GMSAStatus ; Get-RC4OnlyAccounts }
 if ($passwordpolicy -or ($all -and 'passwordpolicy' -notin $exclude) -or 'passwordpolicy' -in $selectedChecks) { $running = $true ; Write-Both "[*] Password Information Audit" ; Get-AccountPassDontExpire ; Get-UserPasswordNotChangedRecently ; Get-PasswordPolicy ; Get-PasswordQuality }
 if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or 'inactivecomputers' -in $selectedChecks) {
     $running = $true
@@ -6649,7 +6943,12 @@ function Invoke-ManagementReport {
                     }
                     $line
                 } |
-                Where-Object { $_ -and $_.Trim().Length -gt 0 }
+                Where-Object {
+                    # Skip blank lines and '#' comment lines (used as evidence-file headers).
+                    # Without this, multi-line explanatory headers would be counted as
+                    # findings and inflate severity (e.g. Critical >= 25 line threshold).
+                    $_ -and $_.Trim().Length -gt 0 -and -not ($_.TrimStart().StartsWith('#'))
+                }
         } catch { return @() }
     }
 
@@ -6952,7 +7251,7 @@ function Invoke-ManagementReport {
     function Get-FindingCategory([string]$Title) {
         switch -Regex ($Title) {
             'Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|privileged|overlap|Delegated permissions' { return 'Privileged access' }
-            'password|Password|KRBTGT|Kerberos|AS-REP|SPN|reversible|weak.*encryption|LM hashes|no password|dictionary|breach|DES-only|AES keys'  { return 'Authentication and password security' }
+            'password|Password|KRBTGT|Kerberos|AS-REP|SPN|reversible|weak.*encryption|LM hashes|no password|dictionary|breach|DES-only|AES keys|CVE-2026-20833|RC4'  { return 'Authentication and password security' }
             'delegation|gMSA|service account'                                                         { return 'Delegation and service accounts' }
             'LAPS|LDAP|NTLM|cipher|SMB signing'                                                     { return 'Identity hardening' }
             'DNS'                                                                                    { return 'DNS security' }
@@ -7038,6 +7337,9 @@ function Invoke-ManagementReport {
             }
             'AES keys missing' {
                 return 'Accounts missing Kerberos AES keys will fall back to weaker encryption (RC4/DES) for Kerberos authentication, increasing vulnerability to offline attacks.'
+            }
+            'CVE-2026-20833|RC4' {
+                return 'Microsoft''s CVE-2026-20833 update hardens the KDC so it stops issuing RC4-encrypted Kerberos service tickets for accounts that do not advertise AES support. Accounts whose msDS-SupportedEncryptionTypes lacks AES128/AES256 (or whose passwords were last set before AES keys were generated) will fail to authenticate after the hardening enforcement, and any traffic still using RC4 today is cryptographically weak and Kerberoastable.'
             }
             'DES-only' {
                 return 'DES encryption is cryptographically broken and can be cracked in real-time. Accounts restricted to DES-only are critically vulnerable.'
@@ -7127,6 +7429,9 @@ function Invoke-ManagementReport {
             }
             'AES keys missing' {
                 return 'Force a password change or reset for affected accounts. The new password hash will include AES keys. For computer accounts use Reset-ComputerMachinePassword. For service accounts consider migrating to gMSA.'
+            }
+            'CVE-2026-20833|RC4' {
+                return 'For each affected account set msDS-SupportedEncryptionTypes to 24 (AES128+AES256): Set-ADUser <acct> -Replace @{''msDS-SupportedEncryptionTypes''=24} or Set-ADComputer <acct> -Replace @{''msDS-SupportedEncryptionTypes''=24}. Then force a password change so AES keys are actually generated (Reset-ComputerMachinePassword for computers; rotate or migrate to gMSA for service accounts; perform a planned double-rotation for krbtgt). At the domain level set the KDC registry value DefaultDomainSupportedEncTypes to 0x18 so accounts with a blank attribute fall back to AES instead of RC4. Validate by inspecting DC events 4768/4769 (TicketEncryptionType 0x11/0x12 = AES, 0x17/0x18 = RC4). References: https://www.cayosoft.com/blog/kerberos-rc4-hardening-what-microsoft-s-cve-2026-20833-update-really-means-for-active-directory-admins/ and https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc'
             }
             'DES-only' {
                 return 'Remove the DES restriction from affected accounts: Set-ADUser <account> -Replace @{''msDS-SupportedEncryptionTypes''=24}. Clear the "Use Kerberos DES encryption types for this account" checkbox in account properties. Force a password change after the update.'
@@ -8923,7 +9228,9 @@ $js
             } catch { $ageVal = 0 }
 
             if ($ageVal -gt 180) {
-                $sev = if ($ageVal -ge 365) { 'High' } else { 'Medium' }
+                $sev = if ($ageVal -ge 730) { 'Critical' }
+                       elseif ($ageVal -ge 365) { 'High' }
+                       else { 'Medium' }
                 Add-FindingOnce $sev 'KRBTGT password age is high' "Estimated age (days): $ageVal" $hrFiles.KRBTGT (Score-Scaled $sev ([Math]::Max($ageVal,1) / 30))
             }
         }
@@ -9237,6 +9544,19 @@ $js
     $smbSignLines = Get-NonHeaderLines $smbSignPath
     if ($smbSignLines.Count -gt 0) {
         Add-FindingOnce 'High' 'SMB signing not enforced on domain controllers' "DCs affected: $($smbSignLines.Count)" $smbSignPath (Score-Scaled 'High' $smbSignLines.Count)
+    }
+
+    # RC4-only accounts (CVE-2026-20833 Kerberos RC4 hardening)
+    $rc4Path  = Resolve-AuditArtifactPath (Join-Path $InputRoot 'rc4_only_accounts.txt')
+    $rc4Lines = Get-NonHeaderLines $rc4Path
+    if ($rc4Lines.Count -gt 0) {
+        $sev = if ($rc4Lines.Count -ge 25) { 'Critical' } elseif ($rc4Lines.Count -ge 5) { 'High' } else { 'Medium' }
+        Add-FindingOnce $sev 'Accounts without AES Kerberos support (CVE-2026-20833)' "Accounts: $($rc4Lines.Count)" $rc4Path (Score-Scaled $sev $rc4Lines.Count)
+    }
+    $rc4AuthPath  = Resolve-AuditArtifactPath (Join-Path $InputRoot 'rc4_authentication_events.txt')
+    $rc4AuthLines = Get-NonHeaderLines $rc4AuthPath
+    if ($rc4AuthLines.Count -gt 0) {
+        Add-FindingOnce 'High' 'Active RC4 Kerberos authentications observed' "Distinct exchanges: $($rc4AuthLines.Count)" $rc4AuthPath (Score-Scaled 'High' $rc4AuthLines.Count)
     }
 
     # Delegated Permissions
@@ -9808,7 +10128,7 @@ $js
         $txt += "Target: $computerName"
         $txt += "Generated: $now"
         $txt += "Overall risk level: $OverallLevel (Score=$TotalScore)"
-        $txt += "Score matrix: Low=0-49; Medium=50-99; High=100-149; Critical=150+"
+        $txt += "Score matrix: " + (($ScoreBands | ForEach-Object { "$($_.Level)=$($_.Range)" }) -join '; ')
         if ($UsersCount)  { $txt += "Users: $UsersCount" }
         if ($GroupsCount) { $txt += "Groups: $GroupsCount" }
         if ($OUsCount)    { $txt += "OUs: $OUsCount" }
