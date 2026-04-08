@@ -7,7 +7,7 @@ A comprehensive PowerShell 7 script for auditing Active Directory security confi
 **From the GUI version you can install dependencies and chose what audits to run**
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-.\AdAudit-GUI.ps1 -all
+.\AdAudit-GUI.ps1
 ```
 
 **For the best and most complete results, run all checks:**
