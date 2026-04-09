@@ -54,10 +54,12 @@ If an optional module is not available, those specific checks will be skipped an
 
 Results are written to a timestamped folder in the script directory, including:
 
-- **Risk Report** (HTML) with findings, severity scores, and recommendations
+- **Risk-Report** (HTML) with findings, severity scores, and recommendations
 - **Nessus-compatible** output file (`.nessus`)
-- **Raw data** exports (text files with detailed findings)
+- **Raw data** exports (text files with detailed findings) (More data and infromation then in HTML reports)
 - **GPO reports** (HTML/XML) when GroupPolicy module is available
+- **ADAudit-Results** (HTML) with most important findings, audit information, recomendation and link to raw files.
+- **overlapping_group_memberships** Detailed information about users that get same group membership from multiple groups path. 
 
 ## Audit Checks
 
