@@ -29,8 +29,15 @@ To also install optional dependencies (DSInternals for password quality analysis
 
 - **PowerShell 7.x** on Windows (`pwsh.exe`)
 - **ActiveDirectory** PowerShell module (installed with RSAT tools)
-- **Windows Server 2025** or supported RSAT-equipped Windows management hosts
 - Run as a user with sufficient AD read permissions (Domain Admin recommended for full results)
+- NuGet and DSInternals modules from PowerShell Gallery
+<rb>
+https://www.powershellgallery.com/packages/NuGet/
+<br>
+https://www.powershellgallery.com/packages/DSInternals/
+<br>
+Chose Manual Download. You will get two .nuplkg files. Plase them in the ADAudit folder for offline installation.
+<br>
 
 ### Optional Modules
 
