@@ -47,7 +47,7 @@ https://github.com/phillips321/adaudit
 
 <br><br>
 
-# Fork Explination
+# Dependencies
 Copy the ADAudit folder to the DC Server or a server with the RSAT tools installed and can manage active directory. The account running the script need to be Domain Admin to run the full audit. <br><br>
 
 Download NuGet and DSInternals modules from PowerShell Gallery before using any audit scripts and place in the same folder as the script.<br>
