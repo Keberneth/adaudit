@@ -18,7 +18,112 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
-            [X] Version 8.3 - 08/04/2026
+            [X] Version 8.7 - 01/05/2026
+                Fixed Get-ADAuditFunctionalLevelRank table: it only knew about 2016+ DFLs,
+                    so any check using Test-ADAuditFunctionalLevelAtLeast against a minimum
+                    of Windows2012R2Domain (or 2008R2, 2012, 2003 etc) returned $false even
+                    on 2016/2019/2022 estates. The Protected Users / Authentication Policies
+                    checks added in v8.6 silently failed because of this. Rank table now
+                    covers Windows 2000 through 2025 (Domain + Forest variants).
+                Get-ADAuditFunctionalLevelMode similarly extended.
+                Test-DCPortConnectivity now DNS-resolves each DC name first; if a DC name
+                    does not resolve we emit ONE "DC unreachable (DNS resolution failed)"
+                    finding instead of fourteen "CLOSED (No such host is known)" rows. The
+                    cross-DC WinRM matrix also skips unresolvable targets so the noise
+                    does not propagate. Real findings still surface as before.
+                Dark mode coverage across every HTML report:
+                    - Risk-Report.html was hard-coded dark only with no light mode and no
+                      toggle; rewritten to support light + dark with prefers-color-scheme
+                      OS auto-detect, a header toggle button, and localStorage persistence.
+                    - ADAudit-Results.html had a manual toggle but defaulted to light no
+                      matter what the OS preference was; now follows OS prefers-color-scheme
+                      on first load and reacts to OS theme changes if the user has not
+                      explicitly toggled.
+                    - Companion-report wrapper (used to wrap GPO/DNS/Delegated reports
+                      with a back-link header) was light-only; now matches the rest of
+                      the suite with full light/dark + OS auto-detect + toggle.
+                    - DNS audit, DNS recommendations, Delegated Permissions, high-risk
+                      baseline, overlapping group memberships and multiple-nested-paths
+                      reports were already prefers-color-scheme aware; verified end-to-end.
+            [ ] Version 8.6 - 01/05/2026
+                Added Test-DCPortConnectivity (-portconnectivity / -dcports / -dc-ports / -portcheck).
+                    Probes every DC from this host on the canonical AD port set
+                    (DNS 53, Kerberos 88, RPC EPM 135, LDAP 389, SMB 445, kpasswd 464,
+                    LDAPS 636, GC 3268, GC-TLS 3269, ADWS 9389, WinRM 5985/5986,
+                    NetBIOS 139, sample of dynamic RPC 49152). Each DC also runs a
+                    cross-DC TCP probe via WinRM if WinRM is reachable; if WinRM is
+                    not reachable the cross-DC matrix is SKIPPED with a clear "why"
+                    note in the output and the rest of the check still runs.
+                    Output: dc_port_connectivity.txt (severity-grouped findings with
+                    WHY / FIX / source-target details + LDAP/LDAPS posture summary)
+                    and dc_port_connectivity.csv (per-row machine readable). Closed
+                    ports surface as one finding per port name in the HTML report;
+                    LDAPS-not-reachable also gets its own dedicated High-severity
+                    finding ("LDAP traffic forced to plaintext").
+                Fixed Get-ProtectedUsers and Get-AuthenticationPoliciesAndSilos: both
+                    were gated on Windows2019Domain functional level, but Microsoft's
+                    actual requirement is Windows2012R2Domain. The previous gate
+                    silently skipped the check on every 2012R2/2016 estate. Now
+                    correctly evaluates from 2012R2+.
+                Both functions now write a structured evidence file with WHY this
+                    matters / HOW to fix / consequences if NOT fixed / consequences
+                    AFTER fixing - even when the check is skipped (DFL too low) or
+                    when the group/policy is empty. The user previously got a one-
+                    line "skipping" message with no remediation context.
+                Help text and -all / -select / -exclude all updated to know about the
+                    new portconnectivity switch.
+            [ ] Version 8.5 - 01/05/2026
+                Resilient per-check error handling: each audit step is now wrapped in
+                    Invoke-AuditCheck / Invoke-AuditStep. A failure in one step (DNS
+                    server unreachable, RPC blocked, missing module, AD lookup error)
+                    is logged and the script continues with all remaining checks
+                    instead of aborting. The customer-reported case where a single
+                    DNS connectivity error stopped the entire audit no longer happens.
+                Connection-failure summary: every captured failure is written to
+                    connection_failures.txt + connection_failures.csv with timestamp,
+                    check name, switch, error type and message, classification of
+                    whether the failure looks like a connectivity / RPC / auth issue,
+                    the suspected target server parsed from the error message, and -
+                    if reachable - which FSMO roles that server holds (so the operator
+                    knows which DC needs attention). Also surfaced as a Nessus finding
+                    (KB1300).
+                DNS audit report rewrite: replaced the flat "Top Findings" mini-table
+                    with a "Findings by Issue" section. Each distinct issue is now
+                    one collapsible row with a severity badge, a clear "why this
+                    matters" explanation, the recommended fix, and the list of
+                    affected zones. The huge per-zone table was demoted to a
+                    collapsed "Zone Details (raw)" reference at the bottom.
+                Delegated Permissions report rewrite: Risk Assessment is now grouped
+                    by severity (CRITICAL > HIGH > MEDIUM > LOW), and each finding
+                    has a Why / Fix / Sample-trustees block. Removed the 73+ per-OU
+                    .txt files that duplicated the matching .csv content, and
+                    replaced them with a single ADAudit_PerScopeSummary.txt for
+                    human reading. The HTML index now leads with severity-bucketed
+                    findings; the raw scope list is collapsed.
+                DNS check no longer throws: missing DnsServer module, undetectable
+                    DNS server, and unreachable target are now Write-Warning + throw
+                    inside the resilient wrapper, which catches them. Earlier the
+                    throws aborted every later check.
+            [ ] Version 8.4 - 01/05/2026
+                Fixed rc4_only_accounts.txt being created with only the explanation header
+                    when zero RC4-only accounts were found. The function now buffers all
+                    evidence text and only writes the file if at least one at-risk account
+                    is detected (matching the rc4_authentication_events.txt pattern).
+                Fixed Get-OverlappingGroupMemberships dispatch ignoring -exclude and -select.
+                    Previously "$all -or $accounts -or $overlappinggroups" forced the check
+                    to run even with -exclude overlappinggroups, and -select overlappinggroups
+                    standalone did not trigger it. Now follows the same pattern as every
+                    other check.
+                Added five missing password-quality categories to the HTML risk report:
+                    duplicate passwords (with same-NTLM-hash + pass-the-hash risk explanation),
+                    historical dictionary passwords, Kerberos pre-auth disabled, password
+                    never expires, and Kerberoastable accounts. Files were already split
+                    and reported via .nessus, but never surfaced in the HTML report body.
+                Added "WHY THIS MATTERS" explanatory block to pq_duplicate_passwords.txt
+                    clarifying that accounts grouped together share the IDENTICAL NTLM hash
+                    (and therefore the same plaintext password), with pass-the-hash and
+                    lateral-movement risk context.
+            [ ] Version 8.3 - 08/04/2026
                 Added Get-RC4OnlyAccounts function (KB1205) to detect AD accounts whose
                     msDS-SupportedEncryptionTypes lacks AES128/AES256 support and are therefore
                     affected by Microsoft's CVE-2026-20833 Kerberos RC4 hardening update.
@@ -251,6 +356,7 @@ Param (
     [string]$DelegServer,
     [switch]$highrisk = $false,
     [switch]$overlappinggroups = $false,
+    [Alias('dcports','dc-ports','portcheck')][switch]$portconnectivity = $false,
     [switch]$all = $false,
     [string[]]$exclude = @(),
     [string]$select,
@@ -260,7 +366,7 @@ Param (
 $selectedChecks = @()
 if ($select) { $selectedChecks = $select.Split(',') }
 
-$versionnum = "v8.3"
+$versionnum = "v8.7"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 $script:ADAuditIsWindows = ($env:OS -eq 'Windows_NT')
@@ -418,7 +524,28 @@ function Convert-ADAuditFileTime {
 function Get-ADAuditFunctionalLevelRank {
     param([string]$Mode)
 
+    # Ranks cover every Domain/Forest mode the ActiveDirectory module emits,
+    # going back to NT4 (rank 0) and forward to Server 2025 (rank 10). Earlier
+    # versions of this table only covered 2016+, which made
+    # Test-ADAuditFunctionalLevelAtLeast return $false whenever the minimum
+    # mode was Windows2003/2008/2008R2/2012/2012R2 because $minimumRank ended
+    # up $null - which broke the Protected Users / Authentication Policies
+    # checks on every estate at or above DFL 2008R2.
     switch ($Mode) {
+        'Windows2000Domain'        { return 0 }
+        'Windows2000Forest'        { return 0 }
+        'Windows2003InterimDomain' { return 1 }
+        'Windows2003InterimForest' { return 1 }
+        'Windows2003Domain'        { return 2 }
+        'Windows2003Forest'        { return 2 }
+        'Windows2008Domain'        { return 3 }
+        'Windows2008Forest'        { return 3 }
+        'Windows2008R2Domain'      { return 4 }
+        'Windows2008R2Forest'      { return 4 }
+        'Windows2012Domain'        { return 5 }
+        'Windows2012Forest'        { return 5 }
+        'Windows2012R2Domain'      { return 6 }
+        'Windows2012R2Forest'      { return 6 }
         'Windows2016Domain'        { return 7 }
         'Windows2016Forest'        { return 7 }
         'WinThreshold'             { return 7 }
@@ -442,6 +569,12 @@ function Get-ADAuditFunctionalLevelMode {
     )
 
     switch ($Rank) {
+        0  { return "Windows2000$Scope" }
+        2  { return "Windows2003$Scope" }
+        3  { return "Windows2008$Scope" }
+        4  { return "Windows2008R2$Scope" }
+        5  { return "Windows2012$Scope" }
+        6  { return "Windows2012R2$Scope" }
         7  { return "Windows2016$Scope" }
         8  { return "Windows2019$Scope" }
         9  { return "Windows2022$Scope" }
@@ -739,6 +872,240 @@ Function Get-EvidencePath {
     $dir = Get-RawSourceDataDir
     return (Join-Path $dir $FileName)
 }
+
+# ---------------------------------------------------------------------------
+# Audit check resilience: per-check try/catch wrapper + FSMO context lookup
+# Lets a single failing check (DNS, Delegated Permissions, etc.) be logged
+# without stopping the entire script. A separate connection_failures.txt /
+# .csv summarises every failure, the error, the suspected target server, and
+# - if reachable - the FSMO roles that server holds, so the operator knows
+# exactly which checks were skipped and why.
+# ---------------------------------------------------------------------------
+$script:CheckFailures = New-Object System.Collections.Generic.List[object]
+
+Function Get-FsmoRolesForServer {
+    [CmdletBinding()]
+    param([string]$ServerHostnameOrFqdn)
+
+    if ([string]::IsNullOrWhiteSpace($ServerHostnameOrFqdn)) { return @() }
+    $needle = $ServerHostnameOrFqdn.Trim().TrimEnd('.').ToLowerInvariant()
+    $shortNeedle = ($needle -split '\.')[0]
+
+    $roles = @()
+    try {
+        $forest = Get-ADForest -ErrorAction Stop
+        if ($forest) {
+            foreach ($pair in @(
+                @{ N='SchemaMaster';        V=$forest.SchemaMaster },
+                @{ N='DomainNamingMaster';  V=$forest.DomainNamingMaster }
+            )) {
+                if ($pair.V) {
+                    $v = $pair.V.ToString().ToLowerInvariant().TrimEnd('.')
+                    $vShort = ($v -split '\.')[0]
+                    if ($v -eq $needle -or $vShort -eq $shortNeedle) { $roles += $pair.N }
+                }
+            }
+        }
+    } catch { }
+    try {
+        $domain = Get-ADDomain -ErrorAction Stop
+        if ($domain) {
+            foreach ($pair in @(
+                @{ N='PDCEmulator';          V=$domain.PDCEmulator },
+                @{ N='RIDMaster';            V=$domain.RIDMaster },
+                @{ N='InfrastructureMaster'; V=$domain.InfrastructureMaster }
+            )) {
+                if ($pair.V) {
+                    $v = $pair.V.ToString().ToLowerInvariant().TrimEnd('.')
+                    $vShort = ($v -split '\.')[0]
+                    if ($v -eq $needle -or $vShort -eq $shortNeedle) { $roles += $pair.N }
+                }
+            }
+        }
+    } catch { }
+    return ,$roles
+}
+
+Function Resolve-ServerHintFromError {
+    [CmdletBinding()]
+    param([string]$ErrorMessage)
+
+    if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return @() }
+    $hints = New-Object System.Collections.Generic.List[string]
+
+    foreach ($pat in @(
+        "(?i)server\s+'([^']+)'",
+        '(?i)server\s+"([^"]+)"',
+        '(?i)on\s+server\s+([A-Za-z0-9_\-\.]+)',
+        '(?i)from\s+server\s+([A-Za-z0-9_\-\.]+)',
+        '(?i)computer\s+''([^'']+)''',
+        '(?i)host\s+([A-Za-z0-9_\-\.]+)',
+        '(?i)\\\\([A-Za-z0-9_\-\.]+)\\',
+        '(?i)to\s+([A-Za-z0-9_\-]+\.[A-Za-z0-9_\-\.]+)'
+    )) {
+        foreach ($m in [regex]::Matches($ErrorMessage, $pat)) {
+            if ($m.Groups.Count -gt 1) {
+                $val = $m.Groups[1].Value.Trim()
+                if ($val -and $val -notmatch '^\s*$') { $hints.Add($val) | Out-Null }
+            }
+        }
+    }
+    return ,(@($hints | Sort-Object -Unique))
+}
+
+Function Test-IsConnectionError {
+    [CmdletBinding()]
+    param([string]$ErrorMessage, [string]$ErrorType)
+    if (-not $ErrorMessage) { return $false }
+    if ($ErrorMessage -match '(?i)\b(rpc|the rpc server is unavailable|cannot find|could not contact|server is not operational|cannot connect|connection (refused|timed out|reset|failed)|network path was not found|firewall|unreachable|0x80004005|access (is )?denied|no logon servers|target principal name is incorrect)\b') { return $true }
+    if ($ErrorType -match '(?i)CimException|RpcException|RemoteException|DirectoryServerDownException|ActiveDirectoryServerDownException|EndpointNotFound') { return $true }
+    return $false
+}
+
+Function Register-AuditFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Description,
+        [string]$Switch,
+        [string]$Prefix = '    [!] STEP FAILED'
+    )
+
+    $errMsg  = $ErrorRecord.Exception.Message
+    $errType = $ErrorRecord.Exception.GetType().FullName
+    $isConn  = Test-IsConnectionError -ErrorMessage $errMsg -ErrorType $errType
+
+    $serverHints = Resolve-ServerHintFromError -ErrorMessage $errMsg
+    $fsmoEntries = New-Object System.Collections.Generic.List[string]
+    foreach ($hint in $serverHints) {
+        $rolesForHost = Get-FsmoRolesForServer -ServerHostnameOrFqdn $hint
+        if ($rolesForHost.Count -gt 0) {
+            $fsmoEntries.Add("$hint = [$($rolesForHost -join ', ')]") | Out-Null
+        }
+    }
+
+    $script:CheckFailures.Add([pscustomobject]@{
+        Time                = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        CheckName           = $Name
+        Switch              = $Switch
+        Description         = if ($Description) { $Description } else { $Name }
+        ErrorType           = $errType
+        ErrorMessage        = $errMsg
+        IsConnectionIssue   = $isConn
+        ServerHints         = ($serverHints -join ', ')
+        FsmoOnFailedServers = ($fsmoEntries -join '; ')
+        ScriptStackTrace    = ([string]$ErrorRecord.ScriptStackTrace)
+    }) | Out-Null
+
+    Write-Both ("{0} ({1}): {2}" -f $Prefix, $Name, $errMsg)
+    if ($isConn) {
+        Write-Both "    [!] Reason: connection / RPC / firewall / authentication issue with an AD or DNS server."
+    }
+    if ($serverHints.Count -gt 0) {
+        Write-Both ("    [!] Suspected server(s) from error: {0}" -f ($serverHints -join ', '))
+    }
+    if ($fsmoEntries.Count -gt 0) {
+        foreach ($entry in $fsmoEntries) {
+            Write-Both "    [!] FSMO holder: $entry"
+        }
+    } elseif ($isConn -and $serverHints.Count -gt 0) {
+        Write-Both "    [!] FSMO lookup: server(s) above do not appear to currently hold FSMO roles (or AD lookup also failed)."
+    }
+}
+
+Function Invoke-AuditCheck {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][scriptblock]$Body,
+        [string]$Switch
+    )
+
+    Write-Both "[*] $Description"
+    try {
+        & $Body
+    } catch {
+        Register-AuditFailure -ErrorRecord $_ -Name $Name -Description $Description -Switch $Switch -Prefix '    [!] CHECK FAILED'
+        Write-Both "    [*] Continuing with remaining checks..."
+    }
+}
+
+Function Invoke-AuditStep {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Body,
+        [string]$Switch
+    )
+
+    try {
+        & $Body
+    } catch {
+        Register-AuditFailure -ErrorRecord $_ -Name $Name -Switch $Switch -Prefix '    [!] STEP FAILED'
+    }
+}
+
+Function Write-CheckFailuresReport {
+    [CmdletBinding()]
+    param([string]$BaseRoot)
+
+    if (-not $script:CheckFailures -or $script:CheckFailures.Count -eq 0) { return }
+
+    $rawDir = Get-RawSourceDataDir
+    if (-not (Test-Path -LiteralPath $rawDir)) {
+        New-Item -ItemType Directory -Path $rawDir -Force | Out-Null
+    }
+    $txtPath = Join-Path $rawDir 'connection_failures.txt'
+    $csvPath = Join-Path $rawDir 'connection_failures.csv'
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('=====================================================================')
+    [void]$sb.AppendLine(' AUDIT CHECK FAILURES (script continued past these)')
+    [void]$sb.AppendLine('=====================================================================')
+    [void]$sb.AppendLine(" Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine(" Total failures: $($script:CheckFailures.Count)")
+    [void]$sb.AppendLine('---------------------------------------------------------------------')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('What this file means:')
+    [void]$sb.AppendLine(' - One or more audit checks could not complete (typically because an AD')
+    [void]$sb.AppendLine('   or DNS server was unreachable, RPC was blocked, the user lacked')
+    [void]$sb.AppendLine('   permissions, or a required PowerShell module was missing).')
+    [void]$sb.AppendLine(' - The script kept running and finished every other check. Anything that')
+    [void]$sb.AppendLine('   appears below was SKIPPED, so the corresponding section of the HTML')
+    [void]$sb.AppendLine('   report may be incomplete.')
+    [void]$sb.AppendLine(' - For each failure we record the suspected target server (parsed from')
+    [void]$sb.AppendLine('   the error message) and which FSMO role(s) that server holds, so you')
+    [void]$sb.AppendLine('   can decide whether to retry from a different DC.')
+    [void]$sb.AppendLine('')
+
+    $i = 0
+    foreach ($f in $script:CheckFailures) {
+        $i++
+        [void]$sb.AppendLine("[$i] $($f.CheckName)  ($($f.Time))")
+        [void]$sb.AppendLine("    Description : $($f.Description)")
+        if ($f.Switch) { [void]$sb.AppendLine("    Switch      : -$($f.Switch)") }
+        [void]$sb.AppendLine("    Connection  : $(if($f.IsConnectionIssue){'YES (RPC / network / auth)'}else{'no - other error'})")
+        [void]$sb.AppendLine("    Error type  : $($f.ErrorType)")
+        [void]$sb.AppendLine("    Error       : $($f.ErrorMessage)")
+        if ($f.ServerHints)         { [void]$sb.AppendLine("    Server hint : $($f.ServerHints)") }
+        if ($f.FsmoOnFailedServers) { [void]$sb.AppendLine("    FSMO held   : $($f.FsmoOnFailedServers)") }
+        [void]$sb.AppendLine("    Effect      : results for this check are MISSING from the report.")
+        [void]$sb.AppendLine('')
+    }
+
+    Set-Content -LiteralPath $txtPath -Value $sb.ToString() -Encoding UTF8
+    $script:CheckFailures | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Both ""
+    Write-Both "[!] $($script:CheckFailures.Count) check(s) failed during this run - see connection_failures.txt"
+
+    try {
+        Write-Nessus-Finding "AuditCheckFailures" "KB1300" ([System.IO.File]::ReadAllText($txtPath))
+    } catch {}
+}
+
 Function Write-Nessus-Header() {
     #Creates nessus XML file header
     Add-Content -Path "$outputdir\adaudit.nessus" -Value "<?xml version=`"1.0`" ?><AdAudit>"
@@ -1366,60 +1733,193 @@ function Get-OverlappingGroupMemberships {
 
 
 Function Get-ProtectedUsers {
-    #Lists users in "Protected Users" group (2019 and above)
+    # Protected Users group: actual Microsoft requirement is Domain Functional
+    # Level Windows Server 2012 R2 (the group was introduced in 2012R2 and the
+    # KDC-side restrictions ship at that DFL). The previous version of this
+    # script gated on Windows2019Domain, which incorrectly skipped the check on
+    # 2012R2/2016/2019 server estates that were perfectly capable of running it.
     $DomainLevel = (Get-ADDomain).DomainMode
-    if (Test-ADAuditFunctionalLevelAtLeast -Mode $DomainLevel -MinimumMode 'Windows2019Domain') {
-        $ProtectedUsersSID = ((Get-ADDomain -Current LoggedOnUser).DomainSID.Value) + "-525"
-        $ProtectedUsers = (Get-ADGroup -Identity $ProtectedUsersSID).SamAccountName
-        $count = 0
-        $protectedaccounts = (Get-ADGroup $ProtectedUsers -Properties Members).Members
+    $evPath = Get-EvidencePath 'accounts_protectedusers.txt'
+
+    if (Test-ADAuditFunctionalLevelAtLeast -Mode $DomainLevel -MinimumMode 'Windows2012R2Domain') {
+        try {
+            $ProtectedUsersSID = ((Get-ADDomain -Current LoggedOnUser).DomainSID.Value) + "-525"
+            $ProtectedUsers    = (Get-ADGroup -Identity $ProtectedUsersSID).SamAccountName
+            $protectedaccounts = (Get-ADGroup $ProtectedUsers -Properties Members).Members
+        } catch {
+            Write-Both "    [!] Could not query the Protected Users group: $($_.Exception.Message)"
+            return
+        }
+
+        $count      = 0
         $totalcount = ($protectedaccounts | Measure-Object | Select-Object -ExpandProperty Count)
         foreach ($members in $protectedaccounts) {
             if ($totalcount -eq 0) { break }
             Write-Progress -Activity "Searching for protected users..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
             $account = Get-ADObject $members -Properties SamAccountName
-            Add-Content -Path (Get-EvidencePath 'accounts_protectedusers.txt') -Value "$($account.SamAccountName) ($($account.Name))"
+            Add-Content -Path $evPath -Value "$($account.SamAccountName) ($($account.Name))"
             $count++
         }
         Write-Progress -Activity "Searching for protected users..." -Status "Ready" -Completed
+
         if ($count -gt 0) {
             Write-Both "    [!] There are $count accounts in the 'Protected Users' group, see accounts_protectedusers.txt"
-            Write-Nessus-Finding "ProtectedUsers" "KB549" ([System.IO.File]::ReadAllText((Get-EvidencePath 'accounts_protectedusers.txt')))
+            Write-Nessus-Finding "ProtectedUsers" "KB549" ([System.IO.File]::ReadAllText($evPath))
+        } else {
+            # Empty Protected Users on a domain that supports it is itself a
+            # finding - admin accounts almost always SHOULD be in this group.
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine('Protected Users group is EMPTY on this domain.')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine("Domain functional level: $DomainLevel (>= Windows2012R2Domain - Protected Users is supported).")
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Why this matters:')
+            [void]$sb.AppendLine(' - Members of Protected Users get hard Kerberos restrictions (no NTLM, no DES,')
+            [void]$sb.AppendLine('   no RC4, no unconstrained delegation, no credential delegation, no cached')
+            [void]$sb.AppendLine('   logon, ticket lifetime fixed at 4h). These mitigations defeat almost every')
+            [void]$sb.AppendLine('   common credential-theft attack: pass-the-hash, overpass-the-hash, ticket')
+            [void]$sb.AppendLine('   reuse on cached creds, RC4-based Kerberoasting against admin accounts.')
+            [void]$sb.AppendLine(' - Without anyone in the group, admins still log on the way they always have')
+            [void]$sb.AppendLine('   and an attacker who lands on a workstation can dump and reuse their hash.')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('How to fix:')
+            [void]$sb.AppendLine(' - Add Tier0 / Domain Admin / Enterprise Admin accounts to the Protected Users')
+            [void]$sb.AppendLine('   group:  Add-ADGroupMember -Identity "Protected Users" -Members <admin>')
+            [void]$sb.AppendLine(' - Roll out gradually. Do NOT add service accounts that depend on NTLM, DES,')
+            [void]$sb.AppendLine('   RC4 or unconstrained delegation - they will break.')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Consequences if NOT fixed:')
+            [void]$sb.AppendLine(' - Admin credentials remain stealable from any system the admin signs in to.')
+            [void]$sb.AppendLine(' - Kerberos tickets for these accounts can be issued with weak ciphers if')
+            [void]$sb.AppendLine('   anything in the trust path is misconfigured.')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Consequences AFTER you fix it (things to test before rollout):')
+            [void]$sb.AppendLine(' - The protected account cannot use NTLM at all - any app that auths via NTLM')
+            [void]$sb.AppendLine('   (older SQL Server, some printer/scan-to-folder, legacy line-of-business apps)')
+            [void]$sb.AppendLine('   will fail for that user. Test before adding accounts in bulk.')
+            [void]$sb.AppendLine(' - The protected account cannot be delegated (constrained or unconstrained),')
+            [void]$sb.AppendLine('   so any "double-hop" scenario (e.g. admin runs a tool that fans out via')
+            [void]$sb.AppendLine('   Kerberos delegation) will break.')
+            [void]$sb.AppendLine(' - Cached logon does not work, so a reachable DC is required at every logon.')
+            [void]$sb.AppendLine(' - Ticket lifetime is 4h with no renewal - long-running interactive sessions')
+            [void]$sb.AppendLine('   need to re-authenticate.')
+            Set-Content -LiteralPath $evPath -Value $sb.ToString() -Encoding UTF8
+            Write-Both "    [!] 'Protected Users' group is empty - no Tier0 admins are protected (KB549). See accounts_protectedusers.txt for context, fix, and trade-offs."
+            Write-Nessus-Finding "ProtectedUsersEmpty" "KB549" ([System.IO.File]::ReadAllText($evPath))
         }
     }
     else {
-        Write-Both "    [-] Domain functional level is below Windows Server 2019, skipping Get-ProtectedUsers check."
+        # DFL too low. Write structured guidance to the evidence file so the
+        # HTML report and Nessus output have a real finding (not a silent skip).
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("Protected Users check SKIPPED - Domain Functional Level ($DomainLevel) is below Windows2012R2Domain.")
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('Why this matters:')
+        [void]$sb.AppendLine(' - Protected Users is the single most effective Microsoft-provided mitigation')
+        [void]$sb.AppendLine('   for credential theft against admin accounts. It only exists at DFL 2012R2+.')
+        [void]$sb.AppendLine(' - Below DFL 2012R2 the group cannot be used at all - Tier0 accounts have no')
+        [void]$sb.AppendLine('   built-in protection against pass-the-hash, RC4 Kerberoasting, etc.')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('How to fix:')
+        [void]$sb.AppendLine(' - Raise the Domain Functional Level. From any DC:')
+        [void]$sb.AppendLine('     Set-ADDomainMode -Identity (Get-ADDomain) -DomainMode Windows2016Domain')
+        [void]$sb.AppendLine('   or via the AD Domains and Trusts MMC. Do this AFTER all DCs are running an')
+        [void]$sb.AppendLine('   OS that supports the target DFL (no remaining Server 2008 R2 DCs for 2012R2,')
+        [void]$sb.AppendLine('   no remaining 2012R2 DCs for 2016, etc).')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('Consequences if NOT fixed:')
+        [void]$sb.AppendLine(' - No way to opt admin accounts into the Kerberos hardening Protected Users')
+        [void]$sb.AppendLine('   provides. PtH/RC4-roasting/ticket reuse risks remain on every admin.')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('Consequences AFTER you raise the DFL (review before doing it):')
+        [void]$sb.AppendLine(' - Once raised, the DFL cannot be lowered to a downlevel value (Server 2016+ adds')
+        [void]$sb.AppendLine('   one-way restrictions). You cannot revert without a domain rebuild.')
+        [void]$sb.AppendLine(' - Any DC running an OS below the new DFL must be removed from the domain BEFORE')
+        [void]$sb.AppendLine('   raising. The Set-ADDomainMode command fails if a too-old DC is still present.')
+        [void]$sb.AppendLine(' - Some legacy clients/applications that explicitly require an older DFL or older')
+        [void]$sb.AppendLine('   schema features may stop working - inventory and test before raising.')
+        Set-Content -LiteralPath $evPath -Value $sb.ToString() -Encoding UTF8
+        Write-Both "    [!] Protected Users check skipped - DFL is $DomainLevel (need Windows2012R2Domain). See accounts_protectedusers.txt for context, fix, and trade-offs."
+        Write-Nessus-Finding "ProtectedUsersDflTooLow" "KB549" ([System.IO.File]::ReadAllText($evPath))
     }
 }
 Function Get-AuthenticationPoliciesAndSilos {
-    #Lists any authentication policies and silos (2019 forest/domain and above)
+    # Authentication Policies and Silos require Domain Functional Level
+    # Windows Server 2012 R2 (the AD schema features and KDC enforcement
+    # ship at that DFL). Forest level is NOT required - only the domain.
+    # Earlier versions of this script gated on Windows2019Domain, which
+    # incorrectly skipped the check on perfectly capable estates.
     $DomainLevel = (Get-ADDomain).DomainMode
-    $ForestLevel = (Get-ADForest).ForestMode
+    $evPath = Get-EvidencePath 'auth_policies_silos.txt'
 
-    if (
-        (Test-ADAuditFunctionalLevelAtLeast -Mode $DomainLevel -MinimumMode 'Windows2019Domain') -and
-        (Test-ADAuditFunctionalLevelAtLeast -Mode $ForestLevel -MinimumMode 'Windows2019Forest')
-    ) {
-        $count = 0
-        foreach ($policy in Get-ADAuthenticationPolicy -Filter *) {
-            Write-Both "    [!] Found $policy Authentication Policy"
-            $count++
-        }
-        if ($count -lt 1) {
-            Write-Both "    [!] There were no AD Authentication Policies found in the domain"
+    if (Test-ADAuditFunctionalLevelAtLeast -Mode $DomainLevel -MinimumMode 'Windows2012R2Domain') {
+        try {
+            $policies = @(Get-ADAuthenticationPolicy -Filter *)
+            $silos    = @(Get-ADAuthenticationPolicySilo -Filter *)
+        } catch {
+            Write-Both "    [!] Could not enumerate Authentication Policies / Silos: $($_.Exception.Message)"
+            return
         }
 
-        $count = 0
-        foreach ($policysilo in Get-ADAuthenticationPolicySilo -Filter *) {
-            Write-Both "    [!] Found $policysilo Authentication Policy Silo"
-            $count++
-        }
-        if ($count -lt 1) {
-            Write-Both "    [!] There were no AD Authentication Policy Silos found in the domain"
+        foreach ($policy in $policies)   { Write-Both "    [+] Found Authentication Policy: $($policy.Name)" }
+        foreach ($silo   in $silos)      { Write-Both "    [+] Found Authentication Policy Silo: $($silo.Name)" }
+
+        if ($policies.Count -eq 0 -and $silos.Count -eq 0) {
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine('No Authentication Policies and no Authentication Policy Silos exist in this domain.')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine("Domain functional level: $DomainLevel (>= Windows2012R2Domain - the feature is supported).")
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Why this matters:')
+            [void]$sb.AppendLine(' - Authentication Silos let you fence off Tier0 (Domain Admins, KRBTGT, the')
+            [void]$sb.AppendLine('   forest root) so those accounts can ONLY sign in to a small, controlled set')
+            [void]$sb.AppendLine('   of jump hosts and DCs. Combined with Protected Users, this is the strongest')
+            [void]$sb.AppendLine('   "no admin creds on workstations" control Microsoft ships out of the box.')
+            [void]$sb.AppendLine(' - Without silos, an attacker who phishes any admin can use that ticket from')
+            [void]$sb.AppendLine('   any compromised endpoint - there is no policy preventing it.')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('How to fix:')
+            [void]$sb.AppendLine(' - Plan a Tier0 silo containing your DCs and a small number of PAW jump hosts.')
+            [void]$sb.AppendLine(' - Create a policy + silo in audit mode first, monitor for breakage, then enforce.')
+            [void]$sb.AppendLine('   Reference: https://learn.microsoft.com/windows-server/identity/ad-ds/manage/how-to-configure-protected-accounts')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Consequences if NOT fixed:')
+            [void]$sb.AppendLine(' - Admins can interactively log on to any workstation. Their tickets can be')
+            [void]$sb.AppendLine('   stolen and reused (golden ticket / silver ticket / ticket reuse paths).')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Consequences AFTER you implement (test before enforcing):')
+            [void]$sb.AppendLine(' - Accounts assigned to the silo can no longer sign in to systems outside it.')
+            [void]$sb.AppendLine('   If the silo is misconfigured admins can lock themselves out of every system,')
+            [void]$sb.AppendLine('   including the silo members. Always pilot in audit mode first.')
+            [void]$sb.AppendLine(' - Service accounts that need to authenticate from many sources usually do NOT')
+            [void]$sb.AppendLine('   belong in a Tier0 silo - put them in a separate silo or leave them out.')
+            Set-Content -LiteralPath $evPath -Value $sb.ToString() -Encoding UTF8
+            Write-Both "    [!] No Authentication Policies / Silos defined - Tier0 isolation is not enforced. See auth_policies_silos.txt for context, fix, and trade-offs."
+            Write-Nessus-Finding "AuthPoliciesSilosMissing" "KB549" ([System.IO.File]::ReadAllText($evPath))
         }
     }
     else {
-        Write-Both "    [-] Forest/domain functional level is below Windows Server 2019, skipping Authentication Policies and Silos check."
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("Authentication Policies / Silos check SKIPPED - Domain Functional Level ($DomainLevel) is below Windows2012R2Domain.")
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('Why this matters:')
+        [void]$sb.AppendLine(' - Authentication Policies and Silos let you fence Tier0 admins to specific,')
+        [void]$sb.AppendLine('   controlled hosts. They require DFL 2012R2 - they simply do not exist below.')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('How to fix:')
+        [void]$sb.AppendLine(' - Raise the Domain Functional Level (see the ProtectedUsers finding for the')
+        [void]$sb.AppendLine('   exact PowerShell). Then plan a Tier0 silo (DCs + PAW jump hosts only).')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('Consequences if NOT fixed:')
+        [void]$sb.AppendLine(' - No mechanism to restrict where Tier0 accounts can sign in. Pass-the-hash and')
+        [void]$sb.AppendLine('   ticket-reuse attacks against admins are not contained at the policy layer.')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('Consequences AFTER raising DFL (review before doing it):')
+        [void]$sb.AppendLine(' - DFL is one-way - cannot be lowered. Remove all DCs running an OS below the')
+        [void]$sb.AppendLine('   target DFL BEFORE raising. Inventory legacy clients and apps for compatibility.')
+        Set-Content -LiteralPath $evPath -Value $sb.ToString() -Encoding UTF8
+        Write-Both "    [!] Authentication Policies / Silos check skipped - DFL is $DomainLevel (need Windows2012R2Domain). See auth_policies_silos.txt for context, fix, and trade-offs."
+        Write-Nessus-Finding "AuthPoliciesSilosDflTooLow" "KB549" ([System.IO.File]::ReadAllText($evPath))
     }
 }
 Function Get-MachineAccountQuota {
@@ -3126,8 +3626,36 @@ $header
 
 "@
         # For "groups of accounts have the same passwords" the format is different (grouped)
-        # so we write the raw block preserving structure
+        # so we write the raw block preserving structure, plus an explanatory note
+        # about NTLM hash equality and the security risk it represents.
         if ($header -match 'groups of accounts have the same passwords') {
+            $fileContent += @"
+WHY THIS MATTERS
+---------------------------------------------------------------------
+DSInternals identified the accounts below by comparing NTLM password
+hashes pulled from NTDS.dit. Every account listed in the same group
+has the IDENTICAL NTLM hash, which means they share the EXACT SAME
+plaintext password (NTLM is an unsalted MD4 over the UTF-16 password,
+so equal hash <=> equal password).
+
+Risk:
+  - One credential compromise unlocks every account in the group at
+    once. An attacker who obtains the NTLM hash from one account
+    (Mimikatz, DCSync, kerberoasting, LSASS dump, etc.) can pass-the-
+    hash to every other account that shares it - including across
+    privilege tiers if a low-tier account happens to share a password
+    with a high-tier one.
+  - Service accounts and admin accounts that share a password with
+    user accounts are an immediate lateral-movement path.
+  - Password reuse across users defeats lockout, auditing per-user
+    accountability, and any "rotate one account's password" response.
+
+Each blank-line-separated block below is one group of accounts that
+share the same NTLM hash (i.e. the same password):
+
+---------------------------------------------------------------------
+
+"@
             $fileContent += ($bodyLines -join "`n")
         }
         else {
@@ -4459,7 +4987,7 @@ function New-ReportsFolder {
         }
 
         if (-not $dnsIps -or @($dnsIps).Count -eq 0) {
-            throw "Could not detect a DNS server from local NIC DNS settings, and local host does not appear to be a DNS server."
+            return $null
         }
 
         foreach ($ip in $dnsIps) {
@@ -4473,22 +5001,33 @@ function New-ReportsFolder {
     }
 
     # ----------------------------
-    # Preflight module
+    # Preflight module - skip the check gracefully if the DnsServer module
+    # isn't available or the target server is unreachable. We previously
+    # threw here, which aborted every subsequent ADAudit check. Now we log
+    # and return so the script can continue with the rest of the audit.
     # ----------------------------
     $dnsModule = Safe-Get -Context "Preflight: Get-Module DnsServer" -Default $null -Script {
         Get-Module -ListAvailable -Name DnsServer | Sort-Object Version -Descending | Select-Object -First 1
     }
-    if (-not $dnsModule) { throw "DnsServer module not found. Install DNS role tools / RSAT DNS (DnsServer) on this host." }
+    if (-not $dnsModule) {
+        Write-Warning "DnsServer module not found. Install DNS role tools / RSAT DNS (DnsServer) on this host. DNS zone report will be skipped."
+        throw "DnsServer module not available - DNS zone report skipped."
+    }
 
     Import-ADAuditModule -Name DnsServer -Required | Out-Null
 
     $ComputerName = Get-TargetDnsServer
+    if (-not $ComputerName) {
+        Write-Warning "Could not detect a DNS server from local NIC DNS settings, and local host does not appear to be a DNS server. DNS zone report will be skipped."
+        throw "DNS server target could not be detected - DNS zone report skipped."
+    }
 
     $serverInfo = Safe-Get -Context "Preflight: Get-DnsServer -ComputerName $ComputerName" -Default $null -Script {
         Get-DnsServer -ComputerName $ComputerName -ErrorAction Stop
     }
     if (-not $serverInfo) {
-        throw "Unable to query DNS server '$ComputerName'. Check connectivity, firewall/RPC, permissions, and that DNS Server role is present."
+        Write-Warning "Unable to query DNS server '$ComputerName'. Check connectivity, firewall/RPC, permissions, and that DNS Server role is present. DNS zone report will be skipped."
+        throw "Unable to query DNS server '$ComputerName' - DNS zone report skipped."
     }
 
     # ----------------------------
@@ -5183,8 +5722,117 @@ $(Get-ADAuditReportFooter)
     # Fix ConvertTo-Html <table> to use <thead>/<tbody>
     $zonesHtml = $zonesHtml -replace '<table>\s*<tr><th','<table><thead><tr><th' -replace '</th></tr>\s*<tr><td','</th></tr></thead><tbody><tr><td' -replace '</td></tr>\s*</table>','</td></tr></tbody></table>'
 
-    $findingsHtml = (($topFindings | Select-Object Name, Count) | ConvertTo-Html -Fragment)
-    $findingsHtml = $findingsHtml -replace '<table>\s*<tr><th','<table><thead><tr><th' -replace '</th></tr>\s*<tr><td','</th></tr></thead><tbody><tr><td' -replace '</td></tr>\s*</table>','</td></tr></tbody></table>'
+    # ----------------------------
+    # Findings by Issue (grouped) - replaces the old "Top Findings" mini-table.
+    # Each row in this section is one DISTINCT issue, with severity, why-it-
+    # matters, recommended fix, and the list of zones it affects (collapsed
+    # into a <details> block so the page is short for the operator and only
+    # expands on click). This is the section the user actually reads to
+    # understand WHAT is wrong, WHY, and WHICH zones to fix.
+    # ----------------------------
+    $issueExplain = @{
+        'Dynamic updates: non-secure updates allowed.' = @{
+            Severity = 'High'
+            Why      = 'Any client (including unauthenticated/rogue hosts) can register or overwrite DNS records, enabling DNS spoofing, MITM, and credential theft via WPAD/NetBIOS poisoning.'
+            Fix      = 'Set the zone Dynamic updates to "Secure only" (DNS Manager: Zone Properties > General). Requires AD-integrated zone.'
+        }
+        'Zone transfers: allowed to any server.' = @{
+            Severity = 'High'
+            Why      = 'Anyone on the network can pull the entire zone (all hostnames, IPs, comments) - a full reconnaissance gift for attackers.'
+            Fix      = 'Restrict zone transfers to specific authorized secondaries (DNS Manager: Zone Properties > Zone Transfers > Only to servers listed on the Name Servers tab, or an explicit IP list).'
+        }
+        'Zone transfer security (SecureSecondaries) is disabled.' = @{
+            Severity = 'Medium'
+            Why      = 'Zone transfers are not restricted to the configured secondary list, expanding the attack surface for zone enumeration.'
+            Fix      = 'Enable secure secondaries on the zone or restrict transfers to an explicit IP allow-list.'
+        }
+        'Zone is not AD-integrated.' = @{
+            Severity = 'Medium'
+            Why      = 'File-backed (Standard Primary) zones store data in plain text on disk and lack AD replication, ACLs, and Secure dynamic updates. Sensitive internal zones should not run as Standard Primary.'
+            Fix      = 'Convert internal zones to AD-integrated (DNS Manager: Zone Properties > General > Change > "Store the zone in Active Directory"). Forwarder/Stub zones are excluded.'
+        }
+        'Aging/Scavenging: disabled.' = @{
+            Severity = 'Medium'
+            Why      = 'Stale dynamic records accumulate over time, which causes name-resolution drift, leaks decommissioned host names to attackers, and inflates zone size.'
+            Fix      = 'Enable aging on the zone and ensure server-level scavenging is on (No-Refresh + Refresh intervals typically 7 days each). Validate operational impact in a maintenance window first.'
+        }
+        'Zone aging enabled but server scavenging appears disabled/unknown.' = @{
+            Severity = 'Low'
+            Why      = 'Per-zone aging is on, but no server is actually deleting expired records, so the aging timestamps build up without effect.'
+            Fix      = 'Enable scavenging at the DNS server level (DNS Manager: Server Properties > Advanced > Enable automatic scavenging of stale records).'
+        }
+        'Dynamic updates: disabled.' = @{
+            Severity = 'Low'
+            Why      = 'Records are static-only. Not a security risk, but flag it because clients that expected to register will fail silently. Often correct for forward-only or manually-curated zones.'
+            Fix      = 'No action if intentional. If the zone is expected to accept registrations, switch to Secure dynamic updates (AD-integrated zones only).'
+        }
+        'Dynamic updates: unknown (property not available).' = @{
+            Severity = 'Low'
+            Why      = 'The DNS module did not expose the dynamic-update property for this zone (typical for Forwarder/Stub zones, which do not register records). Worth confirming in DNS Manager for completeness.'
+            Fix      = 'Open DNS Manager > Zone Properties > General and confirm the Dynamic updates setting matches policy. Forwarder zones can be ignored.'
+        }
+    }
+
+    function _Get-IssueMeta {
+        param([string]$Issue)
+        if ($issueExplain.ContainsKey($Issue)) { return $issueExplain[$Issue] }
+        @{ Severity = 'Medium'; Why = '(no canonical explanation registered for this issue)'; Fix = 'Review the affected zone settings in DNS Manager.' }
+    }
+
+    # Build per-issue groupings: issue string -> {affected zones, severity, etc}
+    $issueGroups = @{}
+    foreach ($r in $rows) {
+        $issuesForRow = @($r._IssueList)
+        foreach ($issue in $issuesForRow) {
+            if (-not $issue) { continue }
+            if (-not $issueGroups.ContainsKey($issue)) {
+                $meta = _Get-IssueMeta -Issue $issue
+                $issueGroups[$issue] = [pscustomobject]@{
+                    Issue    = $issue
+                    Severity = $meta.Severity
+                    Why      = $meta.Why
+                    Fix      = $meta.Fix
+                    Zones    = New-Object System.Collections.Generic.List[string]
+                }
+            }
+            [void]$issueGroups[$issue].Zones.Add([string]$r.ZoneName)
+        }
+    }
+
+    $sevOrder = @{ 'High' = 0; 'Medium' = 1; 'Low' = 2; 'Information' = 3 }
+    $issueGroupList = @($issueGroups.Values |
+        Sort-Object @{Expression={$sevOrder[$_.Severity]}}, @{Expression={-1 * $_.Zones.Count}}, Issue)
+
+    $findingsByIssueHtml = New-Object System.Text.StringBuilder
+    if (@($issueGroupList).Count -eq 0) {
+        [void]$findingsByIssueHtml.Append('<p>No DNS zone issues detected.</p>')
+    } else {
+        foreach ($g in $issueGroupList) {
+            $badgeCls = switch ($g.Severity) { 'High' { 'badge-high' } 'Medium' { 'badge-medium' } 'Low' { 'badge-low' } default { 'badge-info' } }
+            $zoneCount = $g.Zones.Count
+            $zoneListHtml = ($g.Zones | Sort-Object | ForEach-Object { "<li><code>$_</code></li>" }) -join "`n"
+            $whyEnc = [System.Web.HttpUtility]::HtmlEncode($g.Why)
+            $fixEnc = [System.Web.HttpUtility]::HtmlEncode($g.Fix)
+            $issueEnc = [System.Web.HttpUtility]::HtmlEncode($g.Issue)
+            [void]$findingsByIssueHtml.Append(@"
+<details>
+<summary><span class="badge $badgeCls">$($g.Severity)</span> &nbsp; $issueEnc &nbsp;&mdash;&nbsp; <strong>$zoneCount zone(s)</strong></summary>
+<div class="detail-body">
+<p><strong>Why this matters:</strong> $whyEnc</p>
+<p><strong>How to fix:</strong> $fixEnc</p>
+<p><strong>Affected zones ($zoneCount):</strong></p>
+<ul>
+$zoneListHtml
+</ul>
+</div>
+</details>
+"@)
+        }
+    }
+
+    # Try to load HttpUtility for HTML encoding (Add-Type may need to be invoked).
+    # Some PS hosts already have it; if not, it's loaded via System.Web here.
+    try { [void][System.Web.HttpUtility] } catch { Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue }
 
 @"
 $(Get-ADAuditReportHeader -Title 'DNS Audit Report')
@@ -5204,14 +5852,28 @@ Zones: Total=$totalZones, High=$high, Medium=$medium, Low=$low &mdash;
 <div class="stat"><div class="val" style="color:var(--low)">$low</div><div class="lbl">Low Risk</div></div>
 </div>
 
+<h2>How to read this report</h2>
+<p>This report has three sections:</p>
+<ol>
+  <li><strong>Server Posture</strong> - configuration of the DNS server itself (recursion, forwarders, scavenging).</li>
+  <li><strong>Findings by Issue</strong> - one entry per distinct DNS misconfiguration with severity, the security risk it creates, the recommended fix, and the list of zones it affects. <em>Start here.</em></li>
+  <li><strong>Zone Details (raw)</strong> - the full per-zone table for cross-reference. Collapsed by default.</li>
+</ol>
+
 <h2>Server Posture <span class="badge $riskBadgeClass">$($serverRisk.RiskLevel) (Score: $($serverRisk.RiskScore))</span></h2>
 $serverSummaryHtml
 
-<h2>Top Findings</h2>
-$findingsHtml
+<h2>Findings by Issue</h2>
+<p>One entry per distinct issue type. Click each row to see the affected zones and the recommended fix.</p>
+$($findingsByIssueHtml.ToString())
 
-<h2>Zone Details</h2>
+<h2>Zone Details (raw)</h2>
+<details>
+<summary>Show full per-zone table ($totalZones zones)</summary>
+<div class="detail-body">
 $zonesHtml
+</div>
+</details>
 
 $(Get-ADAuditReportFooter)
 "@ | Set-Content -Encoding UTF8 -Path $htmlPath
@@ -5262,6 +5924,10 @@ function Invoke-DelegatedPermissionsReport {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     Import-ADAuditModule -Name ActiveDirectory -Required | Out-Null
+
+    # System.Web is needed later for HtmlEncode in the HTML index. Loading
+    # it once up front avoids a per-call Add-Type and keeps strict-mode happy.
+    try { [void][System.Web.HttpUtility] } catch { Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue }
 
     # Timestamped folders
     $ts   = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -5441,27 +6107,11 @@ function Invoke-DelegatedPermissionsReport {
           InheritanceFlags      = $ace.InheritanceFlags
         })
       }
-
-      # Per-scope TXT summary grouped by trustee
-      $safeName = ($dn -replace '[=,]','_') -replace '[^\w\.-]','_'
-      $perScope = $records | Where-Object { $_.ScopeDN -eq $dn }
-      $txt = @()
-      $txt += "Delegated Permissions for ${scopeType}: $dn"
-      $txt += ('=' * 80)
-      foreach ($grp in ($perScope | Group-Object Trustee)) {
-        $first = $grp.Group | Select-Object -First 1
-        $txt += "Trustee: $($grp.Name)  [$($first.TrusteeType)]"
-        foreach ($r in $grp.Group) {
-          $txt += "  Rights: $($r.ActiveDirectoryRights)  Type: $($r.AccessControlType)"
-          if ($r.AppliesToClass)    { $txt += "  Class:    $($r.AppliesToClass)" }
-          if ($r.AppliesToProperty) { $txt += "  Property: $($r.AppliesToProperty)" }
-          $txt += "  Inheritance: $($r.InheritanceType)  InheritFlags: $($r.InheritanceFlags)  PropFlags: $($r.PropagationFlags)"
-        }
-        $txt += ""
-      }
-      $txtPath = Join-Path -Path $ouDir -ChildPath "ADAudit_$safeName.txt"
-      $txt -join [Environment]::NewLine | Out-File -FilePath $txtPath -Encoding UTF8
-      Write-Host "Wrote: $txtPath"
+      # NOTE: Per-scope .txt files are no longer written here. They previously
+      # duplicated the same data already in the per-scope .csv (and we ended up
+      # with 73+ pairs of .txt/.csv files in OUs/, which made the report folder
+      # hard to navigate). A single consolidated, sectioned summary is written
+      # instead - see ADAudit_PerScopeSummary.txt later in this function.
     }
 
     # De-duplicate identical ACE rows to reduce noise
@@ -5516,51 +6166,165 @@ function Invoke-DelegatedPermissionsReport {
     $highRisk | Export-Csv -NoTypeInformation -Path $highCsv -Encoding UTF8
     Write-Host "High-Risk CSV:  $highCsv"
 
-    # Risk assessment
-    $riskItems = @()
-    $riskItems += "Delegated Permissions Risk Assessment"
-    $riskItems += ('=' * 80)
-    $riskItems += "Timestamp: $(Get-Date -Format o)"
-    $riskItems += "Total ACE records analyzed: $($records.Count)"
-    $riskItems += ""
-    $riskItems += "1. Over-delegation (GenericAll / WriteDacl / DeleteTree): $cntOver"
-    if ($cntOver -gt 0) {
-      $sampleTrustees = ($overDelegations | Select-Object -Expand Trustee | Sort-Object -Unique | Select-Object -First 10) -join ', '
-      $riskItems += "   Sample trustees: $sampleTrustees"
-    }
-    $riskItems += "2. Account Operators present: $cntAcctOps  | Print Operators present: $cntPrintOps"
-    $riskItems += "3. Exchange broad delegations: $cntExchange"
-    $riskItems += "4. Service account elevated delegations: $cntSvc"
-    $riskItems += "5. Unknown / unresolved SIDs: $cntUnknownSids"
-    if ($cntUnknownSids -gt 0) { $riskItems += "   SIDs: $($unknownSids -join ', ')" }
-    $riskItems += "6. Group membership modification rights (WriteProperty member): $cntMemberCtrl"
-    $riskItems += "7. Legacy Pre-Windows 2000 Compatible Access ACEs: $cntPreWin2k"
-    $riskItems += "8. LAPS password read delegations: $cntLaps"
-    $riskItems += "9. Computer object creation rights (CreateChild on computer): $cntComputerCreate"
-    $riskItems += ""
+    # ----------------------------
+    # Risk Assessment - structured by SEVERITY so the operator can read top-down:
+    # CRITICAL findings first (act now), HIGH next, MEDIUM/LOW after. Each
+    # finding now carries: severity, what is wrong, why it matters (security
+    # impact), how to fix it, and a sample of trustees / scopes to look at.
+    # The old report listed nine numbered items with no severity grouping and
+    # no "what to do" guidance per item, which made it hard to prioritise.
+    # ----------------------------
+    $findings = New-Object System.Collections.Generic.List[object]
 
-    $riskLevel = if ($cntOver -gt 50 -or $cntSvc -gt 30 -or $cntMemberCtrl -gt 40) { 'High' }
-                 elseif ($cntOver -gt 10 -or $cntSvc -gt 10) { 'Medium' }
-                 else { 'Low' }
-    $riskItems += "Overall qualitative risk level: $riskLevel"
-    $riskItems += ""
-    $riskItems += "Key Observations:"
-    if ($cntOver -gt 0)       { $riskItems += " - Broad rights (GenericAll/WriteDacl/DeleteTree) increase takeover and lateral movement risk." }
-    if ($cntAcctOps -gt 0)    { $riskItems += " - Account Operators delegation can indirectly create privileged paths; often should be empty." }
-    if ($cntExchange -gt 0)   { $riskItems += " - Exchange security groups hold rights beyond mail scope; review least privilege." }
-    if ($cntSvc -gt 0)        { $riskItems += " - Service accounts with write/create rights enable SPN abuse and escalation." }
-    if ($cntUnknownSids -gt 0){ $riskItems += " - Unknown SIDs may be orphaned or foreign; validate and remove if unnecessary." }
-    if ($cntMemberCtrl -gt 0) { $riskItems += " - Write access to group 'member' permits escalation via nesting." }
-    if ($cntComputerCreate -gt 0){ $riskItems += " - Excessive computer creation rights can enable RBCD abuse." }
-    if ($cntLaps -gt 0)       { $riskItems += " - LAPS password read delegations increase credential exposure." }
-    if ($cntPreWin2k -gt 0)   { $riskItems += " - Legacy read groups expand enumeration; prune if not required." }
-    $riskItems += ""
+    function _Add-Finding {
+        param(
+            [Parameter(Mandatory)][string]$Severity,
+            [Parameter(Mandatory)][string]$Title,
+            [Parameter(Mandatory)][int]$Count,
+            [Parameter(Mandatory)][string]$Why,
+            [Parameter(Mandatory)][string]$Fix,
+            [string[]]$Samples = @()
+        )
+        $findings.Add([pscustomobject]@{
+            Severity = $Severity
+            Title    = $Title
+            Count    = $Count
+            Why      = $Why
+            Fix      = $Fix
+            Samples  = $Samples
+        }) | Out-Null
+    }
+
+    if ($cntOver -gt 0) {
+        $sev = if ($cntOver -gt 50) { 'CRITICAL' } elseif ($cntOver -gt 10) { 'HIGH' } else { 'MEDIUM' }
+        $samples = @($overDelegations | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
+        _Add-Finding -Severity $sev -Title 'Over-delegation: GenericAll / WriteDacl / DeleteTree' -Count $cntOver `
+            -Why 'These rights let the trustee fully control or take ownership of the affected OU, which is equivalent to administrative access on every object below it. A single account or group with GenericAll on a Tier0 OU is a domain-takeover path.' `
+            -Fix 'Replace these delegations with task-specific rights (e.g. ResetPassword, ReadPwdLastSet) scoped to the smallest necessary container. Document the business justification for any remaining GenericAll delegation.' `
+            -Samples $samples
+    }
+    if ($cntMemberCtrl -gt 0) {
+        $sev = if ($cntMemberCtrl -gt 40) { 'CRITICAL' } elseif ($cntMemberCtrl -gt 5) { 'HIGH' } else { 'MEDIUM' }
+        $samples = @($membershipControl | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
+        _Add-Finding -Severity $sev -Title 'Group membership modification rights (WriteProperty on member)' -Count $cntMemberCtrl `
+            -Why 'Allows the trustee to add/remove accounts from arbitrary groups - a direct privilege-escalation vector if it leads to Tier0 groups (Domain/Enterprise Admins) via nested membership.' `
+            -Fix 'Restrict member-write to controlled, audited group-admin roles. Never grant member-write on Tier0 groups except via JIT/PIM.' `
+            -Samples $samples
+    }
+    if ($cntLaps -gt 0) {
+        $samples = @($lapsRead | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
+        _Add-Finding -Severity 'HIGH' -Title 'LAPS password read delegations' -Count $cntLaps `
+            -Why 'Trustees with read access to ms-Mcs-AdmPwd / msLAPS-Password can recover the local-administrator password of every computer covered by the delegation. This is full local-admin on those endpoints.' `
+            -Fix 'Limit LAPS read to a small, monitored helpdesk/Tier1 group. Audit each existing reader and remove anything outside that group. Monitor all reads.' `
+            -Samples $samples
+    }
+    if ($cntComputerCreate -gt 0) {
+        $samples = @($computerCreate | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
+        _Add-Finding -Severity 'HIGH' -Title 'Computer object creation rights (CreateChild for computer class)' -Count $cntComputerCreate `
+            -Why 'Trustees who can create computer objects can join arbitrary machines to the domain and chain that into Resource-Based Constrained Delegation (RBCD) attacks for privilege escalation.' `
+            -Fix 'Constrain computer creation to a dedicated join service account with a low MachineAccountQuota (or 0). Never grant CreateChild=computer to broad groups.' `
+            -Samples $samples
+    }
+    if ($cntAcctOps -gt 0) {
+        _Add-Finding -Severity 'HIGH' -Title 'BUILTIN\Account Operators delegations present' -Count $cntAcctOps `
+            -Why 'Account Operators can manage users/groups/computers in most of the domain - Microsoft explicitly recommends this group be empty. Membership and ACEs through it indirectly create privileged paths.' `
+            -Fix 'Remove BUILTIN\Account Operators delegations from OUs unless explicitly required and reviewed. Replace with narrow, task-specific delegations.' `
+            -Samples @()
+    }
+    if ($cntSvc -gt 0) {
+        $sev = if ($cntSvc -gt 30) { 'HIGH' } else { 'MEDIUM' }
+        $samples = @($serviceAcctDelegations | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
+        _Add-Finding -Severity $sev -Title 'Service account elevated delegations' -Count $cntSvc `
+            -Why 'Service accounts (svc-*, DJ-*, DomainJoin*) holding write/create rights are an attractive target - if compromised they can be used for SPN-based attacks (Kerberoasting), RBCD, and lateral movement.' `
+            -Fix 'Apply least privilege per service account, rotate passwords, prefer Group Managed Service Accounts (gMSA), and tier them so they cannot reach Tier0 objects.' `
+            -Samples $samples
+    }
+    if ($cntExchange -gt 0) {
+        _Add-Finding -Severity 'MEDIUM' -Title 'Exchange security group delegations' -Count $cntExchange `
+            -Why 'Exchange Trusted Subsystem / Organization Management / Exchange Windows Permissions traditionally hold rights well beyond mail scope. They have historically been a path to domain compromise (CVE-2019-0683 et al).' `
+            -Fix 'Review these ACLs against Microsoft Exchange Split Permissions and remove anything not required by the current Exchange version. Replace any GenericAll with the documented minimum.' `
+            -Samples @()
+    }
+    if ($cntUnknownSids -gt 0) {
+        _Add-Finding -Severity 'MEDIUM' -Title 'Unknown / unresolved SIDs in ACLs' -Count $cntUnknownSids `
+            -Why 'A SID that no longer resolves to a principal is usually orphaned (deleted account, deleted trust). Each one is dead weight in the ACL and complicates audits, but a foreign-domain SID could also indicate an unexpected trust relationship.' `
+            -Fix 'For each SID, verify whether it belongs to a deleted local principal or a foreign domain, then remove the ACE. Do NOT bulk-delete without verification.' `
+            -Samples @($unknownSids | Select-Object -First 10)
+    }
+    if ($cntPrintOps -gt 0) {
+        _Add-Finding -Severity 'MEDIUM' -Title 'BUILTIN\Print Operators delegations present' -Count $cntPrintOps `
+            -Why 'Print Operators can load device drivers and historically have been abused (e.g. PrintNightmare, SpoolSample). Microsoft recommends keeping the group empty.' `
+            -Fix 'Remove Print Operators delegations from OUs unless required. Empty the group where possible; replace with explicit, scoped delegations.' `
+            -Samples @()
+    }
+    if ($cntPreWin2k -gt 0) {
+        _Add-Finding -Severity 'LOW' -Title 'Legacy Pre-Windows 2000 Compatible Access ACEs' -Count $cntPreWin2k `
+            -Why 'Pre-Windows 2000 Compatible Access expands anonymous/legacy read scope. Modern environments should not need it.' `
+            -Fix 'Decommission Pre-Windows 2000 Compatible Access ACEs if no legacy systems require them. Validate downstream impact in a maintenance window first.' `
+            -Samples @()
+    }
+
+    # Sort findings by severity (CRITICAL > HIGH > MEDIUM > LOW > INFORMATIONAL)
+    $sevRank = @{ 'CRITICAL'=0; 'HIGH'=1; 'MEDIUM'=2; 'LOW'=3; 'INFORMATIONAL'=4 }
+    $findings = @($findings | Sort-Object @{Expression={$sevRank[$_.Severity]}}, @{Expression={-1 * $_.Count}}, Title)
+
+    $criticalCount = @($findings | Where-Object { $_.Severity -eq 'CRITICAL' }).Count
+    $highCount     = @($findings | Where-Object { $_.Severity -eq 'HIGH' }).Count
+    $medCount      = @($findings | Where-Object { $_.Severity -eq 'MEDIUM' }).Count
+    $lowCount      = @($findings | Where-Object { $_.Severity -eq 'LOW' }).Count
+
+    $overallRisk = if ($criticalCount -gt 0) { 'CRITICAL' }
+                   elseif ($highCount -gt 0) { 'HIGH' }
+                   elseif ($medCount  -gt 0) { 'MEDIUM' }
+                   elseif ($lowCount  -gt 0) { 'LOW' }
+                   else { 'CLEAN' }
+
+    $riskSb = New-Object System.Text.StringBuilder
+    [void]$riskSb.AppendLine('=====================================================================')
+    [void]$riskSb.AppendLine(' DELEGATED PERMISSIONS RISK ASSESSMENT')
+    [void]$riskSb.AppendLine('=====================================================================')
+    [void]$riskSb.AppendLine(" Generated         : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$riskSb.AppendLine(" Scopes analysed   : $(@($scopes).Count)")
+    [void]$riskSb.AppendLine(" ACE records       : $($records.Count)")
+    [void]$riskSb.AppendLine(" Overall risk      : $overallRisk")
+    [void]$riskSb.AppendLine(" Findings (CRITICAL/HIGH/MEDIUM/LOW): $criticalCount / $highCount / $medCount / $lowCount")
+    [void]$riskSb.AppendLine('---------------------------------------------------------------------')
+    [void]$riskSb.AppendLine('')
+    [void]$riskSb.AppendLine('How to read this file:')
+    [void]$riskSb.AppendLine(' - Findings are sorted by severity. Work CRITICAL/HIGH first.')
+    [void]$riskSb.AppendLine(' - Each finding has: WHY (the security impact) and FIX (the action).')
+    [void]$riskSb.AppendLine(' - For the per-account/per-OU breakdown of any finding, open the')
+    [void]$riskSb.AppendLine('   matching file in OUs/ (.csv) or All/ADAudit_HighRisk_*.csv.')
+    [void]$riskSb.AppendLine('')
+
+    if ($findings.Count -eq 0) {
+        [void]$riskSb.AppendLine('No findings detected against the heuristic baseline. This does not')
+        [void]$riskSb.AppendLine('replace a manual ACL review - it only means the patterns this')
+        [void]$riskSb.AppendLine('script tests for were not present.')
+        [void]$riskSb.AppendLine('')
+    } else {
+        $idx = 0
+        foreach ($f in $findings) {
+            $idx++
+            [void]$riskSb.AppendLine(("[{0}/{1}] [{2}] {3}" -f $idx, $findings.Count, $f.Severity, $f.Title))
+            [void]$riskSb.AppendLine("    Count : $($f.Count) ACE records")
+            [void]$riskSb.AppendLine("    Why   : $($f.Why)")
+            [void]$riskSb.AppendLine("    Fix   : $($f.Fix)")
+            if ($f.Samples -and $f.Samples.Count -gt 0) {
+                [void]$riskSb.AppendLine("    Sample: $((($f.Samples | Select-Object -First 10) -join ', '))")
+            }
+            [void]$riskSb.AppendLine('')
+        }
+    }
 
     $riskPath = Join-Path $base 'ADAudit_RiskAssessment.txt'
-    $riskItems -join [Environment]::NewLine | Out-File -FilePath $riskPath -Encoding UTF8
+    Set-Content -LiteralPath $riskPath -Value $riskSb.ToString() -Encoding UTF8
     Write-Host "Wrote: $riskPath"
 
-    # Recommendations (always generate)
+    # ----------------------------
+    # Recommendations - keep the existing prioritized action list (it's the
+    # generic playbook that maps to the findings above).
+    # ----------------------------
     $rec = @()
     $rec += "Delegated Permissions Recommendations"
     $rec += ('=' * 80)
@@ -5588,6 +6352,57 @@ function Invoke-DelegatedPermissionsReport {
     $rec -join [Environment]::NewLine | Out-File -FilePath $recPath -Encoding UTF8
     Write-Host "Wrote: $recPath"
 
+    # ----------------------------
+    # Single consolidated per-scope summary that REPLACES the 73+ per-OU .txt
+    # files we used to drop in OUs/. This is the human-readable companion to
+    # the per-OU .csv files - one document, sorted by scope, grouped by
+    # trustee, with rights inline. Use the .csv files when you need to filter
+    # or pivot in Excel; this file is for reading top-down.
+    # ----------------------------
+    $perScopeSb = New-Object System.Text.StringBuilder
+    [void]$perScopeSb.AppendLine('=====================================================================')
+    [void]$perScopeSb.AppendLine(' DELEGATED PERMISSIONS - PER-SCOPE SUMMARY (HUMAN READABLE)')
+    [void]$perScopeSb.AppendLine('=====================================================================')
+    [void]$perScopeSb.AppendLine(" Generated  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$perScopeSb.AppendLine(" Scopes     : $(@($scopes).Count)")
+    [void]$perScopeSb.AppendLine(" ACE records: $($records.Count)")
+    [void]$perScopeSb.AppendLine('---------------------------------------------------------------------')
+    [void]$perScopeSb.AppendLine(' For machine-readable output use OUs\ADAudit_*.csv (one per scope) or')
+    [void]$perScopeSb.AppendLine(' All\ADAudit_AllScopes_*.csv (everything in one CSV).')
+    [void]$perScopeSb.AppendLine('---------------------------------------------------------------------')
+    [void]$perScopeSb.AppendLine('')
+
+    $byScopeForTxt = $records | Group-Object ScopeDN | Sort-Object Name
+    foreach ($g in $byScopeForTxt) {
+        $first = $g.Group | Select-Object -First 1
+        [void]$perScopeSb.AppendLine('=====================================================================')
+        [void]$perScopeSb.AppendLine(" Scope      : $($g.Name)")
+        [void]$perScopeSb.AppendLine(" Type       : $($first.ScopeType)")
+        if ($first.CanonicalScope) {
+            [void]$perScopeSb.AppendLine(" Canonical  : $($first.CanonicalScope)")
+        }
+        [void]$perScopeSb.AppendLine(" ACE count  : $($g.Count)")
+        [void]$perScopeSb.AppendLine('---------------------------------------------------------------------')
+        foreach ($trGrp in ($g.Group | Group-Object Trustee | Sort-Object Name)) {
+            $tFirst = $trGrp.Group | Select-Object -First 1
+            [void]$perScopeSb.AppendLine("  Trustee  : $($trGrp.Name)  [$($tFirst.TrusteeType)]")
+            foreach ($r in $trGrp.Group) {
+                $line = "    {0,-20} ({1}) class={2} prop={3} inh={4}" -f `
+                    $r.ActiveDirectoryRights, $r.AccessControlType,
+                    ($(if($r.AppliesToClass){$r.AppliesToClass}else{'-'})),
+                    ($(if($r.AppliesToProperty){$r.AppliesToProperty}else{'-'})),
+                    $r.InheritanceType
+                [void]$perScopeSb.AppendLine($line)
+            }
+            [void]$perScopeSb.AppendLine('')
+        }
+        [void]$perScopeSb.AppendLine('')
+    }
+
+    $perScopePath = Join-Path $base 'ADAudit_PerScopeSummary.txt'
+    Set-Content -LiteralPath $perScopePath -Value $perScopeSb.ToString() -Encoding UTF8
+    Write-Host "Wrote: $perScopePath"
+
     # CSVs
     $masterCsv = Join-Path -Path $allDir -ChildPath "ADAudit_AllScopes_$ts.csv"
     $records | Sort-Object ScopeType,ScopeDN,Trustee | Export-Csv -NoTypeInformation -Path $masterCsv -Encoding UTF8
@@ -5599,31 +6414,82 @@ function Invoke-DelegatedPermissionsReport {
       $g.Group | Export-Csv -NoTypeInformation -Path $csvPath -Encoding UTF8
     }
 
-    # HTML index
+    # ----------------------------
+    # HTML index - now leads with the structured Findings (severity, why, fix,
+    # sample trustees) and demotes the raw scope list to a collapsed section
+    # so the operator sees risk first, scopes second.
+    # ----------------------------
+    $sevToBadge = @{
+        'CRITICAL'      = 'badge-critical'
+        'HIGH'          = 'badge-high'
+        'MEDIUM'        = 'badge-medium'
+        'LOW'           = 'badge-low'
+        'INFORMATIONAL' = 'badge-info'
+    }
+
     $index = New-Object System.Collections.Generic.List[string]
     $index.Add((Get-ADAuditReportHeader -Title 'AD Delegated Permissions Report'))
     $index.Add("<div class='hero'><h1>AD Delegated Permissions Report</h1>")
-    $index.Add("<div class='meta'>Generated: $(Get-Date -Format 'u')</div></div>")
+    $index.Add("<div class='meta'>Generated: $(Get-Date -Format 'u') &mdash; Overall risk: <strong>$overallRisk</strong></div></div>")
 
     $index.Add("<div class='stats'>")
     $index.Add("<div class='stat'><div class='val'>$($scopes.Count)</div><div class='lbl'>Scopes Analyzed</div></div>")
-    $index.Add("<div class='stat'><div class='val'>$($records.Count)</div><div class='lbl'>Total Permissions</div></div>")
-    $hrCount = if ($highRisk) { @($highRisk).Count } else { 0 }
-    $index.Add("<div class='stat'><div class='val' style='color:var(--high)'>$hrCount</div><div class='lbl'>High-Risk</div></div>")
+    $index.Add("<div class='stat'><div class='val'>$($records.Count)</div><div class='lbl'>Total ACEs</div></div>")
+    $index.Add("<div class='stat'><div class='val' style='color:var(--critical)'>$criticalCount</div><div class='lbl'>Critical</div></div>")
+    $index.Add("<div class='stat'><div class='val' style='color:var(--high)'>$highCount</div><div class='lbl'>High</div></div>")
+    $index.Add("<div class='stat'><div class='val' style='color:var(--medium)'>$medCount</div><div class='lbl'>Medium</div></div>")
+    $index.Add("<div class='stat'><div class='val' style='color:var(--low)'>$lowCount</div><div class='lbl'>Low</div></div>")
     $index.Add("</div>")
 
-    $index.Add('<h2>Scopes</h2>')
-    foreach ($dn in $scopes) {
-      $safe = ($dn -replace '[=,]','_') -replace '[^\w\.-]','_'
-      $index.Add("<details><summary><code>$dn</code></summary><div class='detail-body'><a href='OUs/ADAudit_$safe.csv'>CSV</a> &nbsp;|&nbsp; <a href='OUs/ADAudit_$safe.txt'>TXT</a></div></details>")
+    $index.Add('<h2>How to read this report</h2>')
+    $index.Add('<p>Findings are sorted by severity. Each finding tells you <strong>what is wrong</strong>, <strong>why it matters</strong> (the actual security impact), and the <strong>recommended fix</strong>. Use the per-scope CSV files at the bottom to drill into specific OUs.</p>')
+
+    $index.Add('<h2>Findings</h2>')
+    if ($findings.Count -eq 0) {
+        $index.Add('<p>No findings detected against the heuristic baseline.</p>')
+    } else {
+        foreach ($f in $findings) {
+            $badge = $sevToBadge[$f.Severity]; if (-not $badge) { $badge = 'badge-info' }
+            $titleEnc  = [System.Web.HttpUtility]::HtmlEncode($f.Title)
+            $whyEnc    = [System.Web.HttpUtility]::HtmlEncode($f.Why)
+            $fixEnc    = [System.Web.HttpUtility]::HtmlEncode($f.Fix)
+            $sampleTxt = if ($f.Samples -and $f.Samples.Count -gt 0) {
+                ($f.Samples | Select-Object -First 10 | ForEach-Object { "<li><code>$([System.Web.HttpUtility]::HtmlEncode([string]$_))</code></li>" }) -join ''
+            } else { '' }
+            $sampleBlock = if ($sampleTxt) {
+                "<p><strong>Sample trustees / SIDs:</strong></p><ul>$sampleTxt</ul>"
+            } else { '' }
+            $index.Add(@"
+<details>
+<summary><span class="badge $badge">$($f.Severity)</span> &nbsp; $titleEnc &nbsp;&mdash;&nbsp; <strong>$($f.Count) ACE records</strong></summary>
+<div class="detail-body">
+<p><strong>Why this matters:</strong> $whyEnc</p>
+<p><strong>How to fix:</strong> $fixEnc</p>
+$sampleBlock
+</div>
+</details>
+"@)
+        }
     }
 
-    $index.Add('<h2>Summary Files</h2><ul class="link-list">')
-    $index.Add("<li><a href='All/ADAudit_AllScopes_$ts.csv'>Master CSV &mdash; all scopes combined</a></li>")
-    $index.Add("<li><a href='All/ADAudit_HighRisk_$ts.csv'>High-Risk CSV &mdash; flagged permissions</a></li>")
-    $index.Add("<li><a href='ADAudit_RiskAssessment.txt'>Risk Assessment</a></li>")
-    $index.Add("<li><a href='ADAudit_Recommendations.txt'>Recommendations</a></li>")
+    try { [void][System.Web.HttpUtility] } catch { Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue }
+
+    $index.Add('<h2>Reference Files</h2><ul class="link-list">')
+    $index.Add("<li><a href='ADAudit_RiskAssessment.txt'>Risk Assessment (severity-grouped, with WHY/FIX per finding)</a></li>")
+    $index.Add("<li><a href='ADAudit_Recommendations.txt'>Recommendations (prioritised playbook)</a></li>")
+    $index.Add("<li><a href='ADAudit_PerScopeSummary.txt'>Per-Scope Summary (one human-readable file, all scopes)</a></li>")
+    $index.Add("<li><a href='All/ADAudit_AllScopes_$ts.csv'>Master CSV - all ACEs across all scopes</a></li>")
+    $index.Add("<li><a href='All/ADAudit_HighRisk_$ts.csv'>High-Risk CSV - flagged ACEs only</a></li>")
     $index.Add('</ul>')
+
+    $index.Add('<h2>Per-Scope CSV (drill-down)</h2>')
+    $index.Add('<details><summary>Show all ' + (@($scopes).Count) + ' scope CSVs</summary><div class="detail-body"><ul class="link-list">')
+    foreach ($dn in $scopes) {
+        $safe = ($dn -replace '[=,]','_') -replace '[^\w\.-]','_'
+        $dnEnc = [System.Web.HttpUtility]::HtmlEncode([string]$dn)
+        $index.Add("<li><a href='OUs/ADAudit_$safe.csv'><code>$dnEnc</code></a></li>")
+    }
+    $index.Add('</ul></div></details>')
     $index.Add((Get-ADAuditReportFooter))
     $indexPath = Join-Path $base 'index.html'
     $index -join "`r`n" | Out-File -Encoding UTF8 -FilePath $indexPath
@@ -6368,7 +7234,11 @@ Function Get-RC4OnlyAccounts {
 #   https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc
 
 "@
-    Add-Content -Path $evidencePath -Value $header
+    # Buffer evidence lines and only materialise rc4_only_accounts.txt on disk if
+    # at least one at-risk account is found. A clean run with zero findings should
+    # not leave behind a header-only file that looks like a finding.
+    $evidenceBuffer = New-Object System.Collections.Generic.List[string]
+    $evidenceBuffer.Add($header) | Out-Null
 
     # Pull all security principals that can hold a Kerberos key
     $props = @('SamAccountName','DistinguishedName','ObjectClass','Enabled','msDS-SupportedEncryptionTypes','PasswordLastSet','ServicePrincipalName','userAccountControl')
@@ -6400,9 +7270,9 @@ Function Get-RC4OnlyAccounts {
 
     if ($null -ne $domainDefault) {
         $domainDefaultHex = '0x{0:X}' -f [int]$domainDefault
-        Add-Content -Path $evidencePath -Value "# Domain DefaultDomainSupportedEncTypes (KDC fallback) = $domainDefault ($domainDefaultHex)`n"
+        $evidenceBuffer.Add("# Domain DefaultDomainSupportedEncTypes (KDC fallback) = $domainDefault ($domainDefaultHex)`n") | Out-Null
     } else {
-        Add-Content -Path $evidencePath -Value "# Domain DefaultDomainSupportedEncTypes is not set on the PDC. Using Windows OS hardcoded fallback 0x1C (AES256+AES128+RC4) for accounts with a null msDS-SupportedEncryptionTypes attribute.`n"
+        $evidenceBuffer.Add("# Domain DefaultDomainSupportedEncTypes is not set on the PDC. Using Windows OS hardcoded fallback 0x1C (AES256+AES128+RC4) for accounts with a null msDS-SupportedEncryptionTypes attribute.`n") | Out-Null
     }
 
     $rows = New-Object System.Collections.Generic.List[object]
@@ -6453,11 +7323,12 @@ Function Get-RC4OnlyAccounts {
 
             $line = "{0,-8} {1,-35} Enabled={2,-5} Raw={3,-6} Effective={4,-6} ({5}) Source={6} Supports=[{7}] PwdLastSet={8} DN={9}" -f `
                 $acct.ObjectClass, $acct.SamAccountName, $acct.Enabled, ($encType), $effective, ('0x{0:X}' -f [int]$effective), $effectiveSource, ($supported -join ','), $acct.PasswordLastSet, $acct.DistinguishedName
-            Add-Content -Path $evidencePath -Value $line
+            $evidenceBuffer.Add($line) | Out-Null
         }
     }
 
     if ($rows.Count -gt 0) {
+        Set-Content -LiteralPath $evidencePath -Value ($evidenceBuffer -join "`n") -Encoding UTF8
         $rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
         Write-Both "    [!] $($rows.Count) account(s) lack AES Kerberos support and are affected by CVE-2026-20833 RC4 hardening (KB1205)"
         Write-Both "    [!] Set msDS-SupportedEncryptionTypes to 24 (AES128+AES256) and rotate passwords - see rc4_only_accounts.txt"
@@ -6588,6 +7459,335 @@ Function Get-RC4OnlyAccounts {
     }
 }
 
+Function Test-DCPortConnectivity {
+    <#
+        Tests TCP connectivity from the running host (and, if WinRM is
+        available, from each DC) to every DC on the standard set of ports an
+        AD environment needs. Closed ports here directly limit AD
+        functionality (replication, authentication, DNS, group policy, AD
+        Web Services for the PowerShell module). LDAP/LDAPS are also flagged
+        as risk findings because plaintext LDAP enables MITM/relay attacks.
+
+        Output:
+            dc_port_connectivity.txt  - human readable findings with WHY/FIX
+            dc_port_connectivity.csv  - machine readable per-(source,target,port) rows
+        Plus a Nessus finding (KB1310) and a CheckFailures entry for each DC
+        that could not be reached at all.
+
+        WinRM dependency: cross-DC tests REQUIRE WinRM 5985/5986 to be open
+        from this host to each DC. If WinRM is unavailable we still run the
+        local-host -> DC tests and clearly note that the cross-DC matrix was
+        skipped (and why) in the output, rather than failing.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $evidencePath = Get-EvidencePath 'dc_port_connectivity.txt'
+    $csvPath      = Get-EvidencePath 'dc_port_connectivity.csv'
+    Remove-Item -LiteralPath $evidencePath,$csvPath -Force -ErrorAction SilentlyContinue
+
+    # Required port catalog. Each entry has a friendly name, a security
+    # criticality (Critical / High / Medium / Low), and a short rationale.
+    # The criticality drives both the severity in the report and how a
+    # closed port is presented to the operator (some ports are advisory,
+    # most are operationally required).
+    $portCatalog = @(
+        [pscustomobject]@{ Port=53;    Proto='tcp'; Name='DNS';                          Severity='Critical'; Why='DC must serve DNS for SRV/A records used by clients to find DCs.'; Required=$true }
+        [pscustomobject]@{ Port=88;    Proto='tcp'; Name='Kerberos';                     Severity='Critical'; Why='Kerberos AS/TGS exchanges. If blocked, no Kerberos auth happens.'; Required=$true }
+        [pscustomobject]@{ Port=135;   Proto='tcp'; Name='RPC endpoint mapper';          Severity='Critical'; Why='Endpoint mapper for AD replication, Netlogon, RPC over TCP. Without it most AD operations fail.'; Required=$true }
+        [pscustomobject]@{ Port=389;   Proto='tcp'; Name='LDAP (plaintext)';             Severity='Medium';   Why='Plaintext LDAP; required for legacy clients but should NEVER be the only AD lookup path. Channel binding/LDAP signing must be enforced.'; Required=$true }
+        [pscustomobject]@{ Port=445;   Proto='tcp'; Name='SMB';                          Severity='Critical'; Why='SYSVOL/NETLOGON shares, GPO download. Without it clients cannot apply Group Policy.'; Required=$true }
+        [pscustomobject]@{ Port=464;   Proto='tcp'; Name='Kerberos password change';     Severity='High';     Why='kpasswd. Required for password changes through Kerberos (Set-ADAccountPassword, ALTER DOMAIN PASSWORD, etc).'; Required=$true }
+        [pscustomobject]@{ Port=636;   Proto='tcp'; Name='LDAPS (LDAP over TLS)';        Severity='High';     Why='Encrypted LDAP. Required to protect bind credentials and search content. CLOSED = a real risk because plaintext LDAP can be intercepted/relayed.'; Required=$true }
+        [pscustomobject]@{ Port=3268;  Proto='tcp'; Name='Global Catalog (LDAP)';        Severity='Critical'; Why='GC queries used by Exchange, multi-domain forest auth. Closed GC breaks login in multi-domain forests.'; Required=$true }
+        [pscustomobject]@{ Port=3269;  Proto='tcp'; Name='Global Catalog (LDAPS)';       Severity='High';     Why='Encrypted GC. Same role as 3268 but over TLS. Should be open if 3268 is open.'; Required=$true }
+        [pscustomobject]@{ Port=9389;  Proto='tcp'; Name='AD Web Services (ADWS)';       Severity='High';     Why='Used by the ActiveDirectory PowerShell module and Get-AD* cmdlets. Closed ADWS breaks every PowerShell-based admin tool.'; Required=$true }
+        [pscustomobject]@{ Port=5985;  Proto='tcp'; Name='WinRM HTTP';                   Severity='Medium';   Why='Remote PowerShell. This audit script and many ops tools depend on it for cross-DC checks. Required for some cross-DC checks in THIS report.'; Required=$true }
+        [pscustomobject]@{ Port=5986;  Proto='tcp'; Name='WinRM HTTPS';                  Severity='Low';      Why='Encrypted WinRM. Optional but recommended over 5985.'; Required=$false }
+        [pscustomobject]@{ Port=139;   Proto='tcp'; Name='NetBIOS Session';              Severity='Low';      Why='Legacy NetBIOS. Modern clients use 445; can be closed if no down-level systems remain.'; Required=$false }
+        [pscustomobject]@{ Port=49152; Proto='tcp'; Name='Dynamic RPC (sample)';         Severity='High';     Why='Sample of the dynamic RPC range (49152-65535) used for AD replication, DRS, FRS/DFSR. If 49152 is closed but the RPC firewall rule is open the actual replication may still be allowed; investigate before remediating.'; Required=$true }
+    )
+
+    # Discover DCs
+    $dcs = @()
+    try {
+        $dcs = @(Get-ADDomainController -Filter * -ErrorAction Stop |
+                 Sort-Object Name |
+                 Select-Object Name,HostName,IPv4Address)
+    } catch {
+        Add-Content -Path $evidencePath -Value "ERROR: could not enumerate DCs via Get-ADDomainController: $($_.Exception.Message)"
+        Write-Both "    [!] DC port check: could not enumerate DCs: $($_.Exception.Message)"
+        return
+    }
+    if ($dcs.Count -eq 0) {
+        Add-Content -Path $evidencePath -Value 'No domain controllers were returned by Get-ADDomainController.'
+        Write-Both '    [!] DC port check: no DCs returned.'
+        return
+    }
+
+    # Helper: TCP probe with short timeout
+    function _Test-TcpPort {
+        param([string]$Target, [int]$Port, [int]$TimeoutMs = 1500)
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        try {
+            $async = $tcp.BeginConnect($Target, $Port, $null, $null)
+            $ok = $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+            if (-not $ok) { return [pscustomobject]@{ Open=$false; Error='timeout' } }
+            try { $tcp.EndConnect($async) } catch { return [pscustomobject]@{ Open=$false; Error=$_.Exception.Message } }
+            return [pscustomobject]@{ Open=$true; Error=$null }
+        } catch {
+            return [pscustomobject]@{ Open=$false; Error=$_.Exception.Message }
+        } finally {
+            try { $tcp.Close() } catch {}
+        }
+    }
+
+    # Run local probes from this host to each DC. We DNS-resolve each DC name
+    # first; if the name does not resolve we emit ONE "host unresolvable"
+    # row instead of 14 noisy "CLOSED (No such host is known)" rows. The user
+    # still gets a clear finding ("DC unreachable: name resolution failed")
+    # and we skip the per-port probes for that DC. If the name resolves but
+    # the host is down (e.g. firewall drops everything) the per-port loop
+    # still runs and produces normal closed-port findings.
+    function _Test-HostResolves {
+        param([string]$Target)
+        try {
+            $null = [System.Net.Dns]::GetHostAddresses($Target)
+            return $true
+        } catch {
+            return $false
+        }
+    }
+
+    Write-Both ("    [+] Probing {0} DC(s) from this host on {1} required ports..." -f $dcs.Count, $portCatalog.Count)
+    $rows           = New-Object System.Collections.Generic.List[object]
+    $unresolvedDcs  = New-Object System.Collections.Generic.List[string]
+    foreach ($dc in $dcs) {
+        $tgt = if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name }
+        if (-not (_Test-HostResolves -Target $tgt)) {
+            $unresolvedDcs.Add($tgt) | Out-Null
+            $rows.Add([pscustomobject]@{
+                Source     = $env:COMPUTERNAME
+                Target     = $tgt
+                Port       = 0
+                Proto      = '-'
+                PortName   = 'DC unreachable (DNS resolution failed)'
+                Severity   = 'Critical'
+                Required   = $true
+                Open       = $false
+                Error      = "Name '$tgt' did not resolve via DNS from this host."
+                Why        = 'Before any port test we resolve the DC FQDN. If resolution fails the DC cannot be queried at all - usually one of: the DNS server cannot be reached from this host, the DC is decommissioned but still listed in AD, or split-DNS is missing the record.'
+                ProbeFrom  = 'this host'
+            }) | Out-Null
+            continue
+        }
+        foreach ($p in $portCatalog) {
+            $r = _Test-TcpPort -Target $tgt -Port $p.Port
+            $rows.Add([pscustomobject]@{
+                Source     = $env:COMPUTERNAME
+                Target     = $tgt
+                Port       = $p.Port
+                Proto      = $p.Proto
+                PortName   = $p.Name
+                Severity   = $p.Severity
+                Required   = $p.Required
+                Open       = $r.Open
+                Error      = $r.Error
+                Why        = $p.Why
+                ProbeFrom  = 'this host'
+            }) | Out-Null
+        }
+    }
+    if ($unresolvedDcs.Count -gt 0) {
+        Write-Both ("    [!] {0} DC(s) could not be resolved via DNS - per-port checks skipped: {1}" -f $unresolvedDcs.Count, ($unresolvedDcs -join ', '))
+    }
+
+    # Cross-DC tests via WinRM. If WinRM is unavailable, mark cross-DC as
+    # skipped and continue (do NOT fail the whole check).
+    $crossRows = New-Object System.Collections.Generic.List[object]
+    $winrmSkippedReason = $null
+
+    $winrmAvailableDcs = @()
+    foreach ($dc in $dcs) {
+        $tgt = if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name }
+        $winrmRow = $rows | Where-Object { $_.Target -eq $tgt -and $_.Port -eq 5985 }
+        if ($winrmRow -and $winrmRow.Open) { $winrmAvailableDcs += $tgt }
+    }
+
+    if ($winrmAvailableDcs.Count -eq 0) {
+        $winrmSkippedReason = "WinRM (TCP 5985) is not reachable from this host to any DC, so we cannot run a cross-DC port matrix. Local-host probes above are still complete."
+        Write-Both "    [!] WinRM is not reachable to any DC - skipping cross-DC port matrix. $winrmSkippedReason"
+    } else {
+        Write-Both ("    [+] WinRM reachable to {0} DC(s) - running cross-DC port matrix..." -f $winrmAvailableDcs.Count)
+        # Run a probe FROM each WinRM-reachable DC TO every other DC. Drop any
+        # DC that did not resolve via DNS from this host - the remote probe
+        # would just emit "No such host is known" 14 times for it. The local
+        # "DC unreachable" row for that target already surfaces it.
+        $allTargets = @($dcs | ForEach-Object { if ($_.HostName) { [string]$_.HostName } else { [string]$_.Name } } | Where-Object { $unresolvedDcs -notcontains $_ })
+
+        foreach ($srcDc in $winrmAvailableDcs) {
+            try {
+                $remoteResults = Invoke-Command -ComputerName $srcDc -ErrorAction Stop -ArgumentList $allTargets,$portCatalog -ScriptBlock {
+                    param($Targets, $Catalog)
+                    $local = $env:COMPUTERNAME
+                    $out = New-Object System.Collections.Generic.List[object]
+                    foreach ($t in $Targets) {
+                        if ($t -eq $local -or $t -like "$local.*") { continue } # skip self
+                        foreach ($p in $Catalog) {
+                            $tcp = New-Object System.Net.Sockets.TcpClient
+                            $open = $false; $err = $null
+                            try {
+                                $async = $tcp.BeginConnect($t, [int]$p.Port, $null, $null)
+                                $ok = $async.AsyncWaitHandle.WaitOne(1500, $false)
+                                if (-not $ok) { $err = 'timeout' }
+                                else {
+                                    try { $tcp.EndConnect($async); $open = $true }
+                                    catch { $err = $_.Exception.Message }
+                                }
+                            } catch {
+                                $err = $_.Exception.Message
+                            } finally {
+                                try { $tcp.Close() } catch {}
+                            }
+                            $out.Add([pscustomobject]@{
+                                Source   = $local
+                                Target   = $t
+                                Port     = $p.Port
+                                Proto    = $p.Proto
+                                PortName = $p.Name
+                                Severity = $p.Severity
+                                Required = $p.Required
+                                Open     = $open
+                                Error    = $err
+                                Why      = $p.Why
+                                ProbeFrom = "DC '$local' (cross-DC via WinRM)"
+                            }) | Out-Null
+                        }
+                    }
+                    ,$out.ToArray()
+                }
+                if ($remoteResults) { foreach ($rr in $remoteResults) { $crossRows.Add($rr) | Out-Null } }
+            } catch {
+                Write-Both ("    [!] Cross-DC probe from {0} failed: {1}" -f $srcDc, $_.Exception.Message)
+            }
+        }
+    }
+
+    $allRows = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $rows)      { $allRows.Add($r) | Out-Null }
+    foreach ($r in $crossRows) { $allRows.Add($r) | Out-Null }
+
+    # Persist machine-readable CSV
+    if ($allRows.Count -gt 0) {
+        $allRows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+    }
+
+    # Build the human-readable evidence file
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('=====================================================================')
+    [void]$sb.AppendLine(' DOMAIN CONTROLLER PORT CONNECTIVITY')
+    [void]$sb.AppendLine('=====================================================================')
+    [void]$sb.AppendLine(" Generated      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine(" Probed from    : $env:COMPUTERNAME")
+    [void]$sb.AppendLine(" DC count       : $($dcs.Count)")
+    [void]$sb.AppendLine(" Ports per DC   : $($portCatalog.Count)")
+    [void]$sb.AppendLine(" Cross-DC probe : $(if ($winrmAvailableDcs.Count -gt 0) { 'yes via WinRM from ' + ($winrmAvailableDcs -join ', ') } else { 'SKIPPED' })")
+    if ($winrmSkippedReason) { [void]$sb.AppendLine("                  Reason: $winrmSkippedReason") }
+    [void]$sb.AppendLine('---------------------------------------------------------------------')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('How to read this file:')
+    [void]$sb.AppendLine(' - Each section below groups the closed-port findings by severity.')
+    [void]$sb.AppendLine(' - "Closed" means the TCP probe could not establish a connection from')
+    [void]$sb.AppendLine('   the named source to the named target on that port within 1.5s.')
+    [void]$sb.AppendLine(' - LDAP (389) and LDAPS (636) are special: 389 OPEN is normal but a')
+    [void]$sb.AppendLine('   risk if LDAP signing/channel-binding is not enforced; 636 CLOSED')
+    [void]$sb.AppendLine('   is treated as a real finding because it forces all LDAP to plain.')
+    [void]$sb.AppendLine('')
+
+    # Closed-port findings, grouped by severity (highest first)
+    $closed = @($allRows | Where-Object { -not $_.Open })
+    $sevOrder = @{ 'Critical'=0; 'High'=1; 'Medium'=2; 'Low'=3 }
+    $closedBySeverity = $closed | Group-Object Severity | Sort-Object @{Expression={$sevOrder[$_.Name]}}
+
+    if ($closed.Count -eq 0) {
+        [void]$sb.AppendLine('All probed ports were reachable from every probe source. No closed-port findings.')
+        [void]$sb.AppendLine('')
+    } else {
+        foreach ($g in $closedBySeverity) {
+            [void]$sb.AppendLine("[$($g.Name)] Closed ports - $($g.Count) finding(s)")
+            [void]$sb.AppendLine('---------------------------------------------------------------------')
+            $byPort = $g.Group | Group-Object PortName | Sort-Object Name
+            foreach ($pg in $byPort) {
+                $first = $pg.Group | Select-Object -First 1
+                [void]$sb.AppendLine("  Port $($first.Port)/$($first.Proto) - $($first.PortName)")
+                [void]$sb.AppendLine("    Why : $($first.Why)")
+                $fix = switch -Regex ($first.PortName) {
+                    'LDAPS' { 'Issue an LDAPS certificate to the DC (Server Authentication EKU, subject = DC FQDN), reload the DC schannel store (e.g. restart NTDS), and verify with `ldp.exe` to <DC>:636.' ; break }
+                    'LDAP \(plaintext\)' { 'LDAP itself must be open (clients still use 389). The risk is unsigned/cleartext binds. Enforce LDAP signing (HKLM\System\CurrentControlSet\Services\NTDS\Parameters\LDAPServerIntegrity=2) and channel binding (LdapEnforceChannelBinding=2) - both should already be on per the LDAPSecurity check above.' ; break }
+                    'WinRM HTTP|WinRM HTTPS' { 'Enable WinRM (`Enable-PSRemoting -Force`) or open TCP 5985/5986 on the DC firewall to the management subnet. Cross-DC checks in this audit need 5985 reachable from the audit host.' ; break }
+                    'AD Web Services' { 'Verify the ADWS service is running on the DC (`Get-Service ADWS`). Open TCP 9389 from any host that uses the ActiveDirectory PowerShell module.' ; break }
+                    'RPC endpoint' { 'Open TCP 135 from the source to the target. Most AD operations (replication, secure channel, Netlogon) start by hitting the RPC endpoint mapper here. Without it almost everything below fails.' ; break }
+                    'Dynamic RPC' { 'Open the dynamic RPC range (TCP 49152-65535) or pin a static replication port via the RPC dynamic-port restriction registry value. Sampling 49152 alone is heuristic - one closed sample does not prove the entire range is blocked.' ; break }
+                    'Kerberos password change' { 'Open TCP/UDP 464 between the DC and any host that does password changes (clients changing passwords, Set-ADAccountPassword from a remote DC).' ; break }
+                    'Kerberos\b' { 'Open TCP/UDP 88 between the source and the DC. Kerberos auth fails completely without it.' ; break }
+                    'Global Catalog' { "Open the GC port (3268 plain / 3269 TLS) from the source to the DC. Multi-domain forest logons and Exchange use GC; closed GC breaks them." ; break }
+                    'DNS\b' { 'Open TCP/UDP 53 from clients to the DC. Without it clients cannot find DCs (no SRV records).' ; break }
+                    'SMB\b' { 'Open TCP 445 between the source and the DC. SYSVOL, NETLOGON, GPO download all use SMB.' ; break }
+                    'NetBIOS' { 'TCP 139 is legacy. If only modern clients exist this is fine to leave closed; otherwise open it.' ; break }
+                    default { 'Open this port from the source to the target on the DC firewall and any path firewall.' }
+                }
+                [void]$sb.AppendLine("    Fix : $fix")
+                foreach ($r in ($pg.Group | Sort-Object Source,Target)) {
+                    $errTxt = if ($r.Error) { " ($($r.Error))" } else { '' }
+                    [void]$sb.AppendLine("    -> [$($r.ProbeFrom)] $($r.Source) -> $($r.Target):$($r.Port)  CLOSED$errTxt")
+                }
+                [void]$sb.AppendLine('')
+            }
+            [void]$sb.AppendLine('')
+        }
+    }
+
+    # LDAP / LDAPS posture summary - this is the question the user explicitly
+    # asked about. Restate it as a dedicated, easy-to-find block.
+    [void]$sb.AppendLine('=====================================================================')
+    [void]$sb.AppendLine(' LDAP / LDAPS POSTURE')
+    [void]$sb.AppendLine('=====================================================================')
+    foreach ($dc in $dcs) {
+        $tgt = if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name }
+        $ldap  = $rows | Where-Object { $_.Target -eq $tgt -and $_.Port -eq 389 }
+        $ldaps = $rows | Where-Object { $_.Target -eq $tgt -and $_.Port -eq 636 }
+        $ldapState  = if ($ldap  -and $ldap.Open)  { 'OPEN' } else { 'CLOSED' }
+        $ldapsState = if ($ldaps -and $ldaps.Open) { 'OPEN' } else { 'CLOSED' }
+        $verdict =
+            if ($ldapsState -eq 'OPEN' -and $ldapState -eq 'OPEN') { 'OK (both available - enforce LDAP signing + channel binding)' }
+            elseif ($ldapsState -eq 'OPEN' -and $ldapState -eq 'CLOSED') { 'OK (LDAPS only, plaintext blocked - rare but ideal)' }
+            elseif ($ldapsState -eq 'CLOSED' -and $ldapState -eq 'OPEN') { 'RISK: LDAPS not reachable - all LDAP traffic forced to plaintext on 389' }
+            else { 'CRITICAL: neither LDAP nor LDAPS reachable - no AD lookups possible from this host' }
+        [void]$sb.AppendLine(("  {0,-40} 389={1,-6} 636={2,-6}  =>  {3}" -f $tgt, $ldapState, $ldapsState, $verdict))
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('Notes:')
+    [void]$sb.AppendLine(' - LDAPS reachable but no certificate trusted = LDAPS effectively broken;')
+    [void]$sb.AppendLine('   the Get-LDAPSecurity check earlier in this report verifies the cert side.')
+    [void]$sb.AppendLine(' - LDAP signing + channel binding requirements live in the registry under')
+    [void]$sb.AppendLine('   HKLM\System\CurrentControlSet\Services\NTDS\Parameters (LDAPServerIntegrity,')
+    [void]$sb.AppendLine('   LdapEnforceChannelBinding). Both should be set to 2 (Required).')
+    [void]$sb.AppendLine('')
+
+    Set-Content -LiteralPath $evidencePath -Value $sb.ToString() -Encoding UTF8
+
+    $closedReq = @($closed | Where-Object { $_.Required })
+    if ($closedReq.Count -gt 0) {
+        Write-Both ("    [!] {0} required port(s) are closed across the DC fleet - see dc_port_connectivity.txt" -f $closedReq.Count)
+    } else {
+        Write-Both '    [+] All required DC ports are reachable from this host (and any cross-DC sources tested).'
+    }
+
+    try {
+        Write-Nessus-Finding "DCPortConnectivity" "KB1310" ([System.IO.File]::ReadAllText($evidencePath))
+    } catch {}
+}
+
 $outputdir = Join-Path -Path (Get-Item -Path '.').FullName -ChildPath $env:COMPUTERNAME
 $script:outputdir = $outputdir
 $starttime = Get-Date
@@ -6621,7 +7821,7 @@ $needsActiveDirectory = (
     $passwordpolicy -or $oldboxes -or $gpo -or $ouperms -or $laps -or
     $authpolsilos -or $insecurednszone -or $recentchanges -or $adcs -or
     $spn -or $asrep -or $acl -or $ldapsecurity -or $dataextract -or
-    $delegatedpermissions -or $highrisk -or $overlappinggroups -or
+    $delegatedpermissions -or $highrisk -or $overlappinggroups -or $portconnectivity -or
     (($all -and 'domainaudit' -notin $exclude) -or
      ($all -and 'trusts' -notin $exclude) -or
      ($all -and 'accounts' -notin $exclude) -or
@@ -6642,7 +7842,8 @@ $needsActiveDirectory = (
      ($all -and 'dataextract' -notin $exclude) -or
      ($all -and 'delegatedpermissions' -notin $exclude) -or
      ($all -and 'highrisk' -notin $exclude) -or
-     ($all -and 'overlappinggroups' -notin $exclude)) -or
+     ($all -and 'overlappinggroups' -notin $exclude) -or
+     ($all -and 'portconnectivity' -notin $exclude)) -or
     ('domainaudit' -in $selectedChecks) -or ('trusts' -in $selectedChecks) -or
     ('accounts' -in $selectedChecks) -or ('inactivecomputers' -in $selectedChecks) -or
     ('passwordpolicy' -in $selectedChecks) -or ('oldboxes' -in $selectedChecks) -or
@@ -6653,7 +7854,7 @@ $needsActiveDirectory = (
     ('asrep' -in $selectedChecks) -or ('acl' -in $selectedChecks) -or
     ('ldapsecurity' -in $selectedChecks) -or ('dataextract' -in $selectedChecks) -or
     ('delegatedpermissions' -in $selectedChecks) -or ('highrisk' -in $selectedChecks) -or
-    ('overlappinggroups' -in $selectedChecks)
+    ('overlappinggroups' -in $selectedChecks) -or ('portconnectivity' -in $selectedChecks)
 )
 
 $needsGroupPolicy = (
@@ -6715,49 +7916,156 @@ if ($needsActiveDirectory) {
     Write-Both "[*] Lang specific variables"
     Get-Variables
 }
-if ($installdeps) { $running = $true ; Write-Both "[*] Installing optionnal features"                           ; Install-Dependencies }
-if ($hostdetails -or ($all -and 'hostdetails' -notin $exclude) -or 'hostdetails' -in $selectedChecks) { $running = $true ; Write-Both "[*] Device Information" ; Get-HostDetails }
-if ($domainaudit -or ($all -and 'domainaudit' -notin $exclude) -or 'domainaudit' -in $selectedChecks) { $running = $true ; Write-Both "[*] Domain Audit" ; Get-LastWUDate ; Get-DCEval ; Get-TimeSource ; Get-PrivilegedGroupMembership ; Get-MachineAccountQuota; Get-DefaultDomainControllersPolicy ; Get-SMB1Support ; Get-FunctionalLevel ; Get-DCsNotOwnedByDA ; Get-ReplicationType ; Check-Shares ; Get-RecycleBinState ; Get-CriticalServicesStatus ; Get-RODC ; Get-KerberosUnconstrainedDelegation ; Get-TombstoneLifetime ; Get-PrintSpoolerOnDCs ; Get-SMBSigningStatus }
-if ($trusts -or ($all -and 'trusts' -notin $exclude) -or 'trusts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Domain Trust Audit" ; Get-DomainTrusts }
-if ($accounts -or ($all -and 'accounts' -notin $exclude) -or 'accounts' -in $selectedChecks) { $running = $true ; Write-Both "[*] Accounts Audit" ; Get-InactiveAccounts ; Get-DisabledAccounts ; Get-LockedAccounts ; Get-AdminAccountChecks ; Get-NULLSessions ; Get-PrivilegedGroupAccounts ; Get-ProtectedUsers ; Get-DomainAdminsGroupOverlap ; Get-GMSAStatus ; Get-RC4OnlyAccounts }
-if ($passwordpolicy -or ($all -and 'passwordpolicy' -notin $exclude) -or 'passwordpolicy' -in $selectedChecks) { $running = $true ; Write-Both "[*] Password Information Audit" ; Get-AccountPassDontExpire ; Get-UserPasswordNotChangedRecently ; Get-PasswordPolicy ; Get-PasswordQuality }
+if ($installdeps) {
+    $running = $true
+    Invoke-AuditCheck -Name 'InstallDependencies' -Switch 'installdeps' -Description 'Installing optionnal features' -Body { Install-Dependencies }
+}
+if ($hostdetails -or ($all -and 'hostdetails' -notin $exclude) -or 'hostdetails' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'HostDetails' -Switch 'hostdetails' -Description 'Device Information' -Body { Get-HostDetails }
+}
+if ($domainaudit -or ($all -and 'domainaudit' -notin $exclude) -or 'domainaudit' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'DomainAudit' -Switch 'domainaudit' -Description 'Domain Audit' -Body {
+        Invoke-AuditStep -Name 'Get-LastWUDate'                       -Switch 'domainaudit' -Body { Get-LastWUDate }
+        Invoke-AuditStep -Name 'Get-DCEval'                           -Switch 'domainaudit' -Body { Get-DCEval }
+        Invoke-AuditStep -Name 'Get-TimeSource'                       -Switch 'domainaudit' -Body { Get-TimeSource }
+        Invoke-AuditStep -Name 'Get-PrivilegedGroupMembership'        -Switch 'domainaudit' -Body { Get-PrivilegedGroupMembership }
+        Invoke-AuditStep -Name 'Get-MachineAccountQuota'              -Switch 'domainaudit' -Body { Get-MachineAccountQuota }
+        Invoke-AuditStep -Name 'Get-DefaultDomainControllersPolicy'   -Switch 'domainaudit' -Body { Get-DefaultDomainControllersPolicy }
+        Invoke-AuditStep -Name 'Get-SMB1Support'                      -Switch 'domainaudit' -Body { Get-SMB1Support }
+        Invoke-AuditStep -Name 'Get-FunctionalLevel'                  -Switch 'domainaudit' -Body { Get-FunctionalLevel }
+        Invoke-AuditStep -Name 'Get-DCsNotOwnedByDA'                  -Switch 'domainaudit' -Body { Get-DCsNotOwnedByDA }
+        Invoke-AuditStep -Name 'Get-ReplicationType'                  -Switch 'domainaudit' -Body { Get-ReplicationType }
+        Invoke-AuditStep -Name 'Check-Shares'                         -Switch 'domainaudit' -Body { Check-Shares }
+        Invoke-AuditStep -Name 'Get-RecycleBinState'                  -Switch 'domainaudit' -Body { Get-RecycleBinState }
+        Invoke-AuditStep -Name 'Get-CriticalServicesStatus'           -Switch 'domainaudit' -Body { Get-CriticalServicesStatus }
+        Invoke-AuditStep -Name 'Get-RODC'                             -Switch 'domainaudit' -Body { Get-RODC }
+        Invoke-AuditStep -Name 'Get-KerberosUnconstrainedDelegation'  -Switch 'domainaudit' -Body { Get-KerberosUnconstrainedDelegation }
+        Invoke-AuditStep -Name 'Get-TombstoneLifetime'                -Switch 'domainaudit' -Body { Get-TombstoneLifetime }
+        Invoke-AuditStep -Name 'Get-PrintSpoolerOnDCs'                -Switch 'domainaudit' -Body { Get-PrintSpoolerOnDCs }
+        Invoke-AuditStep -Name 'Get-SMBSigningStatus'                 -Switch 'domainaudit' -Body { Get-SMBSigningStatus }
+    }
+}
+if ($trusts -or ($all -and 'trusts' -notin $exclude) -or 'trusts' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'DomainTrusts' -Switch 'trusts' -Description 'Domain Trust Audit' -Body { Get-DomainTrusts }
+}
+if ($accounts -or ($all -and 'accounts' -notin $exclude) -or 'accounts' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'AccountsAudit' -Switch 'accounts' -Description 'Accounts Audit' -Body {
+        Invoke-AuditStep -Name 'Get-InactiveAccounts'           -Switch 'accounts' -Body { Get-InactiveAccounts }
+        Invoke-AuditStep -Name 'Get-DisabledAccounts'           -Switch 'accounts' -Body { Get-DisabledAccounts }
+        Invoke-AuditStep -Name 'Get-LockedAccounts'             -Switch 'accounts' -Body { Get-LockedAccounts }
+        Invoke-AuditStep -Name 'Get-AdminAccountChecks'         -Switch 'accounts' -Body { Get-AdminAccountChecks }
+        Invoke-AuditStep -Name 'Get-NULLSessions'               -Switch 'accounts' -Body { Get-NULLSessions }
+        Invoke-AuditStep -Name 'Get-PrivilegedGroupAccounts'    -Switch 'accounts' -Body { Get-PrivilegedGroupAccounts }
+        Invoke-AuditStep -Name 'Get-ProtectedUsers'             -Switch 'accounts' -Body { Get-ProtectedUsers }
+        Invoke-AuditStep -Name 'Get-DomainAdminsGroupOverlap'   -Switch 'accounts' -Body { Get-DomainAdminsGroupOverlap }
+        Invoke-AuditStep -Name 'Get-GMSAStatus'                 -Switch 'accounts' -Body { Get-GMSAStatus }
+        Invoke-AuditStep -Name 'Get-RC4OnlyAccounts'            -Switch 'accounts' -Body { Get-RC4OnlyAccounts }
+    }
+}
+if ($passwordpolicy -or ($all -and 'passwordpolicy' -notin $exclude) -or 'passwordpolicy' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'PasswordPolicy' -Switch 'passwordpolicy' -Description 'Password Information Audit' -Body {
+        Invoke-AuditStep -Name 'Get-AccountPassDontExpire'           -Switch 'passwordpolicy' -Body { Get-AccountPassDontExpire }
+        Invoke-AuditStep -Name 'Get-UserPasswordNotChangedRecently'  -Switch 'passwordpolicy' -Body { Get-UserPasswordNotChangedRecently }
+        Invoke-AuditStep -Name 'Get-PasswordPolicy'                  -Switch 'passwordpolicy' -Body { Get-PasswordPolicy }
+        Invoke-AuditStep -Name 'Get-PasswordQuality'                 -Switch 'passwordpolicy' -Body { Get-PasswordQuality }
+    }
+}
 if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or 'inactivecomputers' -in $selectedChecks) {
     $running = $true
-    Write-Both "[*] Inactive Computer Objects Audit"
-    Get-InactiveComputerObjects
+    Invoke-AuditCheck -Name 'InactiveComputerObjects' -Switch 'inactivecomputers' -Description 'Inactive Computer Objects Audit' -Body { Get-InactiveComputerObjects }
 }
-if ($all -or $accounts -or $overlappinggroups) {
-    Write-Both "    [+] Running overlapping group membership analysis"
-    Get-OverlappingGroupMemberships
+if (
+    $overlappinggroups -or
+    ($all      -and 'overlappinggroups' -notin $exclude) -or
+    ($accounts -and 'overlappinggroups' -notin $exclude) -or
+    'overlappinggroups' -in $selectedChecks -or
+    ('accounts' -in $selectedChecks -and 'overlappinggroups' -notin $exclude)
+) {
+    $running = $true
+    Invoke-AuditCheck -Name 'OverlappingGroupMemberships' -Switch 'overlappinggroups' -Description 'Overlapping group membership analysis' -Body { Get-OverlappingGroupMemberships }
 }
-if ($highrisk -or ($all -and 'highrisk' -notin $exclude) -or 'highrisk' -in $selectedChecks) { $running = $true ; Write-Both "[*] High-Risk AD Baseline Report" ; Get-HighRiskADBaselineReport }
-if ($oldboxes -or ($all -and 'oldboxes' -notin $exclude) -or 'oldboxes' -in $selectedChecks) { $running = $true ; Write-Both "[*] Computer Objects Audit" ; Get-OldBoxes }
-if ($gpo -or ($all -and 'gpo' -notin $exclude) -or 'gpo' -in $selectedChecks) { $running = $true ; Write-Both "[*] GPO audit (and checking SYSVOL for passwords)" ; Get-GPOtoFile ; Get-GPOsPerOU ; Get-SYSVOLXMLS; Get-GPOEnum }
-if ($ouperms -or ($all -and 'ouperms' -notin $exclude) -or 'ouperms' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check Generic Group AD Permissions" ; Get-OUPerms }
-if ($laps -or ($all -and 'laps' -notin $exclude) -or 'laps' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For Existence of LAPS in domain" ; Get-LAPSStatus }
-if ($authpolsilos -or ($all -and 'authpolsilos' -notin $exclude) -or 'authpolsilos' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For Existence of Authentication Polices and Silos" ; Get-AuthenticationPoliciesAndSilos }
-if ($insecurednszone -or ($all -and 'insecurednszone' -notin $exclude) -or 'insecurednszone' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For Existence DNS Zones allowing insecure updates" ; Get-DNSZoneInsecure }
+if ($highrisk -or ($all -and 'highrisk' -notin $exclude) -or 'highrisk' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'HighRiskBaseline' -Switch 'highrisk' -Description 'High-Risk AD Baseline Report' -Body { Get-HighRiskADBaselineReport }
+}
+if ($oldboxes -or ($all -and 'oldboxes' -notin $exclude) -or 'oldboxes' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'OldOSComputers' -Switch 'oldboxes' -Description 'Computer Objects Audit (legacy OS)' -Body { Get-OldBoxes }
+}
+if ($gpo -or ($all -and 'gpo' -notin $exclude) -or 'gpo' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'GPOAudit' -Switch 'gpo' -Description 'GPO audit (and checking SYSVOL for passwords)' -Body {
+        Invoke-AuditStep -Name 'Get-GPOtoFile'   -Switch 'gpo' -Body { Get-GPOtoFile }
+        Invoke-AuditStep -Name 'Get-GPOsPerOU'   -Switch 'gpo' -Body { Get-GPOsPerOU }
+        Invoke-AuditStep -Name 'Get-SYSVOLXMLS'  -Switch 'gpo' -Body { Get-SYSVOLXMLS }
+        Invoke-AuditStep -Name 'Get-GPOEnum'     -Switch 'gpo' -Body { Get-GPOEnum }
+    }
+}
+if ($ouperms -or ($all -and 'ouperms' -notin $exclude) -or 'ouperms' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'OUPermissions' -Switch 'ouperms' -Description 'Check Generic Group AD Permissions' -Body { Get-OUPerms }
+}
+if ($laps -or ($all -and 'laps' -notin $exclude) -or 'laps' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'LAPSStatus' -Switch 'laps' -Description 'Check For Existence of LAPS in domain' -Body { Get-LAPSStatus }
+}
+if ($authpolsilos -or ($all -and 'authpolsilos' -notin $exclude) -or 'authpolsilos' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'AuthPoliciesAndSilos' -Switch 'authpolsilos' -Description 'Check For Existence of Authentication Polices and Silos' -Body { Get-AuthenticationPoliciesAndSilos }
+}
+if ($insecurednszone -or ($all -and 'insecurednszone' -notin $exclude) -or 'insecurednszone' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'InsecureDnsZones' -Switch 'insecurednszone' -Description 'Check For Existence DNS Zones allowing insecure updates' -Body { Get-DNSZoneInsecure }
+}
 if ($dnszone -or ($all -and 'dnszone' -notin $exclude) -or 'dnszone' -in $selectedChecks) {
     $running = $true
-    Write-Both "[*] DNS Zone Report"
-    Invoke-DNSZoneReport -OutputRoot $(if($DnsZoneOutputRoot){$DnsZoneOutputRoot}else{(Get-RawDataDir -BaseRoot $outputdir)}) -IncludeRecordCounts:$DnsIncludeRecordCounts -IncludeSystemZones:$DnsIncludeSystemZones
+    Invoke-AuditCheck -Name 'DnsZoneReport' -Switch 'dnszone' -Description 'DNS Zone Report' -Body {
+        Invoke-DNSZoneReport -OutputRoot $(if($DnsZoneOutputRoot){$DnsZoneOutputRoot}else{(Get-RawDataDir -BaseRoot $outputdir)}) -IncludeRecordCounts:$DnsIncludeRecordCounts -IncludeSystemZones:$DnsIncludeSystemZones
+    }
 }
-if ($recentchanges -or ($all -and 'recentchanges' -notin $exclude) -or 'recentchanges' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check For newly created users and groups"                ; Get-RecentChanges }
-if ($spn -or ($all -and 'spn' -notin $exclude) -or 'spn' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check high value kerberoastable user accounts"           ; Get-SPNs }
-if ($asrep -or ($all -and 'asrep' -notin $exclude) -or 'asrep' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check for accounts with kerberos pre-auth"               ; Get-ADUsersWithoutPreAuth }
-if ($acl -or ($all -and 'acl' -notin $exclude) -or 'acl' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check for dangerous ACL permissions on Computers, Users and Groups"  ; Find-DangerousACLPermissions }
-if ($adcs -or ($all -and 'adcs' -notin $exclude) -or 'adcs' -in $selectedChecks) { $running = $true ; Write-Both "[*] Check for ADCS Vulnerabilities"                          ; Get-ADCSVulns }
-if ($ldapsecurity -or ($all -and 'ldapsecurity' -notin $exclude) -or 'ldapsecurity' -in $selectedChecks) { 
-    $running = $true 
-    Write-Both "[*] Check for LDAP Security Issues" 
-    Get-LDAPSecurity 
+if ($recentchanges -or ($all -and 'recentchanges' -notin $exclude) -or 'recentchanges' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'RecentChanges' -Switch 'recentchanges' -Description 'Check For newly created users and groups' -Body { Get-RecentChanges }
 }
-if ($dataextract -or ($all -and 'dataextract' -notin $exclude) -or 'dataextract' -in $selectedChecks) { $running = $true ; Write-Both "[*] AD Raw Data Extract"                          ; Export-ADAuditDataExtract }
+if ($spn -or ($all -and 'spn' -notin $exclude) -or 'spn' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'KerberoastableAccounts' -Switch 'spn' -Description 'Check high value kerberoastable user accounts' -Body { Get-SPNs }
+}
+if ($asrep -or ($all -and 'asrep' -notin $exclude) -or 'asrep' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'AsRepRoasting' -Switch 'asrep' -Description 'Check for accounts with kerberos pre-auth' -Body { Get-ADUsersWithoutPreAuth }
+}
+if ($acl -or ($all -and 'acl' -notin $exclude) -or 'acl' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'DangerousACLs' -Switch 'acl' -Description 'Check for dangerous ACL permissions on Computers, Users and Groups' -Body { Find-DangerousACLPermissions }
+}
+if ($adcs -or ($all -and 'adcs' -notin $exclude) -or 'adcs' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'ADCSVulnerabilities' -Switch 'adcs' -Description 'Check for ADCS Vulnerabilities' -Body { Get-ADCSVulns }
+}
+if ($ldapsecurity -or ($all -and 'ldapsecurity' -notin $exclude) -or 'ldapsecurity' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'LDAPSecurity' -Switch 'ldapsecurity' -Description 'Check for LDAP Security Issues' -Body { Get-LDAPSecurity }
+}
+if ($dataextract -or ($all -and 'dataextract' -notin $exclude) -or 'dataextract' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'AdDataExtract' -Switch 'dataextract' -Description 'AD Raw Data Extract' -Body { Export-ADAuditDataExtract }
+}
 if ($delegatedpermissions -or ($all -and 'delegatedpermissions' -notin $exclude) -or 'delegatedpermissions' -in $selectedChecks) {
     $running = $true
     if (-not $DelegatedOutputRoot) { $DelegatedOutputRoot = (Join-Path (Get-RawDataDir -BaseRoot $outputdir) 'DelegatedPermissions') }
-    Write-Both "[*] Delegated Permissions Report"
-    Invoke-DelegatedPermissionsReport -OutputRoot $DelegatedOutputRoot -IncludeSystemTrustees:$DelegIncludeSystemTrustees -IncludeDeny:$DelegIncludeDeny -IncludeInherited:$DelegIncludeInherited -Server $DelegServer
+    Invoke-AuditCheck -Name 'DelegatedPermissions' -Switch 'delegatedpermissions' -Description 'Delegated Permissions Report' -Body {
+        Invoke-DelegatedPermissionsReport -OutputRoot $DelegatedOutputRoot -IncludeSystemTrustees:$DelegIncludeSystemTrustees -IncludeDeny:$DelegIncludeDeny -IncludeInherited:$DelegIncludeInherited -Server $DelegServer
+    }
+}
+if ($portconnectivity -or ($all -and 'portconnectivity' -notin $exclude) -or 'portconnectivity' -in $selectedChecks) {
+    $running = $true
+    Invoke-AuditCheck -Name 'DCPortConnectivity' -Switch 'portconnectivity' -Description 'Domain Controller port connectivity check (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC)' -Body { Test-DCPortConnectivity }
 }
 if (!$running) {
     Write-Both "[!] No arguments selected"
@@ -6785,9 +8093,11 @@ if (!$running) {
     Write-Both "    -dataextract exports raw AD audit data (users/groups/computers/OUs/GPO reports/OU ACLs/FGPP/trusts) to .\<COMPUTERNAME>\Raw Data\ADExtract"
     Write-Both "    -delegatedpermissions generates an AD delegated permissions report (alias: -delegated-permissions)"
     Write-Both "        Optional: -DelegIncludeSystemTrustees -DelegIncludeDeny -DelegIncludeInherited -DelegServer <dc> -DelegatedOutputRoot <path>"
+    Write-Both "    -portconnectivity tests TCP ports DCs need (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC) from this host and (via WinRM) cross-DC. Aliases: -dcports, -dc-ports, -portcheck"
     Write-Both "    -all runs all checks, e.g. $scriptname -all"
     Write-Both "    -KeepLegacyArtifacts is retained for backward compatibility; raw data and evidence files are preserved in .\\<COMPUTERNAME>\\Raw Data by default"
 }
+Write-CheckFailuresReport -BaseRoot $outputdir
 Write-Nessus-Footer
 
 # Sanitize .nessus XML characters in-place (no duplicate file)
@@ -8888,6 +10198,20 @@ body[data-theme="dark"] .result-table th{background:#0b1220}
   function qa(sel){return Array.prototype.slice.call(document.querySelectorAll(sel));}
   function findings(){return qa('.finding');}
 
+  // Theme: explicit user choice (localStorage) wins, otherwise we follow the
+  // OS's prefers-color-scheme. Earlier the report defaulted to light no
+  // matter what the user's OS was set to; now a dark-mode workstation gets
+  // a dark report by default and the toggle button still lets the user pin
+  // either mode.
+  function osPrefersDark(){
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  function currentTheme(){
+    var stored = null;
+    try { stored = localStorage.getItem('adaudit-theme'); } catch (_) {}
+    if (stored === 'light' || stored === 'dark') return stored;
+    return osPrefersDark() ? 'dark' : 'light';
+  }
   function applyTheme(theme){
     document.body.setAttribute('data-theme', theme);
     var btn = q('#themeToggle');
@@ -8923,9 +10247,24 @@ body[data-theme="dark"] .result-table th{background:#0b1220}
     });
   }
 
-  var storedTheme = null;
-  try { storedTheme = localStorage.getItem('adaudit-theme'); } catch (e) {}
-  applyTheme(storedTheme === 'dark' ? 'dark' : 'light');
+  applyTheme(currentTheme());
+
+  // If the user has not explicitly toggled, follow the OS theme live.
+  if (window.matchMedia) {
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+    var handler = function(e){
+      var stored = null;
+      try { stored = localStorage.getItem('adaudit-theme'); } catch(_) {}
+      // localStorage was set above by applyTheme(); to honour "follow OS"
+      // we accept the most recent applyTheme value - keep it simple and
+      // only react if storage was explicitly cleared.
+      if (stored !== 'light' && stored !== 'dark') {
+        applyTheme(e.matches ? 'dark' : 'light');
+      }
+    };
+    if (mq.addEventListener) { mq.addEventListener('change', handler); }
+    else if (mq.addListener) { mq.addListener(handler); }
+  }
 
   q('#severityFilter').addEventListener('change', applyFilters);
   q('#searchFilter').addEventListener('input', applyFilters);
@@ -9446,6 +10785,70 @@ $js
         Add-FindingOnce 'High' 'Accounts not required to have a password' "Accounts: $($pqPwdNotReqLines.Count)" $pqPwdNotReqPath $score
     }
 
+    # Duplicate passwords (accounts sharing the same NTLM hash)
+    # DSInternals groups accounts that have identical NTLM hashes, which means
+    # they share the exact same plaintext password. Count both accounts and
+    # groups so the finding makes the pass-the-hash / lateral-movement risk
+    # explicit in the HTML report.
+    $pqDupPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_duplicate_passwords.txt')
+    $pqDupLines = Get-PqAccountLines $pqDupPath
+    if ($pqDupLines.Count -gt 0) {
+        $pqDupGroupCount = 0
+        try {
+            if ($pqDupPath -and (Test-Path -LiteralPath $pqDupPath)) {
+                $rawDup = Get-Content -LiteralPath $pqDupPath -ErrorAction Stop
+                $inGroup = $false
+                foreach ($rawLine in $rawDup) {
+                    $t = ([string]$rawLine).Trim()
+                    if ($t -match '^[^=\-#].*\\') {
+                        if (-not $inGroup) { $pqDupGroupCount++ ; $inGroup = $true }
+                    } else {
+                        $inGroup = $false
+                    }
+                }
+            }
+        } catch {}
+        $sev = if ($pqDupLines.Count -ge 10 -or $pqDupGroupCount -ge 3) { 'Critical' } else { 'High' }
+        $score = Score-BaselineZeroLog -Severity $sev -Observed $pqDupLines.Count -MaxAdd 30 -K 8
+        $detail = if ($pqDupGroupCount -gt 0) {
+            "Accounts: $($pqDupLines.Count) across $pqDupGroupCount group(s) - accounts in the same group share the IDENTICAL NTLM hash (same plaintext password). Risk: one credential compromise unlocks every account in the group via pass-the-hash; reused passwords across privilege tiers create direct lateral-movement paths."
+        } else {
+            "Accounts: $($pqDupLines.Count) - accounts grouped together share the same NTLM hash (same plaintext password). Risk: pass-the-hash unlocks every account in the group from a single credential compromise."
+        }
+        Add-FindingOnce $sev 'Accounts sharing the same password (identical NTLM hash)' $detail $pqDupPath $score
+    }
+
+    # Historical dictionary passwords
+    $pqHistDictPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_historical_dictionary.txt')
+    $pqHistDictLines = Get-PqAccountLines $pqHistDictPath
+    if ($pqHistDictLines.Count -gt 0) {
+        Add-FindingOnce 'Medium' 'Historical (previous) passwords found in dictionary/breach list' "Accounts: $($pqHistDictLines.Count)" $pqHistDictPath (Score-Scaled 'Medium' $pqHistDictLines.Count)
+    }
+
+    # Kerberos pre-auth not required (DSInternals view, complements ASREP.txt)
+    $pqNoPreauthPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_no_preauth.txt')
+    $pqNoPreauthLines = Get-PqAccountLines $pqNoPreauthPath
+    if ($pqNoPreauthLines.Count -gt 0) {
+        $score = Score-BaselineZeroLog -Severity 'High' -Observed $pqNoPreauthLines.Count -MaxAdd 20 -K 8
+        Add-FindingOnce 'High' 'Accounts with Kerberos pre-authentication disabled (AS-REP roastable)' "Accounts: $($pqNoPreauthLines.Count)" $pqNoPreauthPath $score
+    }
+
+    # Password never expires (DSInternals view, complements accounts_passdontexpire.txt)
+    $pqPwdNeverExpPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_password_never_expires.txt')
+    $pqPwdNeverExpLines = Get-PqAccountLines $pqPwdNeverExpPath
+    if ($pqPwdNeverExpLines.Count -gt 0) {
+        $sev = if ($pqPwdNeverExpLines.Count -ge 50) { 'High' } elseif ($pqPwdNeverExpLines.Count -ge 10) { 'Medium' } else { 'Low' }
+        Add-FindingOnce $sev 'Accounts with PasswordNeverExpires set' "Accounts: $($pqPwdNeverExpLines.Count)" $pqPwdNeverExpPath (Score-Scaled $sev $pqPwdNeverExpLines.Count)
+    }
+
+    # Kerberoastable (DSInternals view, complements SPNs.txt)
+    $pqKerbPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_kerberoastable.txt')
+    $pqKerbLines = Get-PqAccountLines $pqKerbPath
+    if ($pqKerbLines.Count -gt 0) {
+        $score = Score-BaselineZeroLog -Severity 'High' -Observed $pqKerbLines.Count -MaxAdd 20 -K 8
+        Add-FindingOnce 'High' 'Kerberoastable accounts (SPN set on user account, weak password risk)' "Accounts: $($pqKerbLines.Count)" $pqKerbPath $score
+    }
+
     # ---------------------------
     # AS-REP roastable
     # ---------------------------
@@ -9557,6 +10960,39 @@ $js
     $rc4AuthLines = Get-NonHeaderLines $rc4AuthPath
     if ($rc4AuthLines.Count -gt 0) {
         Add-FindingOnce 'High' 'Active RC4 Kerberos authentications observed' "Distinct exchanges: $($rc4AuthLines.Count)" $rc4AuthPath (Score-Scaled 'High' $rc4AuthLines.Count)
+    }
+
+    # DC port connectivity - reads the per-(source,target,port) CSV that
+    # Test-DCPortConnectivity generates and produces ONE finding per closed
+    # port name+severity combination so the HTML report makes the WHY/FIX
+    # obvious without forcing the operator to open the txt.
+    $portCsvPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dc_port_connectivity.csv')
+    $portTxtPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dc_port_connectivity.txt')
+    if ($portCsvPath -and (Test-Path -LiteralPath $portCsvPath)) {
+        $portRows = @(Get-CsvSafe $portCsvPath)
+        $closedRows = @($portRows | Where-Object { ([string]$_.Open) -in @('False','false','No','no','0') })
+        $byPortName = $closedRows | Group-Object PortName
+        foreach ($g in $byPortName) {
+            $first = $g.Group | Select-Object -First 1
+            $sev = switch ([string]$first.Severity) {
+                'Critical' { 'Critical' }
+                'High'     { 'High' }
+                'Medium'   { 'Medium' }
+                'Low'      { 'Low' }
+                default    { 'Medium' }
+            }
+            $targets = @($g.Group | Select-Object -ExpandProperty Target -Unique)
+            $detail = "Port $($first.Port)/$($first.Proto) ($($first.PortName)) closed for $($g.Count) probe(s) across $($targets.Count) target(s). See dc_port_connectivity.txt for WHY this matters and the recommended fix."
+            Add-FindingOnce $sev "DC port closed: $($first.PortName) ($($first.Port)/$($first.Proto))" $detail $portTxtPath (Score-Scaled $sev $g.Count)
+        }
+
+        # LDAPS-not-reachable specific finding (security risk, not just connectivity)
+        $ldapsClosedTargets = @($closedRows | Where-Object { [int]$_.Port -eq 636 } | Select-Object -ExpandProperty Target -Unique)
+        if ($ldapsClosedTargets.Count -gt 0) {
+            Add-FindingOnce 'High' 'LDAPS (636) not reachable - LDAP traffic forced to plaintext' `
+                "DCs without LDAPS: $($ldapsClosedTargets -join ', '). All LDAP binds and searches against these DCs run on plaintext 389 and can be sniffed/relayed (LDAP relay to LDAPS is a documented attack path). Issue an LDAPS certificate and verify with `ldp.exe -SSL`." `
+                $portTxtPath (Score-Scaled 'High' $ldapsClosedTargets.Count)
+        }
     }
 
     # Delegated Permissions
@@ -9806,46 +11242,141 @@ $js
     }
     $nextStepsHtml = ($nextSteps | ForEach-Object { "<li>$(HtmlEncode $_)</li>" }) -join "`n"
 
+    # Risk-Report styling: now supports BOTH light and dark with an explicit
+    # data-theme override. Default chooses OS preference (prefers-color-scheme
+    # media query) and the toggle button at the top stores the user choice in
+    # localStorage so they can override it. Earlier the report was hard-coded
+    # dark-only with no way to switch, which made it unreadable on light-mode
+    # workstations and inconsistent with every other report in the bundle.
     $css = @"
 <style>
 :root{
-  --bg:#0b1220; --text:#e8edf6; --muted:#b7c0d6; --line:rgba(255,255,255,.10);
-  --shadow:0 10px 30px rgba(0,0,0,.35); --radius:14px;
-  --critical-bg:rgba(255,77,79,.18); --high-bg:rgba(255,169,64,.18);
-  --medium-bg:rgba(105,177,255,.18); --low-bg:rgba(149,222,100,.18);
-  --info-bg:rgba(160,160,160,.18);
+  /* Light theme (default) */
+  --bg:#f5f7fb;
+  --bg-glow1: rgba(105,177,255,.10);
+  --bg-glow2: rgba(255,169,64,.10);
+  --panel:#ffffff;
+  --panel-soft: rgba(15,23,42,.04);
+  --panel-softer: rgba(15,23,42,.02);
+  --text:#1b2430;
+  --muted:#5f6b7a;
+  --line:#d9e0ea;
+  --shadow:0 10px 24px rgba(15,23,42,.08);
+  --radius:14px;
+  --critical-bg:#fdecec; --critical-text:#c62828;
+  --high-bg:#fff2e5;     --high-text:#ef6c00;
+  --medium-bg:#e8f4fd;   --medium-text:#0277bd;
+  --low-bg:#edf8ee;      --low-text:#2e7d32;
+  --info-bg:#f2f4f6;     --info-text:#6c757d;
+  --link:#0f5cb8;
+  --pre-bg:#f8fafc; --pre-text:#1b2430;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:#0b1220;
+    --bg-glow1: rgba(105,177,255,.18);
+    --bg-glow2: rgba(255,169,64,.16);
+    --panel:#111827;
+    --panel-soft: rgba(255,255,255,.06);
+    --panel-softer: rgba(255,255,255,.03);
+    --text:#e8edf6;
+    --muted:#b7c0d6;
+    --line:rgba(255,255,255,.10);
+    --shadow:0 10px 30px rgba(0,0,0,.35);
+    --critical-bg:rgba(255,77,79,.18); --critical-text:#fecaca;
+    --high-bg:rgba(255,169,64,.18);    --high-text:#fed7aa;
+    --medium-bg:rgba(105,177,255,.18); --medium-text:#bfdbfe;
+    --low-bg:rgba(149,222,100,.18);    --low-text:#bbf7d0;
+    --info-bg:rgba(160,160,160,.18);   --info-text:#e2e8f0;
+    --link:#cfe1ff;
+    --pre-bg:rgba(0,0,0,.25); --pre-text:#dbe6ff;
+  }
+}
+/* Manual override (toggle button) wins over OS preference */
+html[data-theme="light"]{
+  --bg:#f5f7fb;
+  --bg-glow1: rgba(105,177,255,.10);
+  --bg-glow2: rgba(255,169,64,.10);
+  --panel:#ffffff;
+  --panel-soft: rgba(15,23,42,.04);
+  --panel-softer: rgba(15,23,42,.02);
+  --text:#1b2430;
+  --muted:#5f6b7a;
+  --line:#d9e0ea;
+  --shadow:0 10px 24px rgba(15,23,42,.08);
+  --critical-bg:#fdecec; --critical-text:#c62828;
+  --high-bg:#fff2e5;     --high-text:#ef6c00;
+  --medium-bg:#e8f4fd;   --medium-text:#0277bd;
+  --low-bg:#edf8ee;      --low-text:#2e7d32;
+  --info-bg:#f2f4f6;     --info-text:#6c757d;
+  --link:#0f5cb8;
+  --pre-bg:#f8fafc; --pre-text:#1b2430;
+}
+html[data-theme="dark"]{
+  --bg:#0b1220;
+  --bg-glow1: rgba(105,177,255,.18);
+  --bg-glow2: rgba(255,169,64,.16);
+  --panel:#111827;
+  --panel-soft: rgba(255,255,255,.06);
+  --panel-softer: rgba(255,255,255,.03);
+  --text:#e8edf6;
+  --muted:#b7c0d6;
+  --line:rgba(255,255,255,.10);
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+  --critical-bg:rgba(255,77,79,.18); --critical-text:#fecaca;
+  --high-bg:rgba(255,169,64,.18);    --high-text:#fed7aa;
+  --medium-bg:rgba(105,177,255,.18); --medium-text:#bfdbfe;
+  --low-bg:rgba(149,222,100,.18);    --low-text:#bbf7d0;
+  --info-bg:rgba(160,160,160,.18);   --info-text:#e2e8f0;
+  --link:#cfe1ff;
+  --pre-bg:rgba(0,0,0,.25); --pre-text:#dbe6ff;
 }
 *{box-sizing:border-box}
 body{
   margin:0;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  background: radial-gradient(1200px 700px at 20% 10%, rgba(105,177,255,.18), transparent 60%),
-              radial-gradient(1200px 700px at 80% 0%, rgba(255,169,64,.16), transparent 55%),
+  background: radial-gradient(1200px 700px at 20% 10%, var(--bg-glow1), transparent 60%),
+              radial-gradient(1200px 700px at 80% 0%, var(--bg-glow2), transparent 55%),
               var(--bg);
   color:var(--text);
 }
-a{color:#cfe1ff;text-decoration:none} a:hover{text-decoration:underline}
+a{color:var(--link);text-decoration:none} a:hover{text-decoration:underline}
 .container{max-width:1200px;margin:0 auto;padding:28px 20px 60px}
 .header{
-  background: linear-gradient(135deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
+  background: var(--panel);
   border:1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
   padding:22px 22px 18px;
 }
 .h-title{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap}
 h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
 .meta{color:var(--muted);font-size:13px}
+.theme-toggle{
+  border:1px solid var(--line);
+  background:var(--panel);
+  color:var(--text);
+  border-radius:999px;
+  padding:8px 14px;
+  font-size:13px;
+  font-weight:700;
+  cursor:pointer;
+  margin-bottom:10px;
+}
+.theme-toggle:hover{filter:brightness(1.05)}
 .badge{
   display:inline-flex;align-items:center;gap:10px;
   padding:10px 12px;border-radius:999px;border:1px solid var(--line);
-  background: rgba(255,255,255,.06); font-weight:700;
+  background: var(--panel-soft); font-weight:700;
 }
 .badge .grade{font-size:13px;color:var(--muted);font-weight:600}
 .badge .value{font-size:15px}
-.badge.Critical{background:var(--critical-bg)} .badge.High{background:var(--high-bg)}
-.badge.Medium{background:var(--medium-bg)} .badge.Low{background:var(--low-bg)} .badge.Information{background:var(--info-bg)}
+.badge.Critical{background:var(--critical-bg);color:var(--critical-text)}
+.badge.High{background:var(--high-bg);color:var(--high-text)}
+.badge.Medium{background:var(--medium-bg);color:var(--medium-text)}
+.badge.Low{background:var(--low-bg);color:var(--low-text)}
+.badge.Information{background:var(--info-bg);color:var(--info-text)}
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;margin-top:14px}
 .card{
-  background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+  background: var(--panel);
   border:1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
   padding:14px 14px 12px; min-height:88px;
 }
@@ -9859,15 +11390,18 @@ h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
   border:1px solid var(--line);
   min-width:86px;
 }
-.sev-Critical{background:var(--critical-bg)} .sev-High{background:var(--high-bg)}
-.sev-Medium{background:var(--medium-bg)} .sev-Low{background:var(--low-bg)} .sev-Information{background:var(--info-bg)}
+.sev-Critical{background:var(--critical-bg);color:var(--critical-text)}
+.sev-High{background:var(--high-bg);color:var(--high-text)}
+.sev-Medium{background:var(--medium-bg);color:var(--medium-text)}
+.sev-Low{background:var(--low-bg);color:var(--low-text)}
+.sev-Information{background:var(--info-bg);color:var(--info-text)}
 .section{margin-top:18px} .section h2{margin:0 0 10px;font-size:16px}
-.callout{border:1px solid var(--line);border-radius: var(--radius);padding:14px;background: rgba(255,255,255,.05)}
+.callout{border:1px solid var(--line);border-radius: var(--radius);padding:14px;background: var(--panel)}
 .callout p{margin:0;line-height:1.4} .callout ul{margin:10px 0 0 18px} .callout li{margin:6px 0}
 .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin:10px 0}
 .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 select,input{
-  background:rgba(255,255,255,.06);
+  background: var(--panel);
   color:var(--text);
   border:1px solid var(--line);
   border-radius:10px;
@@ -9876,15 +11410,15 @@ select,input{
 }
 input{min-width:240px}
 small{color:var(--muted)}
-select option{ background:#0b1220; color:#ffffff; }
-table{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:rgba(255,255,255,.03)}
+select option{ background: var(--panel); color: var(--text); }
+table{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background: var(--panel)}
 th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em;background: rgba(255,255,255,.05);cursor:pointer;user-select:none}
-tr:hover td{background:rgba(255,255,255,.04)}
+th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em;background: var(--panel-soft);cursor:pointer;user-select:none}
+tr:hover td{background: var(--panel-soft)}
 td.score{font-weight:800} td.title{font-weight:700}
 .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
-td.source .mono{font-size:12px;color:#d7e6ff}
-pre{white-space:pre-wrap;background:rgba(0,0,0,.25);border:1px solid var(--line);border-radius: var(--radius);padding:12px;color:#dbe6ff;overflow:auto}
+td.source .mono{font-size:12px;color:var(--link)}
+pre{white-space:pre-wrap;background: var(--pre-bg);border:1px solid var(--line);border-radius: var(--radius);padding:12px;color: var(--pre-text);overflow:auto}
 .footer{margin-top:16px;color:var(--muted);font-size:12px}
 .matrix-wrap{margin-top:10px}
 table.matrix{ table-layout:fixed; }
@@ -9893,7 +11427,7 @@ table.matrix th{ cursor:default; }
 table.matrix th:nth-child(1), table.matrix td:nth-child(1){ width:18%; padding-left:22px; }
 table.matrix th:nth-child(2), table.matrix td:nth-child(2){ width:18%; text-align:center; }
 table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-left:22px; }
-.matrix-row.active td{background:rgba(255,255,255,.06)}
+.matrix-row.active td{background: var(--panel-soft)}
 </style>
 "@
 
@@ -9903,6 +11437,48 @@ table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-l
   function q(sel){return document.querySelector(sel);}
   function qa(sel){return Array.prototype.slice.call(document.querySelectorAll(sel));}
   function rows(){return qa('#findings-body tr');}
+
+  // Theme handling: if the user has explicitly toggled in the past we honour
+  // their stored choice; otherwise we follow the OS prefers-color-scheme so
+  // light-OS users get a light report and dark-OS users get a dark report.
+  // The CSS handles both via :root / @media / html[data-theme=...] rules.
+  function currentTheme(){
+    var stored = null;
+    try { stored = localStorage.getItem('adaudit-theme'); } catch(e){}
+    if (stored === 'light' || stored === 'dark') return stored;
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
+    return 'light';
+  }
+  function applyTheme(t){
+    document.documentElement.setAttribute('data-theme', t);
+    var btn = q('#themeToggle');
+    if (btn){
+      btn.innerText = (t === 'dark') ? 'Light mode' : 'Dark mode';
+      btn.setAttribute('aria-pressed', (t === 'dark') ? 'true' : 'false');
+    }
+    try { localStorage.setItem('adaudit-theme', t); } catch(e){}
+  }
+  applyTheme(currentTheme());
+  var tBtn = q('#themeToggle');
+  if (tBtn){
+    tBtn.addEventListener('click', function(){
+      var next = (document.documentElement.getAttribute('data-theme') === 'dark') ? 'light' : 'dark';
+      applyTheme(next);
+    });
+  }
+  // React to OS theme changes only when the user has not picked a theme.
+  if (window.matchMedia){
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+    var handler = function(e){
+      var stored = null;
+      try { stored = localStorage.getItem('adaudit-theme'); } catch(_){}
+      if (stored !== 'light' && stored !== 'dark'){
+        applyTheme(e.matches ? 'dark' : 'light');
+      }
+    };
+    if (mq.addEventListener){ mq.addEventListener('change', handler); }
+    else if (mq.addListener){ mq.addListener(handler); }
+  }
 
   function applyFilters(){
     var sev = q('#sevFilter').value;
@@ -9983,15 +11559,18 @@ $css
         <div class="meta">Target: <span class="mono">$(HtmlEncode $computerName)</span> | Generated: $(HtmlEncode $now) | <a href="$(HtmlAttrEncode ([System.IO.Path]::GetFileName($AuditHtml)))">Detailed audit report</a></div>
         <div class="meta" style="margin-top:4px">Script: <span class="mono">$versionnum</span> | Run by: <span class="mono">$(HtmlEncode "$env:USERDOMAIN\$env:USERNAME")</span> | Start: $(HtmlEncode "$starttime") | End: $(HtmlEncode "$endtime")</div>
       </div>
-      <div class="badge $OverallLevel">
-        <div>
-          <div class="grade">Overall Risk</div>
-          <div class="value">$OverallLevel</div>
-        </div>
-        <div style="width:1px;height:28px;background:var(--line)"></div>
-        <div>
-          <div class="grade">Score</div>
-          <div class="value">$TotalScore</div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:10px">
+        <button id="themeToggle" type="button" class="theme-toggle" aria-pressed="false">Toggle theme</button>
+        <div class="badge $OverallLevel">
+          <div>
+            <div class="grade">Overall Risk</div>
+            <div class="value">$OverallLevel</div>
+          </div>
+          <div style="width:1px;height:28px;background:var(--line)"></div>
+          <div>
+            <div class="grade">Score</div>
+            <div class="value">$TotalScore</div>
+          </div>
         </div>
       </div>
     </div>
@@ -10255,6 +11834,11 @@ function Update-CompanionHtmlReports {
         $auditHref = if (Test-Path -LiteralPath $auditPath) { Get-RelativeReportHref -FromFile $targetPath -ToPath $auditPath } else { '' }
         $sourceHref = Get-RelativeReportHref -FromFile $targetPath -ToPath $sourcePath
 
+        # Companion-report wrapper now ships with full dark-mode support
+        # (OS preference + manual toggle + localStorage) so wrapped GPO and
+        # other companion HTML reports match the rest of the suite. Earlier
+        # the wrapper was light-only and looked out of place when the user
+        # had toggled the main ADAudit-Results report to dark.
         $wrapper = @"
 <!doctype html>
 <html lang="en">
@@ -10268,10 +11852,56 @@ $($styleBlocks -join "`n")
 :root{
   --bg:#f5f7fb;
   --panel:#ffffff;
+  --panel-soft:#f8fafc;
+  --panel-softer:#fafcff;
+  --th-bg:#eef2f7;
+  --code-bg:#f3f4f6;
   --text:#1b2430;
   --muted:#5f6b7a;
   --line:#d9e0ea;
   --shadow:0 10px 24px rgba(15,23,42,.08);
+  --link:#0f5cb8;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0f172a;
+    --panel:#1e293b;
+    --panel-soft:#0b1220;
+    --panel-softer:#111827;
+    --th-bg:#1e293b;
+    --code-bg:rgba(255,255,255,.06);
+    --text:#e2e8f0;
+    --muted:#94a3b8;
+    --line:#334155;
+    --shadow:0 10px 24px rgba(0,0,0,.4);
+    --link:#93c5fd;
+  }
+}
+html[data-theme="light"]{
+  --bg:#f5f7fb;
+  --panel:#ffffff;
+  --panel-soft:#f8fafc;
+  --panel-softer:#fafcff;
+  --th-bg:#eef2f7;
+  --code-bg:#f3f4f6;
+  --text:#1b2430;
+  --muted:#5f6b7a;
+  --line:#d9e0ea;
+  --shadow:0 10px 24px rgba(15,23,42,.08);
+  --link:#0f5cb8;
+}
+html[data-theme="dark"]{
+  --bg:#0f172a;
+  --panel:#1e293b;
+  --panel-soft:#0b1220;
+  --panel-softer:#111827;
+  --th-bg:#1e293b;
+  --code-bg:rgba(255,255,255,.06);
+  --text:#e2e8f0;
+  --muted:#94a3b8;
+  --line:#334155;
+  --shadow:0 10px 24px rgba(0,0,0,.4);
+  --link:#93c5fd;
 }
 *{box-sizing:border-box}
 body{
@@ -10280,7 +11910,7 @@ body{
   background:var(--bg);
   color:var(--text);
 }
-a{color:#0f5cb8;text-decoration:none}
+a{color:var(--link);text-decoration:none}
 a:hover{text-decoration:underline}
 .container{max-width:1280px;margin:0 auto;padding:28px 22px 48px}
 .hero,.panel{
@@ -10293,8 +11923,8 @@ a:hover{text-decoration:underline}
 .panel{padding:22px;margin-top:20px}
 .hero-top{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;align-items:flex-start}
 .meta{color:var(--muted);font-size:14px;line-height:1.6}
-.actions{display:flex;gap:10px;flex-wrap:wrap}
-.btn{
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.btn,.theme-toggle{
   display:inline-flex;
   align-items:center;
   justify-content:center;
@@ -10305,22 +11935,26 @@ a:hover{text-decoration:underline}
   background:var(--panel);
   color:var(--text);
   font-weight:700;
+  cursor:pointer;
 }
+.theme-toggle{border-radius:999px;font-size:13px}
 .embedded-report{margin-top:8px}
 .embedded-report table{border-collapse:collapse;width:100%}
 .embedded-report th,.embedded-report td{border:1px solid var(--line);padding:8px 10px;vertical-align:top;text-align:left}
-.embedded-report th{background:#eef2f7}
+.embedded-report th{background:var(--th-bg);color:var(--text)}
 .embedded-report pre{
   white-space:pre-wrap;
   word-break:break-word;
-  background:#f8fafc;
+  background:var(--panel-soft);
+  color:var(--text);
   border:1px solid var(--line);
   border-radius:12px;
   padding:14px;
 }
 .embedded-report code{
   font-family:Consolas,Menlo,Monaco,monospace;
-  background:#f3f4f6;
+  background:var(--code-bg);
+  color:var(--text);
   padding:2px 4px;
   border-radius:4px;
 }
@@ -10329,11 +11963,52 @@ a:hover{text-decoration:underline}
   border-radius:12px;
   padding:12px;
   margin:12px 0;
-  background:#fafcff;
+  background:var(--panel-softer);
+  color:var(--text);
 }
 .embedded-report summary{cursor:pointer;font-weight:700}
-.embedded-report h1,.embedded-report h2,.embedded-report h3,.embedded-report h4{margin-top:0}
+.embedded-report h1,.embedded-report h2,.embedded-report h3,.embedded-report h4{margin-top:0;color:var(--text)}
 </style>
+<script>
+(function(){
+  function osPrefersDark(){
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  function currentTheme(){
+    var s=null; try { s=localStorage.getItem('adaudit-theme'); } catch(_){}
+    if (s==='light'||s==='dark') return s;
+    return osPrefersDark() ? 'dark' : 'light';
+  }
+  function applyTheme(t){
+    document.documentElement.setAttribute('data-theme', t);
+    var btn=document.getElementById('wrapperThemeToggle');
+    if (btn){
+      btn.innerText = (t==='dark') ? 'Light mode' : 'Dark mode';
+      btn.setAttribute('aria-pressed', (t==='dark') ? 'true' : 'false');
+    }
+    try { localStorage.setItem('adaudit-theme', t); } catch(_){}
+  }
+  document.addEventListener('DOMContentLoaded', function(){
+    applyTheme(currentTheme());
+    var btn=document.getElementById('wrapperThemeToggle');
+    if (btn){
+      btn.addEventListener('click', function(){
+        var next = (document.documentElement.getAttribute('data-theme')==='dark') ? 'light' : 'dark';
+        applyTheme(next);
+      });
+    }
+    if (window.matchMedia){
+      var mq = window.matchMedia('(prefers-color-scheme: dark)');
+      var handler = function(e){
+        var s=null; try { s=localStorage.getItem('adaudit-theme'); } catch(_){}
+        if (s !== 'light' && s !== 'dark') applyTheme(e.matches ? 'dark' : 'light');
+      };
+      if (mq.addEventListener){ mq.addEventListener('change', handler); }
+      else if (mq.addListener){ mq.addListener(handler); }
+    }
+  });
+})();
+</script>
 </head>
 <body>
 <div class="container">
@@ -10347,6 +12022,7 @@ a:hover{text-decoration:underline}
         </div>
       </div>
       <div class="actions">
+        <button id="wrapperThemeToggle" type="button" class="theme-toggle" aria-pressed="false">Toggle theme</button>
         $(if ($auditHref) { "<a class='btn' href='$auditHref'>Back to ADAudit-Results</a>" } else { '' })
         <a class="btn" href="$sourceHref" target="_blank" rel="noopener">Open original HTML</a>
       </div>

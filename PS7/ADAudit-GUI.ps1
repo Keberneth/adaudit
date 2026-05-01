@@ -274,6 +274,7 @@ $AuditChecks = [ordered]@{
     delegatedpermissions = "Generate AD delegated permissions report"
     highrisk             = "Generate high-risk AD baseline report"
     overlappinggroups    = "Check for overlapping group memberships"
+    portconnectivity     = "Test DC TCP ports (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC) from this host and cross-DC via WinRM"
 }
 
 # -------------------------
