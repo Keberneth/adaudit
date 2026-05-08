@@ -275,6 +275,7 @@ $AuditChecks = [ordered]@{
     highrisk             = "Generate high-risk AD baseline report"
     overlappinggroups    = "Check for overlapping group memberships"
     portconnectivity     = "Test DC TCP ports (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC) from this host and cross-DC via WinRM"
+    adhealth             = "AD platform health check (replication, dcdiag, SYSVOL/DFSR, NTDS, time, services, events, sites, recycle bin, group hygiene)"
 }
 
 # -------------------------

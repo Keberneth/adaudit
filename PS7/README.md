@@ -4,7 +4,7 @@ A comprehensive PowerShell 7 script for auditing Active Directory security confi
 
 ## Quick Start
 
-**From the GUI version you can install dependencies and chose what audits to run**
+**From the GUI version you can install dependencies and choose what audits to run**
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\AdAudit-GUI.ps1
@@ -31,12 +31,12 @@ To also install optional dependencies (DSInternals for password quality analysis
 - **ActiveDirectory** PowerShell module (installed with RSAT tools)
 - Run as a user with sufficient AD read permissions (Domain Admin recommended for full results)
 - NuGet and DSInternals modules from PowerShell Gallery
-<rb>
+<br>
 https://www.powershellgallery.com/packages/NuGet/
 <br>
 https://www.powershellgallery.com/packages/DSInternals/
 <br>
-Chose Manual Download. You will get two .nuplkg files. Plase them in the ADAudit folder for offline installation.
+Choose Manual Download. You will get two .nupkg files. Place them in the ADAudit folder for offline installation.
 <br>
 
 ### Optional Modules
@@ -52,14 +52,21 @@ If an optional module is not available, those specific checks will be skipped an
 
 ## Output
 
-Results are written to a timestamped folder in the script directory, including:
+Results are written to a folder named after the host (e.g. `<COMPUTERNAME>\HTML Reports\` and `<COMPUTERNAME>\Raw Data\Source\`) in the script directory. The five primary HTML reports share a top navigation bar so you can move between them in the browser; everything else (companion wrappers, intermediate `.source.html` files, the GPO export HTML, the dangerous-ACL HTML, the high-risk baseline index, the DNS audit / recommendations HTML) is removed at the end of the run so the output folder stays focused.
 
-- **Risk-Report** (HTML) with findings, severity scores, and recommendations
-- **Nessus-compatible** output file (`.nessus`)
-- **Raw data** exports (text files with detailed findings) (More data and infromation then in HTML reports)
-- **GPO reports** (HTML/XML) when GroupPolicy module is available
-- **ADAudit-Results** (HTML) with most important findings, audit information, recomendation and link to raw files.
-- **overlapping_group_memberships** Detailed information about users that get same group membership from multiple groups path. 
+Primary HTML reports (in `HTML Reports\`):
+
+- **ADAudit-Results.html** - the main audit report. Severity-grouped findings (Critical / High / Medium / Low / Information), filterable, with per-finding "Why it matters" / "Recommended action" / source-link / result preview panels. Includes the new **Domain Admins membership review (size-adjusted)** and **Built-in domain Administrator (RID-500) hygiene** findings.
+- **Risk-Report.html** - executive risk summary with overall score, score-band matrix, top findings, and links back into ADAudit-Results.html.
+- **AD_Health.html** - AD platform health: replication, DC diagnostics (dcdiag), DC interconnect (network reachability between DCs with severity scaled by remaining redundancy), SYSVOL/DFSR backlog, NTDS database, time synchronization, core AD services (KPSSVC is informational, not High), event-log scrape (last 72h), sites and subnets, AD Recycle Bin, group hygiene. Hero gauge, "Tests Performed" status grid, and a "Test Details" section with one collapsible card per test (summary / why it matters / what to look for / how to fix / source link / copy-paste rerun command).
+- **overlapping_group_memberships.html** - users who reach the same target group via multiple direct group memberships.
+- **multiple_nested_paths.html** - users who reach the same target group via multiple nesting chains from a single direct group (group-nesting complexity, not necessarily duplicate effective permissions).
+
+Other output:
+
+- **Nessus-compatible** XML file (`adaudit.nessus`)
+- **Raw Data\Source\\** - per-check evidence files (more detail than the HTML reports), including `health_*.txt` for AD Health and `domain_admins_scaled.txt` / `domain_admin_builtin_rid500.txt` for the Domain Admins review
+- **Raw Data\GPOReports\\** - GPO XML/HTML exports when the GroupPolicy module is available (the GPOReport HTML in HTML Reports is removed by the final cleanup; the XML export and the per-GPO HTML files in Raw Data are kept)
 
 ## Audit Checks
 
@@ -68,7 +75,7 @@ Results are written to a timestamped folder in the script directory, including:
 | `-hostdetails` | Retrieve hostname and useful audit information |
 | `-domainaudit` | Audit AD functional level, delegation, spooler, SMB signing, tombstone |
 | `-trusts` | Check domain trust relationships |
-| `-accounts` | Identify account issues (expired, disabled, gMSA, overlapping groups, etc.) |
+| `-accounts` | Identify account issues (expired, disabled, gMSA, overlapping groups, etc.). Also runs the **Domain Admins membership review (size-adjusted)** and **Built-in domain Administrator (RID-500) hygiene** checks. |
 | `-InactiveComputers` | Find inactive computer objects (>90 days) |
 | `-passwordpolicy` | Review password policy and password quality (requires DSInternals) |
 | `-oldboxes` | Find machines running unsupported OS (older than Server 2019) |
@@ -88,6 +95,8 @@ Results are written to a timestamped folder in the script directory, including:
 | `-delegatedpermissions` | Generate AD delegated permissions report |
 | `-highrisk` | Generate high-risk AD baseline report |
 | `-overlappinggroups` | Check for overlapping group memberships |
+| `-portconnectivity` | Probe every DC on the canonical AD port set (DNS 53, Kerberos 88, RPC EPM 135, LDAP 389, SMB 445, kpasswd 464, LDAPS 636, GC 3268/3269, ADWS 9389, WinRM 5985/5986, NetBIOS 139, sample dynamic RPC). Also runs a cross-DC TCP probe via WinRM when reachable. Aliases: `-dcports`, `-dc-ports`, `-portcheck`. |
+| `-adhealth` | AD platform health check: replication, DC diagnostics, DC interconnect (severity scales with remaining redundancy - 2 DCs / 1 isolated = Critical, 3 / 1 = High, 4+ / 1 = Medium), SYSVOL/DFSR, NTDS, time sync, services, event logs, sites/subnets, Recycle Bin, group hygiene. Writes `AD_Health.html`. Aliases: `-ad-health`, `-health`. |
 
 ## Switches
 
