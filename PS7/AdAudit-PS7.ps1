@@ -736,11 +736,12 @@ Function Get-Variables() {
     $script:OSVersion = (Get-Itemproperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name ProductName).ProductName
     $script:Administrators = (Get-ADGroup -Identity S-1-5-32-544).SamAccountName
     $script:Users = (Get-ADGroup -Identity S-1-5-32-545).SamAccountName
-    $script:DomainAdminsSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-512"
-    $script:DomainUsersSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-513"
-    $script:DomainControllersSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-516"
-    $script:SchemaAdminsSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-518"
-    $script:EnterpriseAdminsSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-519"
+    $domainSidValue = (Get-ADDomain -Current LoggedOnUser).domainsid.value
+    $script:DomainAdminsSID = $domainSidValue + "-512"
+    $script:DomainUsersSID = $domainSidValue + "-513"
+    $script:DomainControllersSID = $domainSidValue + "-516"
+    $script:SchemaAdminsSID = $domainSidValue + "-518"
+    $script:EnterpriseAdminsSID = $domainSidValue + "-519"
     $script:EveryOneSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-1-0"
     $script:EntrepriseDomainControllersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-9"
     $script:AuthenticatedUsersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-11"
@@ -1019,6 +1020,17 @@ Function Get-EvidencePath {
 # ---------------------------------------------------------------------------
 $script:CheckFailures = New-Object System.Collections.Generic.List[object]
 
+# ---------------------------------------------------------------------------
+# "Could not assess" tracking. Distinct from CheckFailures (thrown errors):
+# this records checks/targets we deliberately could NOT evaluate (e.g. a DC
+# was unreachable over remote PowerShell/CIM, or the host running the script
+# is not a DC so a host-local setting could not be read from a DC). These are
+# NEVER turned into Nessus/risk findings - an un-assessable check must lower
+# confidence, not raise the risk score.
+# ---------------------------------------------------------------------------
+$script:NotAssessed = New-Object System.Collections.Generic.List[object]
+$script:ADAuditIsDC = $null
+
 Function Get-FsmoRolesForServer {
     [CmdletBinding()]
     param([string]$ServerHostnameOrFqdn)
@@ -1242,6 +1254,144 @@ Function Write-CheckFailuresReport {
     } catch {}
 }
 
+Function Test-ADAuditIsDomainController {
+    # Returns $true if the host running the script is itself a Domain Controller.
+    # Cached for the run. Used so host-local checks (registry/SMB config) know
+    # whether reading the LOCAL machine is meaningful or whether they must target
+    # a DC remotely (or report "could not assess").
+    if ($null -ne $script:ADAuditIsDC) { return $script:ADAuditIsDC }
+    try {
+        # Win32_OperatingSystem.ProductType: 1=Workstation, 2=Domain Controller, 3=Member/Standalone Server
+        $pt = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).ProductType
+        $script:ADAuditIsDC = ($pt -eq 2)
+    }
+    catch {
+        try {
+            # DomainRole: 4=Backup DC, 5=Primary DC
+            $role = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).DomainRole
+            $script:ADAuditIsDC = ($role -in 4, 5)
+        }
+        catch { $script:ADAuditIsDC = $false }
+    }
+    return $script:ADAuditIsDC
+}
+
+Function Register-ADAuditNotAssessed {
+    # Records a check (or a per-target portion of a check) that could NOT be
+    # assessed, with the reason. Deliberately does NOT emit a Nessus/risk finding
+    # so an un-assessable check never inflates the risk score.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Reason,
+        [string]$Switch,
+        [string]$Target,
+        [switch]$RequiresRemotePS
+    )
+    $script:NotAssessed.Add([pscustomobject]@{
+        Time             = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        CheckName        = $Name
+        Switch           = $Switch
+        Target           = $Target
+        Reason           = $Reason
+        RequiresRemotePS = [bool]$RequiresRemotePS
+    }) | Out-Null
+    $tgt = if ($Target) { " [$Target]" } else { "" }
+    Write-Both "    [~] NOT ASSESSED ($Name$tgt): $Reason"
+}
+
+Function Get-ADAuditRemoteRegistryDword {
+    # Reads a single HKLM REG_DWORD from a (possibly remote) host via the StdRegProv
+    # WMI provider, trying DCOM first then WSMan/WinRM. Returns a tri-state hashtable:
+    #   Success=$true,  Value=<int>  -> reached the host, value is set
+    #   Success=$true,  Value=$null  -> reached the host, value is NOT set
+    #   Success=$false, Error=<msg>  -> could not reach/query the host (=> NotAssessed)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$SubKey,
+        [Parameter(Mandatory)][string]$ValueName
+    )
+    $HKLM = [uint32]2147483650
+    $result = @{ Success = $false; Value = $null; Error = $null }
+    $regArgs = @{ hDefKey = $HKLM; sSubKeyName = $SubKey; sValueName = $ValueName }
+    $isLocal = $ComputerName -in @('.', 'localhost', $env:COMPUTERNAME)
+
+    if ($isLocal) {
+        try {
+            $r = Invoke-CimMethod -Namespace 'root/default' -ClassName StdRegProv -MethodName GetDWORDValue -Arguments $regArgs -ErrorAction Stop
+            $result.Success = $true; $result.Value = $r.uValue
+        }
+        catch { $result.Error = $_.Exception.Message }
+        return $result
+    }
+
+    foreach ($proto in @('Dcom', 'Wsman')) {
+        $session = $null
+        try {
+            $opt = New-CimSessionOption -Protocol $proto
+            $session = New-CimSession -ComputerName $ComputerName -SessionOption $opt -ErrorAction Stop
+            $r = Invoke-CimMethod -CimSession $session -Namespace 'root/default' -ClassName StdRegProv -MethodName GetDWORDValue -Arguments $regArgs -ErrorAction Stop
+            $result.Success = $true; $result.Value = $r.uValue; $result.Error = $null
+            return $result
+        }
+        catch { $result.Error = $_.Exception.Message }
+        finally { if ($session) { $session | Remove-CimSession -ErrorAction SilentlyContinue } }
+    }
+    return $result
+}
+
+Function Write-NotAssessedReport {
+    # Writes the "could not assess" artifacts (not_assessed.txt/.csv) at end of run.
+    # Surfaced as informational only - never scored.
+    [CmdletBinding()]
+    param([string]$BaseRoot)
+
+    if (-not $script:NotAssessed -or $script:NotAssessed.Count -eq 0) { return }
+
+    $rawDir = Get-RawSourceDataDir
+    if (-not (Test-Path -LiteralPath $rawDir)) {
+        New-Item -ItemType Directory -Path $rawDir -Force | Out-Null
+    }
+    $txtPath = Join-Path $rawDir 'not_assessed.txt'
+    $csvPath = Join-Path $rawDir 'not_assessed.csv'
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('=====================================================================')
+    [void]$sb.AppendLine(' CHECKS / TARGETS THAT COULD NOT BE ASSESSED')
+    [void]$sb.AppendLine('=====================================================================')
+    [void]$sb.AppendLine(" Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine(" Total: $($script:NotAssessed.Count)")
+    [void]$sb.AppendLine('---------------------------------------------------------------------')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('What this file means:')
+    [void]$sb.AppendLine(' - These checks (or specific DC targets) could NOT be evaluated, usually')
+    [void]$sb.AppendLine('   because this host is not a DC and remote PowerShell/CIM to a DC was')
+    [void]$sb.AppendLine('   unavailable, a DC was unreachable, or a required data source was absent.')
+    [void]$sb.AppendLine(' - These are NOT findings and do NOT raise the risk score. They indicate')
+    [void]$sb.AppendLine('   REDUCED COVERAGE: the corresponding posture is unknown, not "good".')
+    [void]$sb.AppendLine(' - To assess them, re-run from a Domain Controller, or enable remote')
+    [void]$sb.AppendLine('   PowerShell (WinRM) / DCOM to the DCs from this management host.')
+    [void]$sb.AppendLine('')
+
+    $i = 0
+    foreach ($n in $script:NotAssessed) {
+        $i++
+        [void]$sb.AppendLine("[$i] $($n.CheckName)  ($($n.Time))")
+        if ($n.Switch) { [void]$sb.AppendLine("    Switch          : -$($n.Switch)") }
+        if ($n.Target) { [void]$sb.AppendLine("    Target          : $($n.Target)") }
+        [void]$sb.AppendLine("    Requires remote : $(if($n.RequiresRemotePS){'YES (remote PowerShell/CIM to a DC)'}else{'no'})")
+        [void]$sb.AppendLine("    Reason          : $($n.Reason)")
+        [void]$sb.AppendLine('')
+    }
+
+    Set-Content -LiteralPath $txtPath -Value $sb.ToString() -Encoding UTF8
+    $script:NotAssessed | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Both ""
+    Write-Both "[~] $($script:NotAssessed.Count) item(s) could not be assessed (reduced coverage, not risk) - see not_assessed.txt"
+}
+
 Function Write-Nessus-Header() {
     #Creates nessus XML file header
     Add-Content -Path "$outputdir\adaudit.nessus" -Value "<?xml version=`"1.0`" ?><AdAudit>"
@@ -1267,7 +1417,7 @@ Function Get-DNSZoneInsecure {
         Import-ADAuditModule -Name DnsServer -Required | Out-Null
     }
     catch {
-        Write-Both "    [!] Could not load required modules (ActiveDirectory/DnsServer). $_"
+        Register-ADAuditNotAssessed -Name 'Get-DNSZoneInsecure' -Switch 'insecurednszone' -Reason "Required modules (ActiveDirectory/DnsServer RSAT) could not be loaded: $($_.Exception.Message)"
         return
     }
 
@@ -1276,12 +1426,12 @@ Function Get-DNSZoneInsecure {
         $dcList = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
     }
     catch {
-        Write-Both "    [!] Failed to enumerate domain controllers from AD. $_"
+        Register-ADAuditNotAssessed -Name 'Get-DNSZoneInsecure' -Switch 'insecurednszone' -Reason "Failed to enumerate domain controllers from AD: $($_.Exception.Message)"
         return
     }
 
     if (-not $dcList -or $dcList.Count -eq 0) {
-        Write-Both "    [-] No domain controllers found."
+        Register-ADAuditNotAssessed -Name 'Get-DNSZoneInsecure' -Switch 'insecurednszone' -Reason "No domain controllers found to probe for insecure DNS zones."
         return
     }
 
@@ -1291,6 +1441,7 @@ Function Get-DNSZoneInsecure {
     }
 
     $totalcount = 0
+    $assessed = 0
 
     foreach ($dnsServer in $dcList) {
 
@@ -1321,6 +1472,7 @@ Function Get-DNSZoneInsecure {
             Write-Both "        [-] $dnsServer does not appear to have the DNS role (or access failed), skipping. $_"
             continue
         }
+        $assessed++
 
         if ($insecurezones) {
             foreach ($insecurezone in $insecurezones) {
@@ -1340,8 +1492,11 @@ Function Get-DNSZoneInsecure {
         Write-Both "    [!] There were $totalcount DNS zones configured to allow insecure updates (KB842) across all DNS servers."
         Write-Nessus-Finding "InsecureDNSZone" "KB842" ([System.IO.File]::ReadAllText($globalInsecureZonesFile))
     }
+    elseif ($assessed -eq 0) {
+        Register-ADAuditNotAssessed -Name 'Get-DNSZoneInsecure' -Switch 'insecurednszone' -RequiresRemotePS -Reason "No DNS server could be queried (DnsServer RPC/WinRM to the DCs unavailable from this host); insecure-zone posture is unknown, not 'clean'."
+    }
     else {
-        Write-Both "    [-] No insecure DNS zones found on any discovered DNS server."
+        Write-Both "    [-] No insecure DNS zones found on any of the $assessed discovered DNS server(s)."
     }
 }
 Function Get-OUPerms {
@@ -3744,9 +3899,21 @@ Function Get-PasswordPolicy {
         Write-Both "    [!] Passwords history is less than 12, currently set to $((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount) (KB262)"
         Write-Nessus-Finding "PasswordHistory" "KB262" "Passwords history is less than 12, currently set to $((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount)"
     }
-    if ((Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\Lsa).NoLmHash -eq 0) {
-        Write-Both "    [!] LM Hashes are stored! (KB510)"
-        Write-Nessus-Finding "LMHashesAreStored" "KB510" "LM Hashes are stored"
+    # NoLmHash is a per-DC machine setting. Read it from the PDC emulator rather than
+    # the local host (on a jump server the local value is the jump server's, not a DC's).
+    $pdc = try { (Get-ADDomain).PDCEmulator } catch { $null }
+    if (-not $pdc) {
+        Register-ADAuditNotAssessed -Name 'Get-PasswordPolicy' -Switch 'passwordpolicy' -Reason "Could not determine the PDC emulator to read the NoLmHash (LM hash storage) setting."
+    }
+    else {
+        $noLm = Get-ADAuditRemoteRegistryDword -ComputerName $pdc -SubKey 'SYSTEM\CurrentControlSet\Control\Lsa' -ValueName 'NoLmHash'
+        if (-not $noLm.Success) {
+            Register-ADAuditNotAssessed -Name 'Get-PasswordPolicy' -Switch 'passwordpolicy' -Target $pdc -RequiresRemotePS -Reason "Could not read NoLmHash from the PDC emulator's registry (remote registry over CIM/DCOM/WinRM unavailable): $($noLm.Error)"
+        }
+        elseif ($noLm.Value -eq 0) {
+            Write-Both "    [!] LM Hashes are stored on $pdc! (KB510)"
+            Write-Nessus-Finding "LMHashesAreStored" "KB510" "LM Hashes are stored (NoLmHash=0) on $pdc"
+        }
     }
     Write-Both "    [-] Finished checking default password policy"
     Write-Both "    [+] Checking fine-grained password policies if they exist"
@@ -3754,7 +3921,7 @@ Function Get-PasswordPolicy {
         $finegrainedpolicyappliesto = $finegrainedpolicy.AppliesTo
         Write-Both "    [!] Policy: $finegrainedpolicy"
         Write-Both "    [!] AppliesTo: $($finegrainedpolicyappliesto)"
-        if (!($finegrainedpolicy).PasswordComplexity) {
+        if (-not $finegrainedpolicy.ComplexityEnabled) {
             Write-Both "    [!] Password Complexity not enabled (KB262)"
             Write-Nessus-Finding "PasswordComplexity" "KB262" "Password Complexity not enabled for $finegrainedpolicy"
         }
@@ -3780,25 +3947,48 @@ Function Get-PasswordPolicy {
     Write-Both "    [-] Finished checking fine-grained password policy"
 }
 Function Get-NULLSessions {
-    if ((Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\Lsa).RestrictAnonymous -eq 0) {
-        Write-Both "    [!] RestrictAnonymous is set to 0! (KB81)"
-        Write-Nessus-Finding "NullSessions" "KB81" " RestrictAnonymous is set to 0"
+    # Anonymous-access (null session) settings live in HKLM\...\Lsa and are a
+    # PER-MACHINE setting on each DC. Reading the LOCAL registry only makes sense
+    # when the script runs ON a DC; from a jump server it would audit the jump
+    # server, not the DCs. So we read each DC's Lsa values via remote registry and
+    # mark a DC NotAssessed (not a finding) when it cannot be reached.
+    $subKey = 'SYSTEM\CurrentControlSet\Control\Lsa'
+    $dcList = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+    if (-not $dcList -or $dcList.Count -eq 0) {
+        Register-ADAuditNotAssessed -Name 'Get-NULLSessions' -Switch 'accounts' -Reason "No domain controllers enumerated; cannot assess anonymous-access (null session) registry settings."
+        return
     }
-    if ((Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\Lsa).RestrictAnonymousSam -eq 0) {
-        Write-Both "    [!] RestrictAnonymousSam is set to 0! (KB81)"
-        Write-Nessus-Finding "NullSessions" "KB81" " RestrictAnonymous is set to 0"
-    }
-    if ((Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\Lsa).everyoneincludesanonymous -eq 1) {
-        Write-Both "    [!] EveryoneIncludesAnonymous is set to 1! (KB81)"
-        Write-Nessus-Finding "NullSessions" "KB81" "EveryoneIncludesAnonymous is set to 1"
+
+    foreach ($dc in $dcList) {
+        $ra  = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $subKey -ValueName 'RestrictAnonymous'
+        $ras = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $subKey -ValueName 'RestrictAnonymousSam'
+        $eia = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $subKey -ValueName 'everyoneincludesanonymous'
+
+        if (-not ($ra.Success -or $ras.Success -or $eia.Success)) {
+            Register-ADAuditNotAssessed -Name 'Get-NULLSessions' -Switch 'accounts' -Target $dc -RequiresRemotePS -Reason "Could not read HKLM\...\Lsa anonymous-access values on $dc (remote registry over CIM/DCOM/WinRM unavailable): $($ra.Error)"
+            continue
+        }
+
+        if ($ra.Success -and $ra.Value -eq 0) {
+            Write-Both "    [!] RestrictAnonymous is set to 0 on $dc! (KB81)"
+            Write-Nessus-Finding "NullSessions" "KB81" "RestrictAnonymous is set to 0 on $dc"
+        }
+        if ($ras.Success -and $ras.Value -eq 0) {
+            Write-Both "    [!] RestrictAnonymousSam is set to 0 on $dc! (KB81)"
+            Write-Nessus-Finding "NullSessions" "KB81" "RestrictAnonymousSam is set to 0 on $dc"
+        }
+        if ($eia.Success -and $eia.Value -eq 1) {
+            Write-Both "    [!] EveryoneIncludesAnonymous is set to 1 on $dc! (KB81)"
+            Write-Nessus-Finding "NullSessions" "KB81" "EveryoneIncludesAnonymous is set to 1 on $dc"
+        }
     }
 }
 Function Get-DomainTrusts {
     #Lists domain trusts if they are bad
     foreach ($trust in (Get-ADObject -Filter { objectClass -eq "trustedDomain" } -Properties TrustPartner, TrustDirection, trustType, trustAttributes)) {
         if ($trust.TrustDirection -eq 2) {
-            if ($trust.TrustAttributes -eq 1 -or $trust.TrustAttributes -eq 4) {
-                #1 means trust is non-transitive, 4 is external so we check for anything but that
+            if (($trust.TrustAttributes -band 0x1) -or ($trust.TrustAttributes -band 0x4)) {
+                # 0x1 = non-transitive, 0x4 = quarantined/SID-filtered; bitmask test so combined flags are handled
                 Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain! (KB250)"
                 Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain."
             }
@@ -3808,8 +3998,8 @@ Function Get-DomainTrusts {
             }
         }
         if ($trust.TrustDirection -eq 3) {
-            if ($trust.TrustAttributes -eq 1 -or $trust.TrustAttributes -eq 4) {
-                #1 means trust is non-transitive, 4 is external so we check for anything but that
+            if (($trust.TrustAttributes -band 0x1) -or ($trust.TrustAttributes -band 0x4)) {
+                # 0x1 = non-transitive, 0x4 = quarantined/SID-filtered; bitmask test so combined flags are handled
                 Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain! (KB250)"
                 Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain."
             }
@@ -3825,19 +4015,41 @@ Function Get-WinVersion {
     return [single]$WinVersion
 }
 Function Get-SMB1Support {
-    #Check if server supports SMBv1
-    if ([single](Get-WinVersion) -le [single]6.1) {
-        #NT6.1 or less detected so checking reg key
-        if (!(Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters).SMB1 -eq 0) {
-            Write-Both "    [!] SMBv1 is not disabled (KB290)"
-            Write-Nessus-Finding "SMBv1Support" "KB290" "SMBv1 is enabled"
-        }
+    # Check whether the DCs still support the SMBv1 server. This is a per-host
+    # setting on each DC, so we query the DCs rather than the host running the
+    # script (which, on a jump server, would report the jump server's SMBv1).
+    $dcList = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+    if (-not $dcList -or $dcList.Count -eq 0) {
+        Register-ADAuditNotAssessed -Name 'Get-SMB1Support' -Switch 'domainaudit' -Reason "No domain controllers enumerated; cannot assess SMBv1 support."
+        return
     }
-    elseif ([single](Get-WinVersion) -ge [single]6.2) {
-        #NT6.2 or greater detected so using powershell function
-        if ((Get-SmbServerConfiguration).EnableSMB1Protocol) {
-            Write-Both "    [!] SMBv1 is enabled! (KB290)"
-            Write-Nessus-Finding "SMBv1Support" "KB290" "SMBv1 is enabled"
+
+    foreach ($dc in $dcList) {
+        $enabled = $null
+        # Preferred: Get-SmbServerConfiguration over WinRM (version-agnostic, authoritative).
+        try {
+            $enabled = Invoke-Command -ComputerName $dc -ScriptBlock { [bool](Get-SmbServerConfiguration).EnableSMB1Protocol } -ErrorAction Stop
+        }
+        catch {
+            # Fallback: SMB1 REG_DWORD (0 = disabled). Absent is ambiguous on modern OS.
+            $reg = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -ValueName 'SMB1'
+            if (-not $reg.Success) {
+                Register-ADAuditNotAssessed -Name 'Get-SMB1Support' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "SMBv1 status needs Get-SmbServerConfiguration over WinRM or the SMB1 registry value; neither was reachable on ${dc}: $($reg.Error)"
+                continue
+            }
+            if ($null -eq $reg.Value) {
+                Register-ADAuditNotAssessed -Name 'Get-SMB1Support' -Switch 'domainaudit' -Target $dc -Reason "The SMB1 registry value is not set on $dc and WinRM was unavailable, so SMBv1 server state is ambiguous (cannot confirm enabled or disabled)."
+                continue
+            }
+            $enabled = ($reg.Value -ne 0)
+        }
+
+        if ($enabled) {
+            Write-Both "    [!] SMBv1 is enabled on $dc! (KB290)"
+            Write-Nessus-Finding "SMBv1Support" "KB290" "SMBv1 is enabled on $dc"
+        }
+        else {
+            Write-Both "    [+] SMBv1 is disabled on $dc"
         }
     }
 }
@@ -3898,7 +4110,12 @@ Function Get-GPOsPerOU {
 }
 Function Get-SYSVOLXMLS {
     #Finds XML files in SYSVOL (thanks --> https://github.com/PowerShellMafia/PowerSploit/blob/master/Exfiltration/Get-GPPPassword.ps1)
-    $XMLFiles = Get-ChildItem -Path "\\$Env:USERDNSDOMAIN\SYSVOL" -Recurse -ErrorAction SilentlyContinue -Include 'Groups.xml', 'Services.xml', 'Scheduledtasks.xml', 'DataSources.xml', 'Printers.xml', 'Drives.xml'
+    $sysvolRoot = "\\$Env:USERDNSDOMAIN\SYSVOL"
+    if (-not (Test-Path -LiteralPath $sysvolRoot -ErrorAction SilentlyContinue)) {
+        Register-ADAuditNotAssessed -Name 'Get-SYSVOLXMLS' -Switch 'gpo' -Target $sysvolRoot -RequiresRemotePS -Reason "SYSVOL is not reachable from this host (SMB/DFS access to a DC required); the GPP cpassword scan could not run. Note: 'zero files' would NOT mean 'no GPP passwords'."
+        return
+    }
+    $XMLFiles = Get-ChildItem -Path $sysvolRoot -Recurse -ErrorAction SilentlyContinue -Include 'Groups.xml', 'Services.xml', 'Scheduledtasks.xml', 'DataSources.xml', 'Printers.xml', 'Drives.xml'
     $count = 0
     if ($XMLFiles) {
         $progresscount = 0
@@ -4027,8 +4244,10 @@ Function Get-InactiveAccounts {
 Function Get-AdminAccountChecks {
     #Checks if Administrator account has been renamed, replaced and is no longer used.
     $AdministratorSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-500"
-    $AdministratorSAMAccountName = (Get-ADUser -Filter { SID -eq $AdministratorSID } -Properties SamAccountName).SamAccountName
-    $AdministratorName = (Get-ADUser -Filter { SID -eq $AdministratorSID } -Properties SamAccountName).Name
+    # One lookup of the RID-500 account instead of three identical queries.
+    $Administrator500 = Get-ADUser -Filter { SID -eq $AdministratorSID } -Properties SamAccountName, Name, LastLogonDate
+    $AdministratorSAMAccountName = $Administrator500.SamAccountName
+    $AdministratorName = $Administrator500.Name
     if ($AdministratorTranslation -contains $AdministratorSAMAccountName) {
         Write-Both "    [!] Local Administrator account (UID500) has not been renamed (KB309)"
         Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Local Administrator account (UID500) has not been renamed"
@@ -4043,7 +4262,7 @@ Function Get-AdminAccountChecks {
             Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Local Admin account renamed to $AdministratorSAMAccountName ($($AdministratorName)), but a dummy account not made in it's place"
         }
     }
-    $AdministratorLastLogonDate = (Get-ADUser -Filter { SID -eq $AdministratorSID } -Properties LastLogonDate).LastLogonDate
+    $AdministratorLastLogonDate = $Administrator500.LastLogonDate
     if ($AdministratorLastLogonDate -gt (Get-Date).AddDays(-180)) {
         Write-Both "    [!] UID500 (LocalAdministrator) account is still used, last used $AdministratorLastLogonDate! (KB309)"
         Write-Nessus-Finding "AdminAccountRenamed" "KB309" "UID500 (LocalAdmini) account is still used, last used $AdministratorLastLogonDate"
@@ -4959,22 +5178,22 @@ Function Get-CriticalServicesStatus {
     foreach ($DC in $dcList) {
         foreach ($service in $services) {
             try {
-                $checkService = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $DC -Filter "Name='$service'"
+                $checkService = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $DC -Filter "Name='$service'" -UseWsmanFallback
                 if (-not $checkService) {
-                    Write-Both "        [!] Service $service cannot be checked on $DC!"
+                    Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -RequiresRemotePS -Reason "Service query returned no data (DC unreachable over CIM/DCOM or WinRM); service state unknown, not confirmed running."
                     continue
                 }
 
                 $serviceStatus = [string]$checkService.State
                 if (-not $serviceStatus) {
-                    Write-Both "        [!] Service $service cannot be checked on $DC!"
+                    Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -RequiresRemotePS -Reason "Service state was empty (DC unreachable over CIM/DCOM or WinRM)."
                 }
                 elseif ($serviceStatus -ne "Running") {
                     Write-Both "        [!] Service $service is not running on $DC!"
                 }
             }
             catch {
-                Write-Both "        [!] Service $service cannot be checked on $DC!"
+                Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -RequiresRemotePS -Reason "Could not query service over CIM/DCOM or WinRM: $($_.Exception.Message)"
             }
         }
     }
@@ -4987,17 +5206,17 @@ Function Get-LastWUDate {
     Write-Both "    [+] Checking Windows Update"
     foreach ($DC in $dcList) {
         try {
-            $wuService = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $DC -Filter "Name='wuauserv'"
+            $wuService = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $DC -Filter "Name='wuauserv'" -UseWsmanFallback
             $startMode = $wuService.StartMode
             if (-not $startMode) {
-                Write-Both "        [!] Windows Update service cannot be checked on $DC!"
+                Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Windows Update service start mode could not be read (DC unreachable over CIM/DCOM or WinRM)."
             }
             elseif ($startMode -eq "Disabled") {
                 Write-Both "        [!] Windows Update service is disabled on $DC!"
             }
         }
         catch {
-            Write-Both "        [!] Windows Update service cannot be checked on $DC!"
+            Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not query Windows Update service over CIM/DCOM or WinRM: $($_.Exception.Message)"
         }
     }
 
@@ -5008,7 +5227,11 @@ Function Get-LastWUDate {
         Write-Progress -Activity "Searching for last Windows Update installation on all DCs..." -Status "Currently searching on $DC" -PercentComplete ($progresscount / $totalcount * 100)
         try {
             $lastHotfix = (Get-HotFix -ComputerName $DC | Where-Object { $_.InstalledOn -ne $null } | Sort-Object -Descending InstalledOn | Select-Object -First 1).InstalledOn
-            if ($lastHotfix -lt $lastMonth) {
+            if ($null -eq $lastHotfix) {
+                # No dated hotfix data returned - do NOT treat as "not up to date" ($null -lt $date is $true)
+                Write-Both "        [!] Could not determine last update date on $DC (no dated hotfix data returned)"
+            }
+            elseif ($lastHotfix -lt $lastMonth) {
                 Write-Both "        [!] Windows is not up to date on $DC, last install: $lastHotfix"
             }
             else {
@@ -5016,7 +5239,7 @@ Function Get-LastWUDate {
             }
         }
         catch {
-            Write-Both "        [!] Cannot check last update date on $DC"
+            Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not read installed hotfixes (Get-HotFix over RPC failed): $($_.Exception.Message)"
         }
         $progresscount++
     }
@@ -5028,9 +5251,17 @@ Function Get-TimeSource {
     (Get-ADDomainController -Filter *) | ForEach-Object { $dcList += $_.Name }
     Write-Both "    [+] Checking NTP configuration"
     foreach ($DC in $dcList) {
-        $ntpSource = w32tm /query /source /computer:$DC
-        if ($ntpSource -like '*0x800706BA*') {
-            Write-Both "        [!] Cannot get time source for $DC"
+        $ntpSource = $null
+        try {
+            $ntpSource = (w32tm /query /source /computer:$DC 2>&1 | Out-String).Trim()
+        }
+        catch {
+            Register-ADAuditNotAssessed -Name 'Get-TimeSource' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "w32tm could not query the time source (RPC to W32Time failed): $($_.Exception.Message)"
+            continue
+        }
+        # Reject error codes (e.g. 0x800706BA) and error text instead of printing them as a "source".
+        if ([string]::IsNullOrWhiteSpace($ntpSource) -or $ntpSource -match '0x[0-9A-Fa-f]{6,8}' -or $ntpSource -match 'error') {
+            Register-ADAuditNotAssessed -Name 'Get-TimeSource' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not determine NTP source ('$ntpSource'). w32tm needs RPC to the W32Time service on the DC."
         }
         else {
             Write-Both "        [+] $DC is syncing time from $ntpSource"
@@ -5452,71 +5683,100 @@ Function Check-Shares {
     $dcList = @()
     (Get-ADDomainController -Filter *) | ForEach-Object { $dcList += $_.Name }
     Write-Both "    [+] Checking SYSVOL and NETLOGON shares on all DCs"
+    $assessed = 0
     foreach ($DC in $dcList) {
+        $shareList = $null
         try {
-            $shareList = @(Get-ADAuditCimInstance -ClassName Win32_Share -ComputerName $DC)
+            $shareList = @(Get-ADAuditCimInstance -ClassName Win32_Share -ComputerName $DC -UseWsmanFallback)
         }
         catch {
-            $shareList = @()
+            Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not enumerate shares over CIM/DCOM or WinRM: $($_.Exception.Message)"
+            continue
         }
 
         if (-not $shareList -or $shareList.Count -eq 0) {
-            Write-Both "        [!] Cannot test shares on $DC!"
+            Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Share enumeration returned no data (DC unreachable over CIM/WinRM); SYSVOL/NETLOGON presence is unknown, not confirmed present."
+            continue
         }
-        else {
-            $sysvolShare = ($shareList | Where-Object { $_.Name -eq 'SYSVOL' } | Measure-Object).Count
-            $netlogonShare = ($shareList | Where-Object { $_.Name -eq 'NETLOGON' } | Measure-Object).Count
-            if ($sysvolShare -eq 0) { Write-Both "        [!] SYSVOL share is missing on $DC!" }
-            if ($netlogonShare -eq 0) { Write-Both "        [!] NETLOGON share is missing on $DC!" }
-        }
+
+        $assessed++
+        $sysvolShare = ($shareList | Where-Object { $_.Name -eq 'SYSVOL' } | Measure-Object).Count
+        $netlogonShare = ($shareList | Where-Object { $_.Name -eq 'NETLOGON' } | Measure-Object).Count
+        if ($sysvolShare -eq 0) { Write-Both "        [!] SYSVOL share is missing on $DC!" }
+        if ($netlogonShare -eq 0) { Write-Both "        [!] NETLOGON share is missing on $DC!" }
+    }
+
+    if ($assessed -eq 0 -and $dcList.Count -gt 0) {
+        Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -RequiresRemotePS -Reason "SYSVOL/NETLOGON shares could not be checked on ANY domain controller ($($dcList.Count) total). Requires CIM/DCOM or WinRM to the DCs. Posture is unknown, not 'all shares present'."
     }
 }
 Function Get-ADCSVulns {
     #Check for ADCS Vulnerabiltiies, ESC1,2,3,4 and 8. ESC8 will output to a different issues mapped to Nessus. 
-    $certutil_output = certutil -v -template
-    $certutil_lines = $certutil_output.Trim().Split("`n")
+    $certutil_output = certutil -v -template 2>&1
+    $certutilExit = $LASTEXITCODE
+    $certutil_text = ($certutil_output | Out-String)
+    # If certutil could not produce template data (no reachable Enterprise CA / AD CS
+    # config from this host), do NOT silently report "no ESC vulnerabilities" - that is
+    # a false all-clear. Record it as could-not-assess and stop.
+    if ($certutilExit -ne 0 -or [string]::IsNullOrWhiteSpace($certutil_text) -or $certutil_text -notmatch 'Template\[') {
+        Register-ADAuditNotAssessed -Name 'Get-ADCSVulns' -Switch 'adcs' -RequiresRemotePS -Reason "certutil -v -template returned no usable certificate-template data (exit code $certutilExit). AD CS / Enterprise CA configuration could not be read from this host, so ESC1-4 were NOT assessed (this is not 'no ADCS template vulnerabilities')."
+        return
+    }
+    $certutil_lines = $certutil_text.Trim().Split("`n")
     $templates = @()
     $current_template = ""
+
+    function ConvertFrom-CertutilTemplateBlock {
+        param([string]$Block)
+        if (-not $Block) { return $null }
+        $template_unparsed = $Block.TrimEnd(",").Split(",")
+        $SuppliesSubjectCheck = $false
+        $ClientAuthCheck = $false
+        $AllowEnrollCheck = $false
+        $AnyPurposeCheck = $false
+        $AllowWriteCheck = $false
+        $AllowFullControl = $false
+        $CertificateRequestAgentCheck = $false
+        $TemplatePropCommonName = $null
+
+        foreach ($detail in $template_unparsed) {
+            if ($detail -like "*TemplatePropCommonName =*") { $TemplatePropCommonName = $detail.Split("=")[1].Trim() }
+            if ($detail -like "*CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT -- 1*") { $SuppliesSubjectCheck = $true }
+            if ($detail -like "*Client Authentication*") { $ClientAuthCheck = $true }
+            if ($detail -match "^\s*Allow Enroll\s+.*\\Authenticated Users\s*$|^\s*Allow Enroll\s+.*\\Domain Users\s*$") { $AllowEnrollCheck = $true }
+            if ($detail -like "2.5.29.37.0 Any Purpose") { $AnyPurposeCheck = $true }
+            if ($detail -match "^\s*Allow Write\s+.*\\Authenticated Users\s*$|^\s*Allow Write\s+.*\\Domain Users\s*$") { $AllowWriteCheck = $true }
+            if ($detail -match "^\s*Allow Full Control\s+.*\\Authenticated Users\s*$|^\s*Allow Full Control\s+.*\\Domain Users\s*$") { $AllowFullControl = $true }
+            if ($detail -like "Certificate Request Agent (1.3.6.1.4.1.311.20.2.1)") { $CertificateRequestAgentCheck = $true }
+        }
+
+        return [pscustomobject]@{
+            SuppliesSubjectCheck         = $SuppliesSubjectCheck
+            ClientAuthCheck              = $ClientAuthCheck
+            AllowEnrollCheck             = $AllowEnrollCheck
+            AnyPurposeCheck              = $AnyPurposeCheck
+            AllowWriteCheck              = $AllowWriteCheck
+            AllowFullControl             = $AllowFullControl
+            TemplatePropCommonName       = $TemplatePropCommonName
+            CertificateRequestAgentCheck = $CertificateRequestAgentCheck
+        }
+    }
 
     foreach ($line in $certutil_lines) {
         if ($line.StartsWith("Template[")) {
             if ($current_template) {
-                $template_unparsed = $current_template.TrimEnd(",").Split(",")
-                $SuppliesSubjectCheck = $false
-                $ClientAuthCheck = $false
-                $AllowEnrollCheck = $false
-                $AnyPurposeCheck = $false
-                $AllowWriteCheck = $false
-                $AllowFullControl = $false
-                $CertificateRequestAgentCheck = $false
-                $TemplatePropCommonName = $null
-
-                foreach ($detail in $template_unparsed) {
-                    if ($detail -like "*TemplatePropCommonName =*") { $TemplatePropCommonName = $detail.Split("=")[1].Trim() }
-                    if ($detail -like "*CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT -- 1*") { $SuppliesSubjectCheck = $true }
-                    if ($detail -like "*Client Authentication*") { $ClientAuthCheck = $true }
-                    if ($detail -match "^\s*Allow Enroll\s+.*\\Authenticated Users\s*$|^\s*Allow Enroll\s+.*\\Domain Users\s*$") { $AllowEnrollCheck = $true }
-                    if ($detail -like "2.5.29.37.0 Any Purpose") { $AnyPurposeCheck = $true }
-                    if ($detail -match "^\s*Allow Write\s+.*\\Authenticated Users\s*$|^\s*Allow Write\s+.*\\Domain Users\s*$") { $AllowWriteCheck = $true }
-                    if ($detail -match "^\s*Allow Full Control\s+.*\\Authenticated Users\s*$|^\s*Allow Full Control\s+.*\\Domain Users\s*$") { $AllowFullControl = $true }
-                    if ($detail -like "Certificate Request Agent (1.3.6.1.4.1.311.20.2.1)") { $CertificateRequestAgentCheck = $true }
-                }
-
-                $templates += [pscustomobject]@{
-                    SuppliesSubjectCheck         = $SuppliesSubjectCheck
-                    ClientAuthCheck              = $ClientAuthCheck
-                    AllowEnrollCheck             = $AllowEnrollCheck
-                    AnyPurposeCheck              = $AnyPurposeCheck
-                    AllowWriteCheck              = $AllowWriteCheck
-                    AllowFullControl             = $AllowFullControl
-                    TemplatePropCommonName       = $TemplatePropCommonName
-                    CertificateRequestAgentCheck = $CertificateRequestAgentCheck
-                }
+                $templates += ConvertFrom-CertutilTemplateBlock $current_template
             }
             $current_template = $line + ","
         } else {
             $current_template += $line + ","
         }
+    }
+    # Flush the final template. The loop only parses a template when it reaches the
+    # NEXT 'Template[' header, so without this trailing flush the last template in the
+    # certutil output was silently dropped (false negative for ESC1/2/3/4).
+    if ($current_template) {
+        $templates += ConvertFrom-CertutilTemplateBlock $current_template
     }
 
     # Check for ESC1
@@ -5710,7 +5970,7 @@ Function Get-SPNs {
                 }
                 $_ | Select-Object Name, @{
                     Name       = "Groups"
-                    Expression = { $groups.Name -join ',' }
+                    Expression = { ,@($groups | ForEach-Object { $_.Name }) }
                 }
             }
 
@@ -5721,7 +5981,7 @@ Function Get-SPNs {
             continue
         }
 
-        $spn_groups = $spn.Groups.Split(',') | Where-Object { $_ -and $_.Trim() -ne "" }
+        $spn_groups = @($spn.Groups) | Where-Object { $_ -and $_.Trim() -ne "" }
         $name = $spn.Name
 
         foreach ($spn_group in $spn_groups) {
@@ -5818,83 +6078,84 @@ function Get-ADUsersWithoutPreAuth {
 }
 
 function Get-LDAPSecurity {
-    # Check if LDAP signing is enabled
-    $computerName = $env:COMPUTERNAME
-    
-    # Check if LDAP signing is enabled
-    try {
-        $ldapSigning = (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters -Name "LDAPServerIntegrity" -ErrorAction Stop).LDAPServerIntegrity
+    # LDAP signing, channel binding and the LDAPS certificate are PER-DC settings
+    # that live in the DC's NTDS\Parameters registry / LocalMachine cert store.
+    # Reading the LOCAL host is only valid on a DC; on a jump server the NTDS key
+    # does not exist and the old code emitted a GUARANTEED-false "LDAP signing not
+    # enabled" finding. We now target each DC and record NotAssessed (not a finding)
+    # when the DC's registry/cert store cannot be read remotely.
+    $serverAuthOid = '1.3.6.1.5.5.7.3.1'   # Server Authentication EKU
+    $ntdsKey = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
 
-        if ($ldapSigning -eq 2) {
-            Write-Both "    [+] LDAP signing is enabled on $computerName"
+    $dcList = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+    if (-not $dcList -or $dcList.Count -eq 0) {
+        Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Reason "No domain controllers enumerated; cannot assess LDAP signing / channel binding / LDAPS."
+        return
+    }
+
+    foreach ($dc in $dcList) {
+        # --- LDAP signing (LDAPServerIntegrity; 2 = required) ---
+        $sig = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $ntdsKey -ValueName 'LDAPServerIntegrity'
+        if (-not $sig.Success) {
+            Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target $dc -RequiresRemotePS -Reason "Could not read NTDS\Parameters\LDAPServerIntegrity on $dc (needs the DC's registry over CIM/DCOM/WinRM, or this host is not a DC): $($sig.Error)"
+        }
+        elseif ($sig.Value -eq 2) {
+            Write-Both "    [+] LDAP signing is required on $dc"
         }
         else {
-            Write-Both "    [!] Issue identified LDAP signing is not enabled on $computerName, the registry value is currently set to $ldapSigning."
-            Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAP signing is not enabled on $computerName, the registry key does not exist"
-            Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP signing is not enabled on $computerName, the registry key does not exist"
+            $lvl = if ($null -eq $sig.Value) { 'not set (default 1 = negotiate, not enforced)' } else { $sig.Value }
+            Write-Both "    [!] LDAP signing is not enforced on $dc (LDAPServerIntegrity = $lvl)"
+            Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAP signing is not enforced on $dc (LDAPServerIntegrity = $lvl)"
+            Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP signing is not enforced on $dc (LDAPServerIntegrity = $lvl)"
         }
-    }
-    catch {
-        Write-Both "    [!] Issue identified LDAP signing is not enabled on $computerName, the registry key does not exist."
-        Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAP signing is not enabled on $computerName, the registry key does not exist"
-        Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP signing is not enabled on $computerName, the registry key does not exist"
-    }
 
-    # Check if LDAPS is configured
-    $serverAuthOid = '1.3.6.1.5.5.7.3.1'
-    $ldapsCert = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object {
-        $_.Extensions -like "System.Security.Cryptography.Oid*" -and
-        $_.Extensions.Oid.Value -eq $serverAuthOid
-    }
-
-    if ($ldapsCert) {
-        Write-Both "    [+] LDAPS is configured on $computerName"
-    }
-    else {
-        Write-Both "    [!] Issue identified LDAPS is not configured on $computerName, LDAPs certificates are not configured"
-        Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAPS is not configured on $computerName, LDAPs certificates are not configured"
-        Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAPS is not configured on $computerName, LDAPs certificates are not configured"
-    }
-
-
-    # Check if LDAPS Channel binding is enabled
-    try {
-        $ldapsBinding = (Get-ItemProperty "HKLM:\System\CurrentControlSet\Services\NTDS\Parameters" -Name "LdapEnforceChannelBinding" -ErrorAction Stop).LdapEnforceChannelBinding
-
-        if ($ldapsBinding -eq 2) {
-            Write-Both "    [+] LDAPS channel binding is enabled on $computerName"
+        # --- LDAP channel binding (LdapEnforceChannelBinding; 2 = always) ---
+        $cb = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $ntdsKey -ValueName 'LdapEnforceChannelBinding'
+        if (-not $cb.Success) {
+            Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target $dc -RequiresRemotePS -Reason "Could not read NTDS\Parameters\LdapEnforceChannelBinding on $dc (needs the DC's registry over CIM/DCOM/WinRM): $($cb.Error)"
+        }
+        elseif ($cb.Value -eq 2) {
+            Write-Both "    [+] LDAP channel binding is enforced (always) on $dc"
         }
         else {
-            Write-Both "    [!] Issue identified LDAPS channel binding is not enabled on $computerName, currently set to $ldapsBinding"
-            Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAPS channel binding is not enabled on $computerName, currently set to $ldapsBinding"
-            Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAPS channel binding is not enabled on $computerName, currently set to $ldapsBinding"
+            $lvl = if ($null -eq $cb.Value) { 'not set' } else { $cb.Value }
+            Write-Both "    [!] LDAP channel binding is not enforced on $dc (LdapEnforceChannelBinding = $lvl)"
+            Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAP channel binding is not enforced on $dc (LdapEnforceChannelBinding = $lvl)"
+            Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP channel binding is not enforced on $dc (LdapEnforceChannelBinding = $lvl)"
+        }
+
+        # --- LDAPS certificate present (Server Authentication EKU in the DC's LocalMachine\My) ---
+        try {
+            $hasLdapsCert = Invoke-Command -ComputerName $dc -ArgumentList $serverAuthOid -ScriptBlock {
+                param($oid)
+                [bool](Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction Stop | Where-Object {
+                    ($_.EnhancedKeyUsageList.ObjectId -contains $oid) -or
+                    ($_.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } | ForEach-Object { $_.EnhancedKeyUsages.Value }) -contains $oid
+                })
+            } -ErrorAction Stop
+
+            if ($hasLdapsCert) {
+                Write-Both "    [+] LDAPS (Server Authentication) certificate present on $dc"
+            }
+            else {
+                Write-Both "    [!] No LDAPS (Server Authentication) certificate found on $dc"
+                Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "No LDAPS (Server Authentication) certificate found on $dc"
+                Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "No LDAPS (Server Authentication) certificate found on $dc"
+            }
+        }
+        catch {
+            Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target $dc -RequiresRemotePS -Reason "Could not enumerate the DC's certificate store for an LDAPS certificate (needs WinRM to $dc): $($_.Exception.Message)"
         }
     }
-    catch {
-        Write-Both "    [!] Issue identified LDAPS channel binding is not enabled on $computerName, the registry key does not exist"
-        Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAPS channel binding is not enabled on $computerName, the registry key does not exist"
-        Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAPS channel binding is not enabled on $computerName, the registry key does not exist"
-    }
 
-
-    # Check for LDAP null sessions
+    # --- LDAP anonymous (null) bind: a network test, valid from any host ---
     $Server = (Get-ADDomainController -Discover).HostName
     $Port = 389
-
     try {
-        # Load required assemblies
         Add-Type -AssemblyName System.DirectoryServices.Protocols
-
-        # Create LDAP connection
         $ldapConnection = New-Object System.DirectoryServices.Protocols.LdapConnection("$Server`:$Port")
-
-        # Set connection timeout
         $ldapConnection.Timeout = [System.TimeSpan]::FromSeconds(5)
-
-        # Create an empty NetworkCredential for anonymous bind
         $anonymousCredential = New-Object System.Net.NetworkCredential("", "")
-
-        # Bind to the LDAP server anonymously
         $ldapConnection.Bind($anonymousCredential)
 
         Write-Both "    [!] Issue identified LDAP null session allowed on server $Server`:$Port"
@@ -5905,7 +6166,7 @@ function Get-LDAPSecurity {
         Write-Both "    [+] LDAP null session not allowed on server $Server`:$Port"
     }
     catch {
-        Write-Both "Error occurred: $_"
+        Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target "$Server`:$Port" -Reason "LDAP null-bind test could not run: $($_.Exception.Message)"
     }
 }
 
@@ -5936,10 +6197,19 @@ function Get-ADObjectAclSafe {
 function Find-DangerousACLPermissions {
     #Specify the ACLs and Groups to check against
     $dangerousAces = @('GenericAll', 'GenericWrite', 'ForceChangePassword', 'WriteDacl', 'WriteOwner', 'Delete')
-    $groupsToCheck = @('NT AUTHORITY\Authenticated Users', 'DOMAIN\Domain Users', 'Everyone')
+    # Build the low-privilege identity list dynamically. The literal 'DOMAIN\Domain Users'
+    # placeholder never matched a real IdentityReference (e.g. 'CONTOSO\Domain Users'),
+    # so the whole check silently found nothing. Use the locale-correct script variables
+    # populated by Get-Variables and qualify Domain Users with the real NetBIOS name.
+    $nbDomain  = try { (Get-ADDomain).NetBIOSName } catch { $env:USERDOMAIN }
+    $authUsers = if ($script:AuthenticatedUsers) { $script:AuthenticatedUsers } else { 'NT AUTHORITY\Authenticated Users' }
+    $everyone  = if ($script:EveryOne)           { $script:EveryOne }           else { 'Everyone' }
+    $domUsers  = if ($script:DomainUsers)         { $script:DomainUsers }         else { 'Domain Users' }
+    $groupsToCheck = @($authUsers, $everyone, "$nbDomain\$domUsers")
 
     # Find dangerous permissions on Computers
-    $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties *
+    $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties Name -ResultPageSize 2000
+    $ci = 0
     $computerResults = foreach ($computer in $computers) {
         try {
             $acl = Get-ADObjectAclSafe -DistinguishedName $computer.DistinguishedName
@@ -5949,7 +6219,10 @@ function Find-DangerousACLPermissions {
             continue
         }
 
-        $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
+        $dangerousRules = $acl.Access | Where-Object {
+            ([string]$_.IdentityReference -in $groupsToCheck) -and
+            ((($_.ActiveDirectoryRights.ToString()) -split ',\s*') | Where-Object { $_ -in $dangerousAces })
+        }
 
         if ($dangerousRules) {
             foreach ($rule in $dangerousRules) {
@@ -5962,11 +6235,13 @@ function Find-DangerousACLPermissions {
                 }
             }
         }
-        Write-Progress -Activity "Searching for dangerous ACL permissions on computers" -Status "Computers searched: $($computers.IndexOf($computer) + 1)/$($computers.Count)" -PercentComplete (($computers.IndexOf($computer) + 1) / $computers.Count * 100)
+        $ci++
+        Write-Progress -Activity "Searching for dangerous ACL permissions on computers" -Status "Computers searched: $ci/$($computers.Count)" -PercentComplete ($ci / $computers.Count * 100)
     }
 
     # Find dangerous permissions on groups
-    $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties *
+    $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties Name -ResultPageSize 2000
+    $gi = 0
     $groupResults = foreach ($group in $groups) {
         try {
             $acl = Get-ADObjectAclSafe -DistinguishedName $group.DistinguishedName
@@ -5976,7 +6251,10 @@ function Find-DangerousACLPermissions {
             continue
         }
 
-        $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
+        $dangerousRules = $acl.Access | Where-Object {
+            ([string]$_.IdentityReference -in $groupsToCheck) -and
+            ((($_.ActiveDirectoryRights.ToString()) -split ',\s*') | Where-Object { $_ -in $dangerousAces })
+        }
 
         if ($dangerousRules) {
             foreach ($rule in $dangerousRules) {
@@ -5989,16 +6267,21 @@ function Find-DangerousACLPermissions {
                 }
             }
         }
-        Write-Progress -Activity "Searching for dangerous ACL permissions on groups" -Status "Groups searched: $($groups.IndexOf($group) + 1)/$($groups.Count)" -PercentComplete (($groups.IndexOf($group) + 1) / $groups.Count * 100)
+        $gi++
+        Write-Progress -Activity "Searching for dangerous ACL permissions on groups" -Status "Groups searched: $gi/$($groups.Count)" -PercentComplete ($gi / $groups.Count * 100)
     }
     # Find dangerous permissions on users
-    $users = Get-ADObject -Filter { objectClass -eq 'user' -and objectCategory -eq 'person' } -Properties *
+    $users = Get-ADObject -Filter { objectClass -eq 'user' -and objectCategory -eq 'person' } -Properties Name -ResultPageSize 2000
+    $ui = 0
 
     $userResults = foreach ($user in $users) {
         $acl = $null
         $acl = Get-ADObjectAclSafe -DistinguishedName $user.DistinguishedName
         if ($acl) {
-            $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
+            $dangerousRules = $acl.Access | Where-Object {
+            ([string]$_.IdentityReference -in $groupsToCheck) -and
+            ((($_.ActiveDirectoryRights.ToString()) -split ',\s*') | Where-Object { $_ -in $dangerousAces })
+        }
             if ($dangerousRules) {
                 foreach ($rule in $dangerousRules) {
                     [PSCustomObject]@{
@@ -6010,7 +6293,8 @@ function Find-DangerousACLPermissions {
                     }
                 }
             }
-            Write-Progress -Activity "Searching for dangerous ACL permissions on users" -Status "Users searched: $($users.IndexOf($user) + 1)/$($users.Count)" -PercentComplete (($users.IndexOf($user) + 1) / $users.Count * 100)
+            $ui++
+            Write-Progress -Activity "Searching for dangerous ACL permissions on users" -Status "Users searched: $ui/$($users.Count)" -PercentComplete ($ui / $users.Count * 100)
         }
     }
 
@@ -6193,22 +6477,27 @@ function ConvertFrom-trustType {
 
 function ConvertFrom-trustAttribute {
     param([Parameter(Mandatory=$true, ValueFromPipeline=$true)]$Value)
-    $trustAttribute = @{
-        0='Non-Verifiable Trust'
-        1='Non-Transitive Trust'
-        2='Up-level Trust'
-        4='Quarantined Domain External Trust (SID Filtering Enabled)'
-        8='Forest Transitive Trust'
-        16='Selective Authentication'
-        20='Intra-Forest Trust'
-        32='Forest-Internal'
-        64='SIDHistory enabled'
-        80='Uses RC4 Encryption'
-        400='PIM Trust'
+    # trustAttributes is a bitmask (MS-ADTS), so decode each flag rather than
+    # doing an exact key lookup (which mislabels any combined value as "Unknown").
+    $trustAttribute = [ordered]@{
+        0x1   = 'Non-Transitive'
+        0x2   = 'Up-level Only'
+        0x4   = 'Quarantined Domain (SID Filtering Enabled)'
+        0x8   = 'Forest Transitive'
+        0x10  = 'Cross-Organization (Selective Authentication)'
+        0x20  = 'Within Forest'
+        0x40  = 'Treat As External'
+        0x80  = 'Uses RC4 Encryption'
+        0x200 = 'Cross-Organization No TGT Delegation'
+        0x400 = 'PIM (PAM) Trust'
+        0x800 = 'Cross-Organization Enable TGT Delegation'
     }
     if ($null -eq $Value) { return "Unknown Trust Attribute - No Value Available" }
-    if ($trustAttribute.ContainsKey([int]$Value)) { return [string]$trustAttribute[[int]$Value] }
-    return "Unknown Trust Attribute - $Value"
+    $val = [int]$Value
+    if ($val -eq 0) { return 'Non-Verifiable / No attributes set' }
+    $matched = foreach ($bit in $trustAttribute.Keys) { if ($val -band $bit) { $trustAttribute[$bit] } }
+    if (-not $matched) { return "Unknown Trust Attribute - $Value" }
+    return ($matched -join ', ')
 }
 
 function Export-ADAuditDataExtract {
@@ -8816,8 +9105,15 @@ Function Get-GMSAStatus {
 Function Get-TombstoneLifetime {
     # Checks the forest tombstone lifetime configuration
     # Low tombstone lifetime reduces the window for AD Recycle Bin recovery
-    $configNC = (Get-ADRootDSE).configurationNamingContext
-    $tombstoneObj = Get-ADObject "CN=Directory Service,CN=Windows NT,CN=Services,$configNC" -Properties tombstoneLifetime -ErrorAction SilentlyContinue
+    try {
+        $configNC = (Get-ADRootDSE -ErrorAction Stop).configurationNamingContext
+        $tombstoneObj = Get-ADObject "CN=Directory Service,CN=Windows NT,CN=Services,$configNC" -Properties tombstoneLifetime -ErrorAction Stop
+    }
+    catch {
+        # A FAILED read is not the same as "not configured" - do not emit a (false) finding.
+        Register-ADAuditNotAssessed -Name 'Get-TombstoneLifetime' -Switch 'domainaudit' -Reason "Could not read the tombstoneLifetime configuration object: $($_.Exception.Message)"
+        return
+    }
     $lifetime = $tombstoneObj.tombstoneLifetime
 
     if ($null -eq $lifetime) {
@@ -8838,6 +9134,7 @@ Function Get-PrintSpoolerOnDCs {
     # Checks if Print Spooler service is running on domain controllers
     # PrintNightmare (CVE-2021-34527) and coercion attacks exploit the spooler service
     $count = 0
+    $assessed = 0
     $evidencePath = Get-EvidencePath 'dc_print_spooler.txt'
     Remove-Item -LiteralPath $evidencePath -Force -ErrorAction SilentlyContinue
 
@@ -8846,16 +9143,21 @@ Function Get-PrintSpoolerOnDCs {
     foreach ($dc in $dcList) {
         try {
             $spooler = Get-ADAuditCimInstance -ClassName Win32_Service -Filter "Name='Spooler'" -ComputerName $dc -UseWsmanFallback
-            if ($spooler -and $spooler.State -eq 'Running') {
+            if (-not $spooler) {
+                Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "Win32_Service query returned no data for the Spooler service (DC unreachable over CIM/DCOM or WinRM); spooler state unknown."
+                continue
+            }
+            $assessed++
+            if ($spooler.State -eq 'Running') {
                 Add-Content -Path $evidencePath -Value "Print Spooler is RUNNING on DC: $dc (StartMode: $($spooler.StartMode))"
                 $count++
             }
-            elseif ($spooler) {
+            else {
                 Write-Both "    [+] Print Spooler is $($spooler.State) on DC: $dc"
             }
         }
         catch {
-            Write-Both "    [!] Could not query Print Spooler status on DC: $dc - $_"
+            Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "Could not query Print Spooler over CIM/DCOM or WinRM: $($_.Exception.Message)"
         }
     }
 
@@ -8863,8 +9165,11 @@ Function Get-PrintSpoolerOnDCs {
         Write-Both "    [!] Print Spooler is running on $count domain controller(s) - disable to mitigate PrintNightmare and coercion attacks (KB1203)"
         Write-Nessus-Finding "PrintSpoolerOnDC" "KB1203" ([System.IO.File]::ReadAllText($evidencePath))
     }
+    elseif ($assessed -eq 0) {
+        Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -RequiresRemotePS -Reason "Print Spooler state could not be queried on ANY domain controller ($($dcList.Count) total). Requires CIM/DCOM or WinRM to the DCs; from a non-DC host with those blocked the spooler posture is unknown, not 'not running'."
+    }
     else {
-        Write-Both "    [+] Print Spooler is not running on any domain controller"
+        Write-Both "    [+] Print Spooler is not running on any of the $assessed of $($dcList.Count) domain controller(s) assessed"
     }
 }
 
@@ -8876,47 +9181,41 @@ Function Get-SMBSigningStatus {
     Remove-Item -LiteralPath $evidencePath -Force -ErrorAction SilentlyContinue
 
     $dcList = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+    $assessed = 0
 
     foreach ($dc in $dcList) {
-        try {
-            $regParams = @{
-                ClassName    = 'StdRegProv'
-                Namespace    = 'root/default'
-                ComputerName = $dc
-            }
+        # Primary: read the DC's registry via StdRegProv, DCOM first then WSMan/WinRM.
+        $reg = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -ValueName 'RequireSecuritySignature'
+        $requireSigning = $null
 
-            # Check RequireSecuritySignature (EnableSecuritySignature is the weaker setting)
-            $requireSigning = $null
+        if ($reg.Success) {
+            $requireSigning = $reg.Value   # $null here means the value is not set on the DC
+            $assessed++
+        }
+        else {
+            # Fallback: Get-SmbServerConfiguration over WinRM
             try {
-                $result = Invoke-CimMethod -ClassName StdRegProv -Namespace 'root/default' -MethodName GetDWORDValue -Arguments @{
-                    hDefKey     = [uint32]2147483650  # HKLM
-                    sSubKeyName = 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
-                    sValueName  = 'RequireSecuritySignature'
-                } -CimSession (New-CimSession -ComputerName $dc -ErrorAction Stop) -ErrorAction Stop
-                $requireSigning = $result.uValue
+                $smbConfig = Invoke-Command -ComputerName $dc -ScriptBlock { (Get-SmbServerConfiguration).RequireSecuritySignature } -ErrorAction Stop
+                $requireSigning = if ($smbConfig) { 1 } else { 0 }
+                $assessed++
             }
             catch {
-                # Fallback: try Get-SmbServerConfiguration if available
-                try {
-                    $smbConfig = Invoke-Command -ComputerName $dc -ScriptBlock { (Get-SmbServerConfiguration).RequireSecuritySignature } -ErrorAction Stop
-                    $requireSigning = if ($smbConfig) { 1 } else { 0 }
-                }
-                catch {
-                    Write-Both "    [!] Could not query SMB signing status on DC: $dc - $_"
-                    continue
-                }
-            }
-
-            if ($null -ne $requireSigning -and $requireSigning -ne 1) {
-                Add-Content -Path $evidencePath -Value "SMB signing is NOT required on DC: $dc (RequireSecuritySignature = $requireSigning)"
-                $count++
-            }
-            else {
-                Write-Both "    [+] SMB signing is required on DC: $dc"
+                Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "SMB signing posture needs the DC's registry (StdRegProv over CIM/DCOM/WinRM) or Get-SmbServerConfiguration over WinRM; neither was reachable: $($reg.Error)"
+                continue
             }
         }
-        catch {
-            Write-Both "    [!] Could not query SMB signing status on DC: $dc - $_"
+
+        if ($null -eq $requireSigning) {
+            # Reached the DC but the value is not present. The effective default varies
+            # by OS/policy, so do not assert "required" and do not score it.
+            Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Target $dc -Reason "RequireSecuritySignature is not set in the registry on $dc; the effective value depends on OS default/policy and could not be confirmed."
+        }
+        elseif ($requireSigning -ne 1) {
+            Add-Content -Path $evidencePath -Value "SMB signing is NOT required on DC: $dc (RequireSecuritySignature = $requireSigning)"
+            $count++
+        }
+        else {
+            Write-Both "    [+] SMB signing is required on DC: $dc"
         }
     }
 
@@ -8924,8 +9223,11 @@ Function Get-SMBSigningStatus {
         Write-Both "    [!] SMB signing is not enforced on $count domain controller(s) - enables NTLM relay attacks (KB1204)"
         Write-Nessus-Finding "SMBSigningNotRequired" "KB1204" ([System.IO.File]::ReadAllText($evidencePath))
     }
+    elseif ($assessed -eq 0) {
+        Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -RequiresRemotePS -Reason "SMB signing could not be queried on ANY domain controller ($($dcList.Count) total). Requires remote registry (CIM/DCOM/WinRM) or Get-SmbServerConfiguration over WinRM. Posture is unknown, not 'enforced'."
+    }
     else {
-        Write-Both "    [+] SMB signing is required on all domain controllers"
+        Write-Both "    [+] SMB signing is required on all of the $assessed of $($dcList.Count) domain controller(s) assessed"
     }
 }
 
@@ -9675,6 +9977,24 @@ if ($needsDSInternals) {
 if (Test-Path "$outputdir\adaudit.nessus") { Remove-Item -LiteralPath "$outputdir\adaudit.nessus" -Force | Out-Null }
 Write-Nessus-Header
 Write-Both "[+] Outputting to $outputdir"
+
+# Preflight: detect whether we are running ON a Domain Controller. Several checks read
+# host-local settings (registry/SMB config) that are only meaningful on a DC, or must
+# reach the DCs over remote PowerShell/CIM. When run from a member/Tier-0 jump server
+# those checks degrade to "could not assess" (recorded, never scored) rather than
+# auditing the wrong host or asserting a false all-clear.
+if ($needsActiveDirectory) {
+    if (Test-ADAuditIsDomainController) {
+        Write-Both "[+] Host role: this host IS a Domain Controller - host-local DC checks read the local machine."
+    }
+    else {
+        Write-Both "[~] Host role: this host is NOT a Domain Controller (member/Tier-0 jump server)."
+        Write-Both "    Checks that need the DCs' registry/services/SMB/SYSVOL will use remote PowerShell/CIM"
+        Write-Both "    (WinRM or DCOM) to each DC. Where that is unavailable, the affected check is recorded as"
+        Write-Both "    'could not assess' in not_assessed.txt with the reason - this does NOT raise the risk score."
+    }
+}
+
 if ($needsActiveDirectory) {
     Write-Both "[*] Lang specific variables"
     Get-Variables
@@ -9867,6 +10187,7 @@ if (!$running) {
     Write-Both "    -KeepLegacyArtifacts is retained for backward compatibility; raw data and evidence files are preserved in .\\<COMPUTERNAME>\\Raw Data by default"
 }
 Write-CheckFailuresReport -BaseRoot $outputdir
+Write-NotAssessedReport -BaseRoot $outputdir
 Write-Nessus-Footer
 
 # Sanitize .nessus XML characters in-place (no duplicate file)
