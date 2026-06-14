@@ -2308,7 +2308,215 @@ Function Get-ADHealth {
     }
 
     # ============================================================
-    # 4) NTDS database
+    # 4) FSMO role holders & operations-master health
+    #
+    # Treats FSMO as INVENTORY + RISK VALIDATION, not "co-location is bad".
+    # Co-locating roles on one DC (e.g. RID + PDC) is a normal, supported
+    # layout, so simple co-location is reported as informational only and
+    # is never failed on its own. A role IS flagged when its holder is
+    # missing/unassigned, unresolvable in DNS, an RODC (read-only DCs
+    # cannot own an operations-master role), unreachable on LDAP/ADWS,
+    # not replicating, or - for the forest-root PDC emulator - has no
+    # authoritative external time source.
+    # ============================================================
+    $fsmoPath = Join-Path $rawDir 'health_fsmo.txt'
+    $fsmoSb   = New-Object System.Text.StringBuilder
+    $fsmoCritical = 0   # Critical findings -> Fail card
+    $fsmoHigh     = 0   # High findings     -> Fail card
+    $fsmoWarn     = 0   # Medium findings   -> Warn card
+    [void]$fsmoSb.AppendLine('=== FSMO role holders & operations-master health ===')
+    [void]$fsmoSb.AppendLine('The five FSMO (operations master) roles:')
+    [void]$fsmoSb.AppendLine('  Forest-wide : SchemaMaster, DomainNamingMaster')
+    [void]$fsmoSb.AppendLine('  Per-domain  : PDCEmulator, RIDMaster, InfrastructureMaster')
+    [void]$fsmoSb.AppendLine('Co-locating roles on one DC (e.g. RID + PDC) is normal and supported,')
+    [void]$fsmoSb.AppendLine('and is reported as informational only - never failed on its own.')
+    [void]$fsmoSb.AppendLine('A role is flagged when its holder is missing, unresolvable in DNS, an')
+    [void]$fsmoSb.AppendLine('RODC, unreachable on LDAP/ADWS, not replicating, or (forest-root PDC)')
+    [void]$fsmoSb.AppendLine('has no authoritative external time source.')
+    [void]$fsmoSb.AppendLine('')
+
+    $fsmoRoles      = New-Object System.Collections.Generic.List[object]
+    $forestRootPdc  = $null
+    $fsmoEnumerated = $false
+    try {
+        $fsmoForest = Get-ADForest -ErrorAction Stop
+        $fsmoRoles.Add([pscustomobject]@{ Scope='Forest'; Role='SchemaMaster';       Holder=[string]$fsmoForest.SchemaMaster })       | Out-Null
+        $fsmoRoles.Add([pscustomobject]@{ Scope='Forest'; Role='DomainNamingMaster'; Holder=[string]$fsmoForest.DomainNamingMaster }) | Out-Null
+        $rootDomainName = [string]$fsmoForest.RootDomain
+        foreach ($domName in $fsmoForest.Domains) {
+            try {
+                $fsmoDom = Get-ADDomain -Server $domName -ErrorAction Stop
+                if ($domName -eq $rootDomainName) { $forestRootPdc = [string]$fsmoDom.PDCEmulator }
+                $fsmoRoles.Add([pscustomobject]@{ Scope=$domName; Role='PDCEmulator';          Holder=[string]$fsmoDom.PDCEmulator })          | Out-Null
+                $fsmoRoles.Add([pscustomobject]@{ Scope=$domName; Role='RIDMaster';            Holder=[string]$fsmoDom.RIDMaster })            | Out-Null
+                $fsmoRoles.Add([pscustomobject]@{ Scope=$domName; Role='InfrastructureMaster'; Holder=[string]$fsmoDom.InfrastructureMaster }) | Out-Null
+            } catch {
+                [void]$fsmoSb.AppendLine("[!] Could not query domain '$domName' (PDC/RID/Infrastructure not validated): $($_.Exception.Message)")
+                _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title 'Per-domain FSMO holders could not be determined' -Evidence "Get-ADDomain -Server $domName failed: $($_.Exception.Message). PDC/RID/Infrastructure roles for this domain were not validated." -Source $fsmoPath
+                $fsmoWarn++
+            }
+        }
+        $fsmoEnumerated = $true
+    } catch {
+        [void]$fsmoSb.AppendLine("[!] Could not query the forest for FSMO holders: $($_.Exception.Message)")
+        _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title 'FSMO role holders could not be enumerated' -Evidence "Get-ADForest failed: $($_.Exception.Message). FSMO inventory and validation were skipped - run from a domain-joined host with AD reachable." -Source $fsmoPath
+        $fsmoWarn++
+    }
+
+    if ($fsmoEnumerated -and $fsmoRoles.Count -gt 0) {
+        # --- Probe each unique holder once (a single DC can hold several roles) ---
+        $holderProbe = @{}
+        foreach ($h in (@($fsmoRoles | ForEach-Object { $_.Holder } | Where-Object { $_ } | Sort-Object -Unique))) {
+            $hKey = $h.ToLowerInvariant()
+            $found = $false; $isRodc = $null; $site = $null; $ipv4 = $null
+            try {
+                $hdc = Get-ADDomainController -Identity $h -ErrorAction Stop
+                $found = $true; $isRodc = [bool]$hdc.IsReadOnly; $site = [string]$hdc.Site; $ipv4 = [string]$hdc.IPv4Address
+            } catch {
+                try {
+                    $hdc = Get-ADDomainController -Identity $h -Server $h -ErrorAction Stop
+                    $found = $true; $isRodc = [bool]$hdc.IsReadOnly; $site = [string]$hdc.Site; $ipv4 = [string]$hdc.IPv4Address
+                } catch { }
+            }
+            $dnsOk = $false
+            try { if (Resolve-DnsName -Name $h -Type A -ErrorAction Stop) { $dnsOk = $true } } catch { }
+            $ldapOk = $false; $adwsOk = $false
+            if ($dnsOk -or $found) {
+                $ldapOk = _Test-DCTcp -Target $h -Port 389
+                $adwsOk = _Test-DCTcp -Target $h -Port 9389
+            }
+            # $replOk: $true = fresh, $false = CONFIRMED stale (partners returned but
+            # older than 24h), $null = could NOT verify (single DC with no partners,
+            # or a cross-domain/RPC-restricted holder we cannot query). Only the
+            # confirmed-stale ($false) case raises a finding, so a healthy holder we
+            # simply cannot reach for metadata is never falsely flagged.
+            $replOk = $null; $lastRepl = $null
+            try {
+                $rp = Get-ADReplicationPartnerMetadata -Target $h -Scope Server -ErrorAction Stop
+                if ($rp) {
+                    $stale = $false
+                    foreach ($p in $rp) { $lastRepl = $p.LastReplicationSuccess; if (-not $lastRepl -or $lastRepl -lt (Get-Date).AddDays(-1)) { $stale = $true } }
+                    $replOk = -not $stale
+                }
+            } catch { $replOk = $null }
+            $holderProbe[$hKey] = [pscustomobject]@{ Holder=$h; Found=$found; IsRODC=$isRodc; DNS=$dnsOk; LDAP=$ldapOk; ADWS=$adwsOk; ReplFresh=$replOk; LastRepl=$lastRepl; Site=$site; IPv4=$ipv4 }
+        }
+
+        # --- Inventory ---
+        [void]$fsmoSb.AppendLine('--- Current FSMO holders ---')
+        foreach ($fr in $fsmoRoles) {
+            [void]$fsmoSb.AppendLine(("  {0,-20} [{1}] -> {2}" -f $fr.Role, $fr.Scope, $(if ($fr.Holder) { $fr.Holder } else { '(unassigned)' })))
+        }
+        [void]$fsmoSb.AppendLine('')
+        [void]$fsmoSb.AppendLine('--- Per-holder validation ---')
+
+        foreach ($fr in $fsmoRoles) {
+            $role = $fr.Role; $holder = $fr.Holder
+            # Reachability impact: PDC and RID are the highest-impact operations
+            # masters (password/lockout/time, and SID-pool issuance). The others
+            # degrade to Warning when unreachable.
+            $reachSev = if ($role -in @('PDCEmulator','RIDMaster')) { 'Critical' } else { 'Medium' }
+
+            if (-not $holder) {
+                [void]$fsmoSb.AppendLine("  $role [$($fr.Scope)] -> HOLDER UNASSIGNED")
+                _Add-HFinding -Category 'FSMO' -Severity 'Critical' -Title "FSMO role $role has no holder" -Evidence "The $role role ($($fr.Scope)) has no assigned owner. Operations that depend on this role will fail until it is seized to a healthy writable DC." -Source $fsmoPath
+                $fsmoCritical++
+                [void]$fsmoSb.AppendLine('')
+                continue
+            }
+
+            $pr = $holderProbe[$holder.ToLowerInvariant()]
+            [void]$fsmoSb.AppendLine(("  {0} [{1}] -> {2}" -f $role, $fr.Scope, $holder))
+            if ($pr) {
+                [void]$fsmoSb.AppendLine(("      DC object found  : {0}{1}" -f $pr.Found, $(if ($pr.Found) { "  (Site=$($pr.Site), IPv4=$($pr.IPv4))" } else { '' })))
+                [void]$fsmoSb.AppendLine(("      DNS resolves     : {0}" -f $pr.DNS))
+                [void]$fsmoSb.AppendLine(("      LDAP TCP 389     : {0}" -f $pr.LDAP))
+                [void]$fsmoSb.AppendLine(("      ADWS TCP 9389    : {0}" -f $pr.ADWS))
+                [void]$fsmoSb.AppendLine(("      Read-only (RODC) : {0}" -f $pr.IsRODC))
+                [void]$fsmoSb.AppendLine(("      Replication fresh: {0} (last success: {1})" -f $pr.ReplFresh, $(if ($pr.LastRepl) { $pr.LastRepl } else { 'unknown' })))
+
+                if (-not $pr.DNS) {
+                    _Add-HFinding -Category 'FSMO' -Severity $reachSev -Title "FSMO holder does not resolve in DNS" -Evidence "The $role holder '$holder' ($($fr.Scope)) has no A record / DNS resolution failed. DCs and clients locate the role owner via DNS; an unresolvable holder makes $role unreachable. Common causes: the holder was decommissioned without transferring the role, or its DNS record was removed." -Source $fsmoPath
+                    if ($reachSev -eq 'Critical') { $fsmoCritical++ } else { $fsmoWarn++ }
+                } elseif (-not $pr.LDAP) {
+                    _Add-HFinding -Category 'FSMO' -Severity $reachSev -Title "FSMO holder unreachable on LDAP (389)" -Evidence "The $role holder '$holder' resolves in DNS but is not reachable on TCP 389 (LDAP) from $env:COMPUTERNAME. An offline/firewalled operations master blocks role-dependent operations (PDC: password changes, lockouts, GPO targeting, forest time; RID: new-object SID pools)." -Source $fsmoPath
+                    if ($reachSev -eq 'Critical') { $fsmoCritical++ } else { $fsmoWarn++ }
+                }
+                if ($pr.DNS -and -not $pr.ADWS) {
+                    _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title "FSMO holder unreachable on ADWS (9389)" -Evidence "The $role holder '$holder' is not reachable on TCP 9389 (Active Directory Web Services). FSMO operations themselves do not require ADWS, but PowerShell/RSAT management of this DC and discovery tooling will fail against it." -Source $fsmoPath
+                    $fsmoWarn++
+                }
+                if ($pr.Found -and $pr.IsRODC -eq $true) {
+                    _Add-HFinding -Category 'FSMO' -Severity 'Critical' -Title "Operations-master role held by a read-only DC (RODC)" -Evidence "The $role holder '$holder' is an RODC. RODCs hold a read-only replica and cannot perform operations-master writes - this role must be moved to a writable DC." -Source $fsmoPath
+                    $fsmoCritical++
+                }
+                if ($pr.Found -and $pr.ReplFresh -eq $false) {
+                    _Add-HFinding -Category 'FSMO' -Severity 'High' -Title "FSMO holder is not replicating" -Evidence "The $role holder '$holder' is reachable but has no confirmed successful inbound replication in the last 24h (last success: $(if ($pr.LastRepl) { $pr.LastRepl } else { 'unknown' })). A reachable-but-non-replicating operations master serves stale data and is a latent outage." -Source $fsmoPath
+                    $fsmoHigh++
+                }
+                if ($pr.DNS -and $pr.LDAP -and -not $pr.Found) {
+                    [void]$fsmoSb.AppendLine('      Note: holder resolves and answers on LDAP but its DC object could not be read (cross-domain / ADWS / permissions). RODC and replication state were not validated for this holder.')
+                }
+            } else {
+                [void]$fsmoSb.AppendLine('      (no probe result)')
+            }
+            [void]$fsmoSb.AppendLine('')
+        }
+
+        # --- Role placement / co-location (informational only) ---
+        [void]$fsmoSb.AppendLine('--- Role placement (informational - co-location is normal) ---')
+        $byHolder = @($fsmoRoles | Where-Object { $_.Holder } | Group-Object { $_.Holder.ToLowerInvariant() })
+        foreach ($g in $byHolder) {
+            $rolesOn = ($g.Group | ForEach-Object { $_.Role }) -join ', '
+            [void]$fsmoSb.AppendLine(("  {0}: {1}" -f $g.Group[0].Holder, $rolesOn))
+        }
+        $allOnOne = @($byHolder | Where-Object { $_.Count -ge 5 })
+        if ($allOnOne.Count -gt 0) {
+            [void]$fsmoSb.AppendLine('')
+            [void]$fsmoSb.AppendLine("  [i] All FSMO roles are held by a single DC ($($allOnOne[0].Group[0].Holder)). This is common")
+            [void]$fsmoSb.AppendLine('      and supported in a single-domain forest; noted for documentation and DR')
+            [void]$fsmoSb.AppendLine('      planning, not flagged as a problem.')
+        }
+        [void]$fsmoSb.AppendLine('')
+
+        # --- Forest-root PDC emulator: authoritative external time source ---
+        if ($forestRootPdc) {
+            [void]$fsmoSb.AppendLine('--- Forest-root PDC emulator time source ---')
+            [void]$fsmoSb.AppendLine("  Forest-root PDC: $forestRootPdc")
+            try {
+                $pdcSource = (w32tm /query /source /computer:$forestRootPdc 2>&1 | Out-String).Trim()
+                [void]$fsmoSb.AppendLine("  w32tm source   : $pdcSource")
+                if ($pdcSource -match '(?i)0x800706BA|error|RPC server is unavailable') {
+                    _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title 'Forest-root PDC time source could not be queried' -Evidence "w32tm /query /source against the forest-root PDC emulator '$forestRootPdc' failed ($pdcSource). The forest-root PDC is the authoritative time source for the entire forest - confirm W32Time and RPC are reachable on it." -Source $fsmoPath
+                    $fsmoWarn++
+                } elseif ($pdcSource -match '(?i)Local CMOS Clock|Free-running System Clock') {
+                    _Add-HFinding -Category 'FSMO' -Severity 'High' -Title 'Forest-root PDC has no authoritative external time source' -Evidence "The forest-root PDC emulator '$forestRootPdc' is syncing from '$pdcSource' rather than an external/hardware NTP source. Every clock in the forest chains to this PDC; with no real upstream source the whole forest can drift and break Kerberos (auth fails at >5 min skew)." -Source $fsmoPath
+                    $fsmoWarn++
+                } else {
+                    [void]$fsmoSb.AppendLine('  Assessment     : external/upstream time source present (OK)')
+                }
+            } catch {
+                [void]$fsmoSb.AppendLine("  w32tm source   : query failed ($($_.Exception.Message))")
+            }
+            [void]$fsmoSb.AppendLine('')
+        }
+    }
+
+    Set-Content -LiteralPath $fsmoPath -Value $fsmoSb.ToString() -Encoding UTF8
+    $fsmoSubtitle = 'Schema, Domain Naming, PDC, RID, Infrastructure: holder writable, resolvable, reachable, replicating'
+    if (($fsmoCritical + $fsmoHigh) -gt 0) {
+        $fsmoDetail = if ($fsmoCritical -gt 0 -and $fsmoHigh -gt 0) { "$fsmoCritical Critical, $fsmoHigh High" }
+                      elseif ($fsmoCritical -gt 0)                  { "$fsmoCritical Critical" }
+                      else                                          { "$fsmoHigh High" }
+        _Add-HTest -Title 'FSMO role holders' -Subtitle $fsmoSubtitle -Status 'Fail' -Detail $fsmoDetail -EvidencePath $fsmoPath
+    } elseif ($fsmoWarn -gt 0) {
+        _Add-HTest -Title 'FSMO role holders' -Subtitle $fsmoSubtitle -Status 'Warn' -Detail "$fsmoWarn issue(s)" -EvidencePath $fsmoPath
+    } else {
+        _Add-HTest -Title 'FSMO role holders' -Subtitle $fsmoSubtitle -Status 'Pass' -Detail 'All FSMO holders healthy' -EvidencePath $fsmoPath
+    }
+
+    # ============================================================
+    # 5) NTDS database
     # ============================================================
     $ntdsPath = Join-Path $rawDir 'health_ntds.txt'
     $ntdsSb   = New-Object System.Text.StringBuilder
@@ -2352,7 +2560,7 @@ Function Get-ADHealth {
     }
 
     # ============================================================
-    # 5) Time synchronization
+    # 6) Time synchronization
     # ============================================================
     $timePath = Join-Path $rawDir 'health_time.txt'
     $timeSb   = New-Object System.Text.StringBuilder
@@ -2386,7 +2594,7 @@ Function Get-ADHealth {
     }
 
     # ============================================================
-    # 6) Core AD services
+    # 7) Core AD services
     # KPSSVC (Kerberos Key Distribution Proxy / KDC Proxy) is OPTIONAL.
     # Many AD deployments leave it Stopped intentionally. We still record
     # its state but classify it as Information, not High/Critical.
@@ -2438,7 +2646,7 @@ Function Get-ADHealth {
     }
 
     # ============================================================
-    # 7) Event log scrape (72h)
+    # 8) Event log scrape (72h)
     # ============================================================
     $evtPath = Join-Path $rawDir 'health_events_72h.txt'
     $evtSb   = New-Object System.Text.StringBuilder
@@ -2478,7 +2686,7 @@ Function Get-ADHealth {
     }
 
     # ============================================================
-    # 8) Sites and subnets
+    # 9) Sites and subnets
     # ============================================================
     $sitePath = Join-Path $rawDir 'health_sites_subnets.txt'
     $siteSb   = New-Object System.Text.StringBuilder
@@ -2504,7 +2712,7 @@ Function Get-ADHealth {
     }
 
     # ============================================================
-    # 9) AD Recycle Bin
+    # 10) AD Recycle Bin
     # ============================================================
     $rbPath = Join-Path $rawDir 'health_recyclebin.txt'
     $rbSb   = New-Object System.Text.StringBuilder
@@ -2528,7 +2736,7 @@ Function Get-ADHealth {
     }
 
     # ============================================================
-    # 10) Group Hygiene
+    # 11) Group Hygiene
     # ============================================================
     $ghPath = Join-Path $rawDir 'health_group_hygiene.txt'
     $ghSb   = New-Object System.Text.StringBuilder
@@ -2904,6 +3112,13 @@ $($testRowsSb.ToString())
             LookFor    = "In the evidence file: 'SYSVOL share NOT reachable' lines, DFSR service state != Running, or NTFRS service in use on a domain that should have migrated."
             HowToFix   = 'Start DFSR (`Start-Service DFSR`). Inspect backlog cross-DC: `dfsrdiag backlog /sm:<source> /rm:<receiving> /rfn:"SYSVOL Share"`. Compare DFS Replication event log on each DC. If migration from FRS is incomplete, complete it before further changes.'
             RerunCmd   = 'Get-Service DFSR -ComputerName <DC>; dfsrdiag backlog /sm:<source-DC> /rm:<receiving-DC> /rfn:"SYSVOL Share"'
+        }
+        'FSMO role holders' = @{
+            Summary    = 'Inventories the five operations-master (FSMO) role holders - SchemaMaster and DomainNamingMaster (forest-wide) plus PDCEmulator, RIDMaster and InfrastructureMaster (per domain) - then validates each holder: is it a real writable DC (not an RODC), does it resolve in DNS, is it reachable on LDAP 389 and ADWS 9389, is it still replicating, and (forest-root PDC) does it have an authoritative external time source. Co-location of roles on one DC is reported as informational only.'
+            WhyMatters = 'Each FSMO role is single-owner - only one DC performs that operation at a time. If a holder is offline, decommissioned-but-not-transferred, an RODC, unresolvable or not replicating, the dependent operations silently fail: the PDC emulator drives password changes, account lockouts, GPO editing and forest time; the RID master hands out SID pools (no new users/computers once a DC exhausts its pool); Schema and Domain Naming gate schema edits and domain/partition changes. Co-locating roles on one DC (e.g. RID + PDC) is a normal, supported layout, so this check never fails on co-location alone.'
+            LookFor    = "In the evidence file (health_fsmo.txt): the 'Current FSMO holders' inventory, then per-holder lines such as 'DC object found: False', 'Read-only (RODC): True', 'DNS resolves: False', 'LDAP TCP 389: False' or 'Replication fresh: False', plus the forest-root PDC time-source assessment."
+            HowToFix   = 'For a missing/orphaned or RODC holder, transfer the role to a healthy writable DC: `Move-ADDirectoryServerOperationMasterRole -Identity <DC> -OperationMasterRole <role>` (add `-Force` to SEIZE only when the old holder is permanently gone, then never bring it back online). Restore DNS/LDAP reachability for unreachable holders, fix replication first for non-replicating holders, and point the forest-root PDC at an external NTP source: `w32tm /config /manualpeerlist:"time.windows.com,0x9" /syncfromflags:manual /reliable:yes /update; Restart-Service W32Time`.'
+            RerunCmd   = 'netdom query fsmo; Get-ADForest | Select-Object SchemaMaster,DomainNamingMaster; Get-ADDomain | Select-Object PDCEmulator,RIDMaster,InfrastructureMaster'
         }
         'NTDS database' = @{
             Summary    = 'Reads the NTDS registry parameters and measures ntds.dit size plus free space on the database log volume.'
@@ -4711,9 +4926,13 @@ Function Get-DCEval {
     if ($SitesWithNoGC -eq $true) {
         Write-Both "    [!] You have sites with no Global Catalog!"
     }
-    #Does one DC holds all FSMO
-    if (($ADs | Where-Object { $_.OperationMasterRoles -ne $null } | measure).count -eq 1) {
-        Write-Both "    [!] DC $($ADs | Where-Object {$_.OperationMasterRoles -ne $null} | select -ExpandProperty Hostname) holds all FSMO roles!"
+    #FSMO role placement. Co-location (one DC holding all roles) is normal and
+    #supported, so this is informational only - not a warning. The -adhealth
+    #check ('FSMO role holders') validates each holder's writability, DNS,
+    #reachability, replication and the forest-root PDC time source.
+    $fsmoHolders = @($ADs | Where-Object { @($_.OperationMasterRoles).Count -gt 0 })
+    if ($fsmoHolders.Count -eq 1) {
+        Write-Both "    [i] All FSMO roles are held by a single DC ($($fsmoHolders[0].Hostname)). Normal/supported in a single-domain forest; noted for documentation and DR. Run -adhealth to validate each FSMO holder."
     }
     #DCs with weak Kerberos algorithm (*CH* Changed below to look for msDS-SupportedEncryptionTypes to work with 2008R2)
 $ADcomputers = $ADs | ForEach-Object { Get-ADComputer $_.Name -Properties msDS-SupportedEncryptionTypes }
