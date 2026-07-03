@@ -1,6 +1,7 @@
 # ADAudit-PS7 - Active Directory Security Audit Tool
 
-A comprehensive PowerShell 7 script for auditing Active Directory security configurations, policies, and vulnerabilities. Originally created by phillips321, converted to PowerShell 7 and extended by Keberneth.
+A comprehensive PowerShell 7 script for auditing Active Directory security configurations, policies, and vulnerabilities. Originally created by phillips321, converted to PowerShell 7 and extended by Keberneth.<br>
+ADAudit-PS7 include health checks and improved reporting.
 
 ## Password Audit
 Password Audit is a standalone script that checks accounts with the same NTLM hash (same passwords) and checks Active Directory account NTLM hashes against the
