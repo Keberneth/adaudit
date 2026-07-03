@@ -24,10 +24,10 @@ a single informational row.
 - Account with rights required for Get-ADReplAccount
 
 .EXAMPLES
-.\pwned_users_prof.ps1
-.\pwned_users_prof.ps1 -Server dc01.contoso.local
-.\pwned_users_prof.ps1 -OutCsv C:\Temp\PWNED_PASSWORD_HASH.csv
-.\pwned_users_prof.ps1 -IncludeComputers
+.\pwned_password_prof.ps1
+.\pwned_password_prof.ps1 -Server dc01.contoso.local
+.\pwned_password_prof.ps1 -OutCsv C:\Temp\PWNED_PASSWORD_HASH.csv
+.\pwned_password_prof.ps1 -IncludeComputers
 #>
 
 [CmdletBinding()]
@@ -45,178 +45,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Resolve-DefaultServer {
-    [CmdletBinding()]
-    param()
-
-    $dcObj = Get-ADDomainController -Discover -ErrorAction Stop
-
-    foreach ($propertyName in @('DNSHostName', 'HostName', 'Name')) {
-        $candidate = $dcObj.$propertyName
-        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-            return [string]$candidate
-        }
-    }
-
-    throw 'Could not determine a domain controller hostname.'
-}
-
-function Ensure-DirectoryPath {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
-}
-
-function Resolve-ParentDirectory {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $parent = Split-Path -Parent $Path
-    if ([string]::IsNullOrWhiteSpace($parent)) {
-        return (Get-Location).Path
-    }
-
-    return $parent
-}
-
-function Convert-BytesToHex {
-    [CmdletBinding()]
-    param(
-        [byte[]]$Bytes
-    )
-
-    if ($null -eq $Bytes -or $Bytes.Count -eq 0) {
-        return $null
-    }
-
-    return (-join ($Bytes | ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
-}
-
-function Get-AccountTypeLabel {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$AccountName
-    )
-
-    if ($AccountName -match '\$$') {
-        return 'Computer'
-    }
-
-    return 'User'
-}
-
-function Get-AccountStatusLabel {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SamAccountName,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Server
-    )
-
-    try {
-        if ($SamAccountName -match '\$$') {
-            $adObject = Get-ADComputer -Identity $SamAccountName -Properties Enabled -Server $Server -ErrorAction Stop
-        }
-        else {
-            $adObject = Get-ADUser -Identity $SamAccountName -Properties Enabled -Server $Server -ErrorAction Stop
-        }
-
-        switch ($adObject.Enabled) {
-            $true  { return 'Active' }
-            $false { return 'Disabled' }
-            default { return 'Unknown' }
-        }
-    }
-    catch {
-        Write-Warning ("Could not resolve account status for {0}: {1}" -f $SamAccountName, $_.Exception.Message)
-        return 'Unknown'
-    }
-}
-
-function Test-NtlmHashPwned {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$NtlmHash
-    )
-
-    $NtlmHash = $NtlmHash.ToUpperInvariant()
-
-    if ($NtlmHash -notmatch '^[A-F0-9]{32}$') {
-        throw "Invalid NTLM hash format: $NtlmHash"
-    }
-
-    $prefix = $NtlmHash.Substring(0, 5)
-    $suffix = $NtlmHash.Substring(5)
-    $uri = 'https://api.pwnedpasswords.com/range/{0}?mode=ntlm' -f $prefix
-
-    try {
-        $response = Invoke-WebRequest -Uri $uri -Method Get -Headers @{
-            'User-Agent'  = 'pwned_users_prof.ps1'
-            'Add-Padding' = 'true'
-        } -TimeoutSec 30 -ErrorAction Stop
-    }
-    catch {
-        Write-Warning ("Failed pwned lookup for hash prefix {0}: {1}" -f $prefix, $_.Exception.Message)
-        return [pscustomobject]@{
-            Pwned      = 'LookupFailed'
-            PwnedCount = $null
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($response.Content)) {
-        return [pscustomobject]@{
-            Pwned      = 'No'
-            PwnedCount = 0
-        }
-    }
-
-    foreach ($line in ($response.Content -split "(`r`n|`n|`r)")) {
-        if ([string]::IsNullOrWhiteSpace($line)) {
-            continue
-        }
-
-        $parts = $line.Split(':', 2)
-        if ($parts.Count -ne 2) {
-            continue
-        }
-
-        $returnedSuffix = $parts[0].Trim().ToUpperInvariant()
-        $countText = $parts[1].Trim()
-
-        # Ignore padded fake rows when Add-Padding=true
-        if ($countText -eq '0') {
-            continue
-        }
-
-        if ($returnedSuffix -eq $suffix) {
-            $countValue = 0
-            [void][int64]::TryParse($countText, [ref]$countValue)
-
-            return [pscustomobject]@{
-                Pwned      = 'Yes'
-                PwnedCount = $countValue
-            }
-        }
-    }
-
-    return [pscustomobject]@{
-        Pwned      = 'No'
-        PwnedCount = 0
-    }
-}
+# Shared helpers (Resolve-DefaultServer, Ensure-DirectoryPath, Resolve-ParentDirectory,
+# Convert-BytesToHex, Get-AccountTypeLabel, Get-AccountStatusFromReplObject, Test-NtlmHashPwned,
+# Get-PwnedResultsForHashes, Get-ReplicatedAccountHashes) live in the shared module so they are
+# not duplicated across the two Password Audit scripts. Imported via $PSScriptRoot so it resolves
+# regardless of the current working directory.
+Import-Module (Join-Path $PSScriptRoot 'PasswordAuditCommon.psm1') -Force
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($scriptDir)) {
@@ -242,11 +76,7 @@ $domainDN = $domain.DistinguishedName
 Write-Host ("Running pwned password check against: {0}" -f $Server)
 Write-Host ("Include computer accounts: {0}" -f $(if ($IncludeComputers) { 'YES' } else { 'NO' }))
 
-$replAccounts = @(Get-ADReplAccount -All -Server $Server -NamingContext $domainDN -ErrorAction Stop)
-
-if ($replAccounts.Count -eq 0) {
-    throw "No replication accounts were returned from $Server."
-}
+$replAccounts = @(Get-ReplicatedAccountHashes -Server $Server -NamingContext $domainDN)
 
 $accountRows = New-Object System.Collections.Generic.List[object]
 
@@ -266,12 +96,15 @@ foreach ($ra in $replAccounts) {
         continue
     }
 
+    # AccountStatus is derived from the replication object already in hand (no per-account
+    # Get-ADUser / Get-ADComputer round-trip). NTHash is kept ONLY in memory here for the
+    # HIBP lookup / grouping; it is deliberately never written to the CSV (pass-the-hash risk).
     $accountRows.Add([pscustomobject]@{
         SamAccountName = $sam
         NTHash         = $ntlmHash
         AccountType    = Get-AccountTypeLabel -AccountName $sam
         SourceServer   = [string]$Server
-        AccountStatus  = Get-AccountStatusLabel -SamAccountName $sam -Server $Server
+        AccountStatus  = Get-AccountStatusFromReplObject -ReplAccount $ra
     })
 }
 
@@ -279,7 +112,6 @@ if ($accountRows.Count -eq 0) {
     $emptyResult = @(
         [pscustomobject]([ordered]@{
             SamAccountName = ''
-            NTHash         = ''
             AccountType    = ''
             SourceServer   = [string]$Server
             AccountStatus  = ''
@@ -302,23 +134,25 @@ $uniqueHashes = @(
 
 Write-Host ("Checking {0} unique NTLM hash(es) against HIBP..." -f $uniqueHashes.Count)
 
-$pwnedCache = @{}
-
-foreach ($hash in $uniqueHashes) {
-    if (-not $pwnedCache.ContainsKey($hash)) {
-        $pwnedCache[$hash] = Test-NtlmHashPwned -NtlmHash $hash
-    }
-}
+# Prefix-batched lookup: one range fetch per 5-char prefix, matched locally (k-anonymity
+# preserved). Returns a map of full-hash -> { Pwned; PwnedCount } including 'LookupFailed'.
+$pwnedCache = Get-PwnedResultsForHashes -Hashes $uniqueHashes -UserAgent 'pwned_password_prof.ps1'
 
 $results = New-Object System.Collections.Generic.List[object]
+$failedResults = New-Object System.Collections.Generic.List[object]
 
 foreach ($row in $accountRows) {
     $lookup = $pwnedCache[$row.NTHash]
 
+    if ($null -eq $lookup) {
+        # Defensive: hash was not in the cache (should not happen). Treat as a failed lookup
+        # rather than silently dropping the account.
+        $lookup = [pscustomobject]@{ Pwned = 'LookupFailed'; PwnedCount = $null }
+    }
+
     if ($lookup.Pwned -eq 'Yes') {
         $results.Add([pscustomobject]([ordered]@{
             SamAccountName = $row.SamAccountName
-            NTHash         = $row.NTHash
             AccountType    = $row.AccountType
             SourceServer   = $row.SourceServer
             AccountStatus  = $row.AccountStatus
@@ -327,13 +161,28 @@ foreach ($row in $accountRows) {
             Comment        = 'NTLM hash found in Have I Been Pwned Pwned Passwords corpus.'
         }))
     }
+    elseif ($lookup.Pwned -eq 'LookupFailed') {
+        # FIX: failed lookups are no longer silently dropped. They are reported as their own
+        # rows so a rate-limited / errored run is not mistaken for a clean one.
+        $failedResults.Add([pscustomobject]([ordered]@{
+            SamAccountName = $row.SamAccountName
+            AccountType    = $row.AccountType
+            SourceServer   = $row.SourceServer
+            AccountStatus  = $row.AccountStatus
+            Pwned          = 'LookupFailed'
+            PwnedCount     = ''
+            Comment        = 'HIBP lookup failed for this account (possible rate limiting / network error) - status UNKNOWN.'
+        }))
+    }
 }
 
-if ($results.Count -eq 0) {
+# Distinct account count behind the failed lookups (for the summary warning).
+$failedAccountCount = $failedResults.Count
+
+if ($results.Count -eq 0 -and $failedResults.Count -eq 0) {
     $noPwnedResult = @(
         [pscustomobject]([ordered]@{
             SamAccountName = ''
-            NTHash         = ''
             AccountType    = if ($IncludeComputers) { 'UserAndComputerScope' } else { 'UserScope' }
             SourceServer   = [string]$Server
             AccountStatus  = ''
@@ -346,14 +195,26 @@ if ($results.Count -eq 0) {
     $noPwnedResult | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
 }
 else {
+    $allRows = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $results)       { $allRows.Add($r) }
+    foreach ($r in $failedResults) { $allRows.Add($r) }
+
     $sortedResults = @(
-        $results |
-            Sort-Object -Property AccountType, SamAccountName
+        $allRows |
+            Sort-Object -Property Pwned, AccountType, SamAccountName
     )
 
     $sortedResults | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
 }
 
 Write-Host ("Processed accounts: {0}" -f $accountRows.Count)
-Write-Host ("Pwned accounts exported: {0}" -f $results.Count)
+if ($results.Count -eq 0 -and $failedAccountCount -eq 0) {
+    Write-Host "Pwned accounts exported: 0 (all lookups succeeded - none found in HIBP)."
+}
+else {
+    Write-Host ("Pwned accounts exported: {0}" -f $results.Count)
+}
+if ($failedAccountCount -gt 0) {
+    Write-Warning ("{0} account(s) could NOT be checked (lookup failed - possible rate limiting or network error). Their pwned status is UNKNOWN; re-run to complete the check." -f $failedAccountCount)
+}
 Write-Host ("CSV written to: {0}" -f $OutCsv)

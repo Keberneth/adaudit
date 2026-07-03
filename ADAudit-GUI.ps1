@@ -47,10 +47,14 @@ Add-Type -AssemblyName System.Drawing      -ErrorAction Stop
 # -------------------------
 # Offline Install Logic (from InstallDeps.ps1)
 # -------------------------
-function Assert-IsAdmin {
+function Test-IsAdmin {
     $id  = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pri = New-Object Security.Principal.WindowsPrincipal($id)
-    if (-not $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    return $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Assert-IsAdmin {
+    if (-not (Test-IsAdmin)) {
         throw "Run this script elevated (Run as Administrator)."
     }
 }
@@ -123,10 +127,12 @@ function Test-ModuleUsable {
     if (-not $m) { return $false }
     $manifest = Join-Path $m.ModuleBase ($ModuleName + ".psd1")
     if (-not (Test-Path $manifest)) { return $false }
+    # Probe usability in a throwaway child process so we do not permanently load
+    # (and lock) the module's assemblies in the GUI process — that would block the
+    # installer from replacing the DLLs later.
     try {
-        Remove-Module -Name $ModuleName -ErrorAction SilentlyContinue
-        Import-Module -Name $manifest -Force -ErrorAction Stop
-        return $true
+        $probe = Start-Process pwsh.exe -ArgumentList '-NoProfile','-NonInteractive','-Command',("Import-Module '" + $manifest + "' -ErrorAction Stop") -Wait -PassThru -WindowStyle Hidden
+        return ($probe.ExitCode -eq 0)
     } catch { return $false }
 }
 
@@ -145,6 +151,10 @@ function Install-ModuleFromNupkg {
     $destRoot    = Join-Path $modulesRoot $ModuleName
     $destVerDir  = Join-Path $destRoot  $Version.ToString()
     New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
+    # Opportunistically sweep any leftover *_old_* dirs from previous runs whose
+    # locks have since been released.
+    Get-ChildItem -Path $destRoot -Directory -Filter '*_old_*' -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     $tmp = $null
     try {
         $tmp = Expand-NupkgToTemp -NupkgPath $NupkgPath
@@ -156,7 +166,8 @@ function Install-ModuleFromNupkg {
                 # DLLs may be locked by another session; rename old dir out of the way
                 $stale = "${destVerDir}_old_" + [guid]::NewGuid().ToString("n").Substring(0,8)
                 Rename-Item -Path $destVerDir -NewName (Split-Path $stale -Leaf) -Force -ErrorAction Stop
-                # Schedule cleanup on next reboot if we can't delete it now
+                # Try to delete the renamed dir now; if it's still locked it will be
+                # swept opportunistically on a future run (see the *_old_* sweep above).
                 try { Remove-Item $stale -Recurse -Force -ErrorAction Stop } catch {}
             }
         }
@@ -446,6 +457,10 @@ $lblExcludeHint.ForeColor = [System.Drawing.Color]::Gray
 $y += 22
 
 $excludeCheckboxes = @{}
+# Track the exclude description labels too so the whole section can be hidden/shown
+# together with the checkboxes and headers (avoids a heading-less block of greyed
+# checkboxes when 'Run All' is unchecked).
+$excludeDescLabels = @()
 # Display exclude checkboxes in a more compact 2-column layout
 $excludeKeys = @($AuditChecks.Keys)
 $excludeStartY = $y
@@ -456,6 +471,7 @@ foreach ($key in $excludeKeys) {
 
     $exDesc = Add-Label $AuditChecks[$key] ($y + 1) 230 ($xPos + 226)
     $exDesc.ForeColor = [System.Drawing.Color]::DimGray
+    $excludeDescLabels += $exDesc
 
     $exChk.Tag = "exclude_$key"
     $excludeCheckboxes[$key] = $exChk
@@ -520,6 +536,10 @@ $y += $rowHeight
 
 Add-Label "Delegated Server:" $y | Out-Null
 $txtDelegServer = Add-TextBox $y
+$y += $rowHeight + 4
+
+Add-Label "Delegated Output Root:" $y | Out-Null
+$txtDelegOutputRoot = Add-TextBox $y
 $y += $rowHeight + 8
 
 Add-Separator $y
@@ -587,6 +607,7 @@ function Update-Preview {
     if ($script:chkDelegDeny.Checked)        { $cmd += " -DelegIncludeDeny" }
     if ($script:chkDelegInherited.Checked)   { $cmd += " -DelegIncludeInherited" }
     if ($script:txtDelegServer.Text.Trim())  { $cmd += ' -DelegServer "' + $script:txtDelegServer.Text.Trim() + '"' }
+    if ($script:txtDelegOutputRoot.Text.Trim()) { $cmd += ' -DelegatedOutputRoot "' + $script:txtDelegOutputRoot.Text.Trim() + '"' }
 
     $script:txtPreview.Text = $cmd
 }
@@ -607,12 +628,17 @@ $chkAll.Add_CheckedChanged({
         }
     }
 
-    # Toggle exclude section visibility
+    # Toggle exclude section visibility — hide/show the whole block together so the
+    # exclude checkboxes and their description labels do not linger without a heading.
     foreach ($key in $script:excludeCheckboxes.Keys) {
         $script:excludeCheckboxes[$key].Enabled = $allChecked
+        $script:excludeCheckboxes[$key].Visible = $allChecked
         if (-not $allChecked) {
             $script:excludeCheckboxes[$key].Checked = $false
         }
+    }
+    foreach ($lbl in $script:excludeDescLabels) {
+        $lbl.Visible = $allChecked
     }
     $script:lblExclude.Visible   = $allChecked
     $script:lblExcludeHint.Visible = $allChecked
@@ -635,12 +661,16 @@ $chkDelegDeny.Add_CheckedChanged({ Update-Preview })
 $chkDelegInherited.Add_CheckedChanged({ Update-Preview })
 $txtDnsOutputRoot.Add_TextChanged({ Update-Preview })
 $txtDelegServer.Add_TextChanged({ Update-Preview })
+$txtDelegOutputRoot.Add_TextChanged({ Update-Preview })
 
 # Install Online button
 $btnOnline.Add_Click({
     $cmd = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "' + $script:AuditScriptPath + '" -installdeps'
     try {
-        Start-Process pwsh.exe -ArgumentList "-NoExit", "-Command", $cmd -Verb RunAs
+        # Launch via EncodedCommand so paths containing spaces/quotes cannot be
+        # corrupted by Start-Process argument joining or child-pwsh quote stripping.
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cmd))
+        Start-Process pwsh.exe -ArgumentList '-NoExit','-EncodedCommand',$encoded -Verb RunAs
         Msg-Info "Online dependency installation launched in a new PowerShell 7 window."
     } catch {
         Msg-Error "Failed to launch online install: $($_.Exception.Message)"
@@ -649,6 +679,10 @@ $btnOnline.Add_Click({
 
 # Install Offline button
 $btnOffline.Add_Click({
+    if (-not (Test-IsAdmin)) {
+        Msg-Error "Offline install must run elevated. Restart the GUI as Administrator to use offline installation."
+        return
+    }
     try {
         $result = Invoke-OfflineInstall -SearchRoot $script:ScriptDir
         Msg-Info "Offline installation completed successfully.`n`n$result"
@@ -696,7 +730,10 @@ $btnRun.Add_Click({
     }
 
     try {
-        Start-Process pwsh.exe -ArgumentList "-NoExit", "-Command", $cmd -Verb RunAs
+        # Launch via EncodedCommand so paths containing spaces/quotes cannot be
+        # corrupted by Start-Process argument joining or child-pwsh quote stripping.
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cmd))
+        Start-Process pwsh.exe -ArgumentList '-NoExit','-EncodedCommand',$encoded -Verb RunAs
         # Close the GUI and its PowerShell window after launching the audit
         $script:form.Close()
     } catch {
