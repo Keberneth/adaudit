@@ -1,6 +1,171 @@
-### The PS5 script will not be developted anymore. The PS7 is a converted version of the PS5 script and have more adudit functions and improved reports
-<br><br>
+# ADAudit-PS7 - Active Directory Security Audit Tool
 
+A comprehensive PowerShell 7 script for auditing Active Directory security configurations, policies, and vulnerabilities. Originally created by phillips321, converted to PowerShell 7 and extended by Keberneth.
+
+## Quick Start
+
+**From the GUI version you can install dependencies and choose what audits to run**
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\AdAudit-GUI.ps1
+```
+
+**For the best and most complete results, run all checks:**
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\AdAudit-PS7.ps1 -all
+```
+
+This runs every available audit check and produces a full security report. It is the recommended way to use this tool.
+
+To also install optional dependencies (DSInternals for password quality analysis):
+
+```powershell
+.\AdAudit-PS7.ps1 -installdeps -all
+```
+
+## Requirements
+
+- **PowerShell 7.x** on Windows (`pwsh.exe`)
+- **ActiveDirectory** PowerShell module (installed with RSAT tools)
+- Run as a user with sufficient AD read permissions (Domain Admin recommended for full results)
+- NuGet and DSInternals modules from PowerShell Gallery
+<br>
+https://www.powershellgallery.com/packages/NuGet/
+<br>
+https://www.powershellgallery.com/packages/DSInternals/
+<br>
+Choose Manual Download. You will get two .nupkg files. Place them in the ADAudit folder for offline installation.
+<br>
+
+### Optional Modules
+
+| Module | Purpose | How to Get |
+|---|---|---|
+| GroupPolicy | GPO export and domain audit checks | Installed with RSAT Group Policy Management |
+| DnsServer | DNS zone security checks | Installed with DNS Server role |
+| LAPS / AdmPwd.PS | LAPS deployment verification | Windows LAPS or legacy Microsoft LAPS |
+| DSInternals | Password quality analysis | `.\AdAudit-PS7.ps1 -installdeps` or manual install |
+
+If an optional module is not available, those specific checks will be skipped and the rest of the audit will continue normally.
+
+## Output
+
+Results are written to a folder named after the host (e.g. `<COMPUTERNAME>\HTML Reports\` and `<COMPUTERNAME>\Raw Data\Source\`) in the script directory. The five primary HTML reports share a top navigation bar so you can move between them in the browser; everything else (companion wrappers, intermediate `.source.html` files, the GPO export HTML, the dangerous-ACL HTML, the high-risk baseline index, the DNS audit / recommendations HTML) is removed at the end of the run so the output folder stays focused.
+
+Primary HTML reports (in `HTML Reports\`):
+
+- **ADAudit-Results.html** - the main audit report. Severity-grouped findings (Critical / High / Medium / Low / Information), filterable, with per-finding "Why it matters" / "Recommended action" / source-link / result preview panels. Includes the new **Domain Admins membership review (size-adjusted)** and **Built-in domain Administrator (RID-500) hygiene** findings.
+- **Risk-Report.html** - executive risk summary with overall score, score-band matrix, top findings, and links back into ADAudit-Results.html.
+- **AD_Health.html** - AD platform health: replication, DC diagnostics (dcdiag), DC interconnect (network reachability between DCs with severity scaled by remaining redundancy), SYSVOL/DFSR backlog, NTDS database, time synchronization, core AD services (KPSSVC is informational, not High), event-log scrape (last 72h), sites and subnets, AD Recycle Bin, group hygiene. Hero gauge, "Tests Performed" status grid, and a "Test Details" section with one collapsible card per test (summary / why it matters / what to look for / how to fix / source link / copy-paste rerun command).
+- **overlapping_group_memberships.html** - users who reach the same target group via multiple direct group memberships.
+- **multiple_nested_paths.html** - users who reach the same target group via multiple nesting chains from a single direct group (group-nesting complexity, not necessarily duplicate effective permissions).
+
+Other output:
+
+- **Nessus-compatible** XML file (`adaudit.nessus`)
+- **Raw Data\Source\\** - per-check evidence files (more detail than the HTML reports), including `health_*.txt` for AD Health and `domain_admins_scaled.txt` / `domain_admin_builtin_rid500.txt` for the Domain Admins review
+- **Raw Data\GPOReports\\** - GPO XML/HTML exports when the GroupPolicy module is available (the GPOReport HTML in HTML Reports is removed by the final cleanup; the XML export and the per-GPO HTML files in Raw Data are kept)
+
+## Audit Checks
+
+| Switch | Description |
+|---|---|
+| `-hostdetails` | Retrieve hostname and useful audit information |
+| `-domainaudit` | Audit AD functional level, delegation, spooler, SMB signing, tombstone |
+| `-trusts` | Check domain trust relationships |
+| `-accounts` | Identify account issues (expired, disabled, gMSA, overlapping groups, etc.). Also runs the **Domain Admins membership review (size-adjusted)** and **Built-in domain Administrator (RID-500) hygiene** checks. |
+| `-InactiveComputers` | Find inactive computer objects (>90 days) |
+| `-passwordpolicy` | Review password policy and password quality (requires DSInternals) |
+| `-oldboxes` | Find machines running unsupported OS (older than Server 2019) |
+| `-gpo` | Export GPOs in XML and HTML format, check SYSVOL for passwords |
+| `-ouperms` | Check for generic OU permission issues |
+| `-laps` | Check if LAPS is deployed |
+| `-authpolsilos` | Check authentication policies and silos |
+| `-insecurednszone` | Detect DNS zones allowing insecure/unauthenticated updates |
+| `-dnszone` | Generate DNS zone posture report |
+| `-recentchanges` | Check for newly created users and groups (last 30 days) |
+| `-adcs` | Check for ADCS vulnerabilities (ESC1-4, ESC8) |
+| `-spn` | Find kerberoastable high-value accounts |
+| `-asrep` | Find accounts vulnerable to AS-REP roasting |
+| `-acl` | Check for dangerous ACL permissions on computers, users, and groups |
+| `-ldapsecurity` | Check LDAP security configuration |
+| `-dataextract` | Export raw AD audit data |
+| `-delegatedpermissions` | Generate AD delegated permissions report |
+| `-highrisk` | Generate high-risk AD baseline report |
+| `-overlappinggroups` | Check for overlapping group memberships |
+| `-portconnectivity` | Probe every DC on the canonical AD port set (DNS 53, Kerberos 88, RPC EPM 135, LDAP 389, SMB 445, kpasswd 464, LDAPS 636, GC 3268/3269, ADWS 9389, WinRM 5985/5986, NetBIOS 139, sample dynamic RPC). Also runs a cross-DC TCP probe via WinRM when reachable. Aliases: `-dcports`, `-dc-ports`, `-portcheck`. |
+| `-adhealth` | AD platform health check: replication, DC diagnostics, DC interconnect (severity scales with remaining redundancy - 2 DCs / 1 isolated = Critical, 3 / 1 = High, 4+ / 1 = Medium), SYSVOL/DFSR, NTDS, time sync, services, event logs, sites/subnets, Recycle Bin, group hygiene. Writes `AD_Health.html`. Aliases: `-ad-health`, `-health`. |
+
+## Switches
+
+### Run Modes
+
+| Switch | Description |
+|---|---|
+| `-all` | Run all audit checks (recommended) |
+| `-exclude <checks>` | Comma-separated list of checks to skip when using `-all` (e.g. `-exclude gpo,dnszone`) |
+| `-select <checks>` | Comma-separated list of checks to run (alternative to individual switches) |
+| `-installdeps` | Install optional dependencies (DSInternals, NuGet) |
+
+### Advanced Options
+
+| Switch | Description |
+|---|---|
+| `-KeepLegacyArtifacts` | Preserve raw data and evidence files in legacy locations |
+| `-DnsZoneOutputRoot <path>` | Custom output directory for DNS zone reports |
+| `-DnsIncludeRecordCounts` | Include record counts in DNS zone report |
+| `-DnsIncludeSystemZones` | Include system DNS zones in the report |
+| `-DelegatedOutputRoot <path>` | Custom output directory for delegated permissions report |
+| `-DelegIncludeSystemTrustees` | Include system trustees in delegated permissions report |
+| `-DelegIncludeDeny` | Include deny permissions in delegated permissions report |
+| `-DelegIncludeInherited` | Include inherited permissions in delegated permissions report |
+| `-DelegServer <server>` | Target a specific server for delegated permissions queries |
+
+## Examples
+
+Run all checks:
+```powershell
+.\AdAudit-PS7.ps1 -all
+```
+
+Run all checks except GPO and DNS:
+```powershell
+.\AdAudit-PS7.ps1 -all -exclude gpo,dnszone
+```
+
+Run only account and password checks:
+```powershell
+.\AdAudit-PS7.ps1 -accounts -passwordpolicy
+```
+
+Install dependencies and run everything:
+```powershell
+.\AdAudit-PS7.ps1 -installdeps -all
+```
+
+## GUI
+
+A graphical interface is also available for users who prefer a visual way to configure and launch the audit:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\ADAudit-GUI.ps1
+```
+
+The GUI provides:
+
+- **Run All Checks** toggle (enabled by default, recommended)
+- **Exclude** specific checks when running all
+- **Individual check selection** when Run All is unchecked
+- **Advanced options** for DNS zone and delegated permissions configuration
+- **Command preview** showing the exact command that will be executed
+- **Online/Offline dependency installation**
+
+When you click "Run Audit", the script launches in a new elevated PowerShell window and the GUI closes automatically.
+
+<br><br>
 ## Active Directory Assessment Overview
 This script performs an assessment of Active Directory configuration, security posture, and operational health.  
 The output is intended to provide visibility into potential risks, misconfigurations, and improvement areas.
@@ -33,8 +198,7 @@ This script is designed to support informed decision-making and continuous impro
 # adaudit
 This PowerShell script is designed to conduct a comprehensive audit of Microsoft Active Directory, focusing on identifying common security vulnerabilities and weaknesses. Its execution facilitates the pinpointing of critical areas that require reinforcement, thereby fortifying your infrastructure against prevalent tactics used in lateral movement or privilege escalation attacks targeting Active Directory.
 ```
-<br><br>
-### Original script created by: <br>
+### Original script created by:
 _____ ____     _____       _ _ _
 |  _  |    \   |  _  |_ _ _| |_| |_
 |     |  |  |  |     | | | . | |  _|
@@ -43,18 +207,9 @@ _____ ____     _____       _ _ _
 ```
 <br>
 https://github.com/phillips321/adaudit
-
-
 <br><br>
 
-# Dependencies
-Copy the ADAudit folder to the DC Server or a server with the RSAT tools installed and can manage active directory. The account running the script need to be Domain Admin to run the full audit. <br><br>
+## Credits
 
-Download NuGet and DSInternals modules from PowerShell Gallery before using any audit scripts and place in the same folder as the script.<br>
-https://www.powershellgallery.com/packages/NuGet/<br>
-https://www.powershellgallery.com/packages/DSInternals/<br>
-Chose Manual Download. You will get two .nuplkg files. Plase them in the ADAudit folder.<br><br>
-
-To install the required modules, run the powershell script AdAudit-Run.ps1 and chose option 2 for offline installation.<br><br>
-For PS7 version you have offline installation in GUI script or run InstallDeps.ps1 in PowerShell 7 and place script in same folder as the .nuplkg files
-<br><br>
+- Original script by [phillips321](https://github.com/phillips321)
+- PowerShell 7 conversion and updates by Keberneth
