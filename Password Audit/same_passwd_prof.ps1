@@ -40,133 +40,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Resolve-DefaultServer {
-    [CmdletBinding()]
-    param()
-
-    $dcObj = Get-ADDomainController -Discover -ErrorAction Stop
-
-    foreach ($propertyName in @('DNSHostName', 'HostName', 'Name')) {
-        $candidate = $dcObj.$propertyName
-        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-            return [string]$candidate
-        }
-    }
-
-    throw 'Could not determine a domain controller hostname.'
-}
-
-function Ensure-DirectoryPath {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
-}
-
-function Resolve-ParentDirectory {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $parent = Split-Path -Parent $Path
-    if ([string]::IsNullOrWhiteSpace($parent)) {
-        return (Get-Location).Path
-    }
-
-    return $parent
-}
-
-function Convert-BytesToHex {
-    [CmdletBinding()]
-    param(
-        [byte[]]$Bytes
-    )
-
-    if ($null -eq $Bytes -or $Bytes.Count -eq 0) {
-        return $null
-    }
-
-    return (-join ($Bytes | ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
-}
-
-function Get-AccountTypeLabel {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$AccountName
-    )
-
-    if ($AccountName -match '\$$') {
-        return 'Computer'
-    }
-
-    return 'User'
-}
-
-function Test-NtlmHashPwned {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$NtlmHash
-    )
-
-    $NtlmHash = $NtlmHash.ToUpperInvariant()
-
-    if ($NtlmHash -notmatch '^[A-F0-9]{32}$') {
-        throw "Invalid NTLM hash format: $NtlmHash"
-    }
-
-    $prefix = $NtlmHash.Substring(0, 5)
-    $suffix = $NtlmHash.Substring(5)
-    $uri = 'https://api.pwnedpasswords.com/range/{0}?mode=ntlm' -f $prefix
-
-    try {
-        $response = Invoke-WebRequest -Uri $uri -Method Get -Headers @{
-            'User-Agent'  = 'same_passwd_prof.ps1'
-            'Add-Padding' = 'true'
-        } -TimeoutSec 30 -ErrorAction Stop
-    }
-    catch {
-        Write-Warning ("Failed pwned lookup for hash prefix {0}: {1}" -f $prefix, $_.Exception.Message)
-        return 'LookupFailed'
-    }
-
-    if ([string]::IsNullOrWhiteSpace($response.Content)) {
-        return 'No'
-    }
-
-    foreach ($line in ($response.Content -split "(`r`n|`n|`r)")) {
-        if ([string]::IsNullOrWhiteSpace($line)) {
-            continue
-        }
-
-        $parts = $line.Split(':', 2)
-        if ($parts.Count -ne 2) {
-            continue
-        }
-
-        $returnedSuffix = $parts[0].Trim().ToUpperInvariant()
-        $count = $parts[1].Trim()
-
-        # Ignore padded fake rows when Add-Padding=true
-        if ($count -eq '0') {
-            continue
-        }
-
-        if ($returnedSuffix -eq $suffix) {
-            return 'Yes'
-        }
-    }
-
-    return 'No'
-}
+# Shared helpers (Resolve-DefaultServer, Ensure-DirectoryPath, Resolve-ParentDirectory,
+# Convert-BytesToHex, Get-AccountTypeLabel, Get-AccountStatusFromReplObject, Test-NtlmHashPwned,
+# Get-PwnedResultsForHashes, Get-ReplicatedAccountHashes) live in the shared module so they are
+# not duplicated across the two Password Audit scripts. Imported via $PSScriptRoot so it resolves
+# regardless of the current working directory.
+Import-Module (Join-Path $PSScriptRoot 'PasswordAuditCommon.psm1') -Force
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($scriptDir)) {
@@ -192,11 +71,7 @@ $domainDN = $domain.DistinguishedName
 Write-Host ("Running duplicate password check against: {0}" -f $Server)
 Write-Host ("Pwned password lookup: {0}" -f $(if ($Pwned) { 'ENABLED' } else { 'DISABLED' }))
 
-$replAccounts = @(Get-ADReplAccount -All -Server $Server -NamingContext $domainDN -ErrorAction Stop)
-
-if ($replAccounts.Count -eq 0) {
-    throw "No replication accounts were returned from $Server."
-}
+$replAccounts = @(Get-ReplicatedAccountHashes -Server $Server -NamingContext $domainDN)
 
 $hashRows = New-Object System.Collections.Generic.List[object]
 
@@ -234,19 +109,18 @@ $duplicateGroups = @(
 $pwnedCache = @{}
 
 if ($Pwned -and $duplicateGroups.Count -gt 0) {
-    Write-Host ("Checking {0} unique duplicate NTLM hash(es) against HIBP..." -f $duplicateGroups.Count)
+    $uniqueDuplicateHashes = @($duplicateGroups | ForEach-Object { [string]$_.Name })
+    Write-Host ("Checking {0} unique duplicate NTLM hash(es) against HIBP..." -f $uniqueDuplicateHashes.Count)
 
-    foreach ($group in $duplicateGroups) {
-        $hash = [string]$group.Name
-
-        if (-not $pwnedCache.ContainsKey($hash)) {
-            $pwnedCache[$hash] = Test-NtlmHashPwned -NtlmHash $hash
-        }
-    }
+    # Prefix-batched lookup: one range fetch per 5-char prefix, matched locally (k-anonymity
+    # preserved). Returns full-hash -> { Pwned; PwnedCount } including explicit 'LookupFailed'
+    # (a failed lookup is NEVER collapsed to 'No').
+    $pwnedCache = Get-PwnedResultsForHashes -Hashes $uniqueDuplicateHashes -UserAgent 'same_passwd_prof.ps1'
 }
 
 $results = New-Object System.Collections.Generic.List[object]
 $groupNumber = 0
+$pwnedLookupFailures = 0
 
 foreach ($group in $duplicateGroups) {
     $members = @(
@@ -260,9 +134,21 @@ foreach ($group in $duplicateGroups) {
 
     $groupNumber++
 
+    # Pwned status is per duplicate group (all members share the same NTLM hash). The raw hash
+    # is deliberately NOT written to the CSV (pass-the-hash risk); the DuplicatePasswordGroup id
+    # keeps shared-password accounts correlatable without exposing the credential-equivalent hash.
     $pwnedValue = 'NotChecked'
     if ($Pwned) {
-        $pwnedValue = [string]$pwnedCache[[string]$group.Name]
+        $lookup = $pwnedCache[[string]$group.Name]
+        if ($null -eq $lookup) {
+            $pwnedValue = 'LookupFailed'
+        }
+        else {
+            $pwnedValue = [string]$lookup.Pwned
+        }
+        if ($pwnedValue -eq 'LookupFailed') {
+            $pwnedLookupFailures++
+        }
     }
 
     foreach ($member in $members) {
@@ -270,7 +156,6 @@ foreach ($group in $duplicateGroups) {
             DuplicatePasswordGroup     = $groupNumber
             DuplicatePasswordGroupSize = $members.Count
             SamAccountName             = $member.SamAccountName
-            NTHash                     = $member.NTHash
             AccountType                = $member.AccountType
             SourceServer               = $member.SourceServer
             Pwned                      = $pwnedValue
@@ -278,13 +163,35 @@ foreach ($group in $duplicateGroups) {
     }
 }
 
-$sortedResults = @(
-    $results |
-        Sort-Object -Property DuplicatePasswordGroup, SamAccountName
-)
+if ($results.Count -eq 0) {
+    # Mirror pwned_password_prof.ps1: emit a self-describing informational row instead of a
+    # headerless empty CSV when there are no duplicate-password groups.
+    $emptyResult = @(
+        [pscustomobject]([ordered]@{
+            DuplicatePasswordGroup     = ''
+            DuplicatePasswordGroupSize = ''
+            SamAccountName             = ''
+            AccountType                = if ($UsersOnly) { 'UserScope' } else { 'UserAndComputerScope' }
+            SourceServer               = [string]$Server
+            Pwned                      = if ($Pwned) { 'NotApplicable' } else { 'NotChecked' }
+            Comment                    = 'No duplicate-password groups were found.'
+        })
+    )
 
-$sortedResults | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+    $emptyResult | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+}
+else {
+    $sortedResults = @(
+        $results |
+            Sort-Object -Property DuplicatePasswordGroup, SamAccountName
+    )
+
+    $sortedResults | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+}
 
 Write-Host ("Duplicate password groups found: {0}" -f $groupNumber)
-Write-Host ("Affected accounts exported: {0}" -f $sortedResults.Count)
+Write-Host ("Affected accounts exported: {0}" -f $results.Count)
+if ($Pwned -and $pwnedLookupFailures -gt 0) {
+    Write-Warning ("{0} duplicate-password group(s) could NOT be checked against HIBP (lookup failed - possible rate limiting or network error). Those rows show Pwned=LookupFailed, NOT 'No'." -f $pwnedLookupFailures)
+}
 Write-Host ("CSV written to: {0}" -f $OutCsv)

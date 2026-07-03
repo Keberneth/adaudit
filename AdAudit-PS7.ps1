@@ -18,6 +18,51 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
+            [X] Version 8.9 - 03/07/2026
+                Code-review fix pass (correctness, duplication, efficiency, report/output clarity).
+                Correctness fixes:
+                    - Removed a stray top-level dispatch that ran the InactiveComputers check
+                      TWICE, the first time before $outputdir existed (writing a rogue
+                      \adaudit.nessus at the drive root) and outside the error wrapper.
+                    - Get-DomainAdminScaledRisk hydrated members with Get-ADObject -Properties
+                      Enabled, an invalid property that threw for every member, so KB427 always
+                      reported Critical. Now derives enabled state from userAccountControl.
+                    - Risk report: inverted NTLM logic (hardened domains were flagged, unhardened
+                      passed) - collector now writes an explicit Status line and the finding keys
+                      off "NotRestricted". MachineAccountQuota finding read a non-existent column
+                      and always said "Quota: 10" / fired at MAQ=0 - now reads Observed + IsFinding.
+                      SPNs.txt "no findings" sentinel counted as a Kerberoastable finding on clean
+                      domains - now excluded. AS-REP / Kerberoast / duplicate-password /
+                      PasswordNeverExpires / krbtgt / MAQ were each reported 2-3x under different
+                      titles/severities - now de-duplicated to a single source.
+                    - Nessus export: values are XML-escaped at write time (evidence containing
+                      < > & no longer corrupts the file) and severity is tiered from the KB id
+                      instead of every item being severity 0 / Low. Removed the broken post-hoc
+                      sanitizer.
+                    - Get-ADReplAccount -All (full-domain DCSync) ran twice per -all run; now
+                      cached and replicated once. Privileged-group enumeration failure was
+                      reported as an empty group (false all-clear); now recorded as Not Assessed.
+                    - Delegated permissions: Exchange/svc-*/Pre-Win2000 trustee matches ignored
+                      the DOMAIN\ prefix and never fired; computer-creation checked the wrong ACE
+                      column; Get-PrincipalType built an invalid LDAP filter from DOMAIN\name.
+                    - ConvertFrom-UACComputed always returned Unknown (int32 keys vs int64 lookup).
+                    - Split-PasswordQualityReport parsed the injected Kerberoast prose as accounts
+                      (now splits before annotating). repadmin /replsummary failure count was
+                      doubled (Source + Destination tables). Time-sync reported WinRM latency as
+                      clock skew (now offset vs the auditor clock). Get-ADAuditDcFunctionalLevelCapRank
+                      returned null for pre-2016 DCs, giving wrong "raise DFL" advice.
+                    - Theme toggle persisted the OS preference on first load in all HTML reports,
+                      permanently disabling "follow OS". End-of-run cleanup deleted companion
+                      reports that ADAudit-Results.html still linked to (now preserved).
+                    - Get-DomainAdminsGroupOverlap used direct-only membership; now resolves
+                      transitive membership via tokenGroups. Disabled built-in Administrator (RID-500)
+                      no longer flagged as a finding.
+                Efficiency: Get-PasswordPolicy queries the policy once (was 9x); Get-LockedAccounts
+                    uses Search-ADAccount -LockedOut; Get-OUPerms scans OUs only (was every object).
+                Clarity/output: fixed "identifed"/"optionnal" typos, KB### placeholder, stray '@'
+                    file headers, admin-account terminology (RID 500, not "Local Administrator"),
+                    trust-risk wording, and -select/-exclude trimming + usage docs. -KeepLegacyArtifacts
+                    now clears prior-run evidence files at startup (fixes append-across-runs).
             [X] Version 8.8 - 08/05/2026
                 Added Get-ADHealth (-adhealth / -ad-health / -health). New AD platform
                     health check covering replication health, DC diagnostics (dcdiag),
@@ -417,7 +462,7 @@
         Launch all checks (but do not install external modules)
     .EXAMPLE
         PS> ADAudit.ps1 -installdeps
-        Installs optionnal features (DSInternals)
+        Installs optional features (DSInternals)
     .EXAMPLE
         PS> ADAudit.ps1 -hostdetails -domainaudit
         Retrieves hostname and other useful audit info
@@ -466,9 +511,13 @@ Param (
 )
 
 $selectedChecks = @()
-if ($select) { $selectedChecks = $select.Split(',') }
+if ($select) { $selectedChecks = @($select.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+# Normalise -exclude too: accept "-exclude gpo,dnszone" and "-exclude 'gpo, dnszone'"
+# alike by splitting on commas and trimming, so a stray space never silently
+# defeats the match (e.g. ' dnszone' -notin the check names).
+$exclude = @($exclude | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-$versionnum = "v8.8"
+$versionnum = "v8.9"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 $script:ADAuditIsWindows = ($env:OS -eq 'Windows_NT')
@@ -717,6 +766,12 @@ function Get-ADAuditDcFunctionalLevelCapRank {
     if ($operatingSystem -match '2022') { return 9 }
     if ($operatingSystem -match '2019') { return 8 }
     if ($operatingSystem -match '2016') { return 7 }
+    if ($operatingSystem -match '2012 ?R2') { return 6 }
+    if ($operatingSystem -match '2012') { return 5 }
+    if ($operatingSystem -match '2008 ?R2') { return 4 }
+    if ($operatingSystem -match '2008') { return 3 }
+    if ($operatingSystem -match '2003') { return 2 }
+    if ($operatingSystem -match '2000') { return 0 }
 
     try {
         $parsedVersion = [version]$version
@@ -724,10 +779,34 @@ function Get-ADAuditDcFunctionalLevelCapRank {
         if ($parsedVersion.Major -eq 10 -and $parsedVersion.Build -ge 20348) { return 9 }
         if ($parsedVersion.Major -eq 10 -and $parsedVersion.Build -ge 17763) { return 8 }
         if ($parsedVersion.Major -eq 10) { return 7 }
+        if ($parsedVersion.Major -eq 6 -and $parsedVersion.Minor -eq 3) { return 6 }
+        if ($parsedVersion.Major -eq 6 -and $parsedVersion.Minor -eq 2) { return 5 }
+        if ($parsedVersion.Major -eq 6 -and $parsedVersion.Minor -eq 1) { return 4 }
+        if ($parsedVersion.Major -eq 6 -and $parsedVersion.Minor -eq 0) { return 3 }
+        if ($parsedVersion.Major -eq 5 -and $parsedVersion.Minor -eq 2) { return 2 }
     }
     catch { }
 
     return $null
+}
+
+$script:ADAuditReplAccountCache = @{}
+function Get-ADAuditReplAccountsCached {
+    param(
+        [Parameter(Mandatory = $true)][string]$Server,
+        [Parameter(Mandatory = $true)][string]$NamingContext
+    )
+    # Full-domain secrets replication (Get-ADReplAccount -All, a DCSync) is the single
+    # most expensive and most SOC-alarming operation in this tool. Both the password
+    # quality check and the high-risk baseline need it; cache the result per
+    # Server+NamingContext so a single -all run replicates once, not twice.
+    $key = "$Server|$NamingContext"
+    if ($script:ADAuditReplAccountCache.ContainsKey($key)) {
+        return $script:ADAuditReplAccountCache[$key]
+    }
+    $accounts = Get-ADReplAccount -All -Server $Server -NamingContext $NamingContext -ErrorAction Stop
+    $script:ADAuditReplAccountCache[$key] = $accounts
+    return $accounts
 }
 
 
@@ -1398,13 +1477,59 @@ Function Write-Nessus-Header() {
     Add-Content -Path "$outputdir\adaudit.nessus" -Value "<Report name=`"$env:ComputerName`" xmlns:cm=`"http://www.nessus.org/cm`">"
     Add-Content -Path "$outputdir\adaudit.nessus" -Value "<ReportHost name=`"$env:ComputerName`"><HostProperties></HostProperties>"
 }
-Function Write-Nessus-Finding( [string]$pluginname, [string]$pluginid, [string]$pluginexample) {
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<ReportItem port=`"0`" svc_name=`"`" protocol=`"`" severity=`"0`" pluginID=`"ADAudit_$pluginid`" pluginName=`"$pluginname`" pluginFamily=`"Windows`">"
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<description>There's an issue with $pluginname</description>"
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<plugin_type>remote</plugin_type><risk_factor>Low</risk_factor>"
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<solution>CCS Recommends fixing the issues with $pluginname on the host</solution>"
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<synopsis>There's an issue with the $pluginname settings on the host</synopsis>"
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<plugin_output>$pluginexample</plugin_output></ReportItem>"
+# Maps ADAudit KB identifiers to a Nessus severity tier so the exported
+# .nessus file can be triaged by risk instead of every item landing on "Low".
+# Anything not listed defaults to Medium; callers may override per finding by
+# passing -Severity (Critical/High/Medium/Low/Info).
+$script:NessusSeverityByKB = @{
+    'KB510' = 'Critical'; 'KB1200' = 'Critical'; 'KB253' = 'Critical'; 'KB611' = 'Critical'
+    'KB720' = 'Critical'; 'KB1095' = 'Critical'; 'KB1096' = 'Critical'; 'KB1205' = 'Critical'
+    'KB329' = 'Critical'
+    'KB842' = 'High'; 'KB551' = 'High'; 'KB426' = 'High'; 'KB427' = 'High'; 'KB428' = 'High'
+    'KB262' = 'High'; 'KB263' = 'High'; 'KB81' = 'High'; 'KB290' = 'High'; 'KB479' = 'High'
+    'KB995' = 'High'; 'KB1101' = 'High'; 'KB1203' = 'High'; 'KB1204' = 'High'; 'KB258' = 'High'
+    'KB250' = 'Medium'; 'KB251' = 'Medium'; 'KB254' = 'Medium'; 'KB259' = 'Medium'
+    'KB500' = 'Medium'; 'KB546' = 'Medium'; 'KB547' = 'Medium'; 'KB549' = 'Medium'
+    'KB550' = 'Medium'; 'KB552' = 'Medium'; 'KB1202' = 'Medium'; 'KB1310' = 'Medium'
+    'KB309' = 'Medium'; 'KB1201' = 'Medium'
+    'KB501' = 'Low'; 'KB1300' = 'Low'
+}
+
+function Get-NessusSeverityTuple([string]$Severity) {
+    switch ($Severity) {
+        'Critical' { return @{ Num = 4; Risk = 'Critical' } }
+        'High'     { return @{ Num = 3; Risk = 'High' } }
+        'Medium'   { return @{ Num = 2; Risk = 'Medium' } }
+        'Low'      { return @{ Num = 1; Risk = 'Low' } }
+        'Info'     { return @{ Num = 0; Risk = 'None' } }
+        default    { return @{ Num = 2; Risk = 'Medium' } }
+    }
+}
+
+Function Write-Nessus-Finding( [string]$pluginname, [string]$pluginid, [string]$pluginexample, [string]$Severity = '') {
+    # Resolve severity: explicit override, else KB map, else Medium.
+    if ([string]::IsNullOrWhiteSpace($Severity)) {
+        $kb = ($pluginid -replace '[^A-Za-z0-9]', '')
+        if ($script:NessusSeverityByKB.ContainsKey($kb)) { $Severity = $script:NessusSeverityByKB[$kb] }
+        else { $Severity = 'Medium' }
+    }
+    $sev = Get-NessusSeverityTuple $Severity
+
+    # Escape every value at write time so evidence text containing < > & " '
+    # can never produce malformed XML (the previous post-hoc sanitizer could
+    # not distinguish markup from content and left the file unparseable).
+    $nameEsc = [System.Security.SecurityElement]::Escape([string]$pluginname)
+    $idEsc = [System.Security.SecurityElement]::Escape([string]$pluginid)
+    $exEsc = [System.Security.SecurityElement]::Escape([string]$pluginexample)
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine("<ReportItem port=`"0`" svc_name=`"`" protocol=`"`" severity=`"$($sev.Num)`" pluginID=`"ADAudit_$idEsc`" pluginName=`"$nameEsc`" pluginFamily=`"Windows`">")
+    [void]$sb.AppendLine("<description>Active Directory audit finding: $nameEsc</description>")
+    [void]$sb.AppendLine("<plugin_type>remote</plugin_type><risk_factor>$($sev.Risk)</risk_factor>")
+    [void]$sb.AppendLine("<solution>Review the '$nameEsc' finding in the ADAudit report and remediate per its recommended action.</solution>")
+    [void]$sb.AppendLine("<synopsis>ADAudit detected a potential issue: $nameEsc</synopsis>")
+    [void]$sb.AppendLine("<plugin_output>$exEsc</plugin_output></ReportItem>")
+    Add-Content -Path "$outputdir\adaudit.nessus" -Value $sb.ToString().TrimEnd()
 }
 Function Write-Nessus-Footer() {
     Add-Content -Path "$outputdir\adaudit.nessus" -Value "</ReportHost></Report></AdAudit>"
@@ -1477,7 +1602,7 @@ Function Get-DNSZoneInsecure {
         if ($insecurezones) {
             foreach ($insecurezone in $insecurezones) {
                 Add-Content -Path $globalInsecureZonesFile -Value (
-"@The DNS Zone {0} on DNS server {1} allows insecure updates ({2})" -f `
+"The DNS Zone {0} on DNS server {1} allows insecure updates ({2})" -f `
                     $insecurezone.ZoneName, $dnsServer, $insecurezone.DynamicUpdate
                 )
                 $totalcount++
@@ -1503,12 +1628,16 @@ Function Get-OUPerms {
     #Check for non-standard perms for authenticated users, domain users, users and everyone groups
     $count = 0
     $progresscount = 0
-    $objects = (Get-ADObject -Filter *)
-    $totalcount = ($objects | Measure-Object | Select-Object Count).count
+    # Scope to organizationalUnit objects only. The previous version enumerated EVERY object
+    # in the domain and ran one Get-Acl per object (very slow on large estates), then labelled
+    # every result 'OU:' even when it was a user/computer/container. Dangerous ACLs on non-OU
+    # objects are covered by the -acl and -delegatedpermissions checks.
+    $objects = @(Get-ADObject -LDAPFilter '(objectClass=organizationalUnit)')
+    $totalcount = $objects.Count
     foreach ($object in $objects) {
         if ($totalcount -eq 0) { break }
         $progresscount++
-        Write-Progress -Activity "Searching for non standard permissions for authenticated users..." -Status "Currently identifed $count" -PercentComplete ($progresscount / $totalcount * 100)
+        Write-Progress -Activity "Searching for non-standard OU permissions..." -Status "Currently identified $count" -PercentComplete ($progresscount / $totalcount * 100)
         try {
             $output = (Get-Acl -Path "AD:$object" -ErrorAction Stop).Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
         } catch {
@@ -1517,12 +1646,14 @@ Function Get-OUPerms {
         if ($output -ne $null) {
             $count++
             Add-Content -Path (Get-EvidencePath 'ou_permissions.txt') -Value "OU: $object"
-            Add-Content -Path (Get-EvidencePath 'ou_permissions.txt') -Value "[!] Rights: $($output.IdentityReference) $($output.ActiveDirectoryRights) $($output.AccessControlType)"
+            foreach ($ace in @($output)) {
+                Add-Content -Path (Get-EvidencePath 'ou_permissions.txt') -Value "    [!] $($ace.IdentityReference) | $($ace.ActiveDirectoryRights) | $($ace.AccessControlType)"
+            }
         }
     }
-    Write-Progress -Activity "Searching for non standard permissions for authenticated users..." -Status "Ready" -Completed
+    Write-Progress -Activity "Searching for non-standard OU permissions..." -Status "Ready" -Completed
     if ($count -gt 0) {
-        Write-Both "    [!] Issue identified, see $outputdir\ou_permissions.txt"
+        Write-Both "    [!] Non-standard OU permissions identified, see ou_permissions.txt"
         Write-Nessus-Finding "OUPermissions" "KB551" ([System.IO.File]::ReadAllText((Get-EvidencePath 'ou_permissions.txt')))
     }
 }
@@ -1662,14 +1793,14 @@ Function Get-PrivilegedGroupAccounts {
     $totalcount = ($privilegedusers | Measure-Object | Select-Object Count).count
     foreach ($account in $privusersunique) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for users who are in privileged groups..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for users who are in privileged groups..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'accounts_userPrivileged.txt') -Value "$($account.SamAccountName) ($($account.Name))"
         $count++
     }
     Write-Progress -Activity "Searching for users who are in privileged groups..." -Status "Ready" -Completed
     if ($count -gt 0) {
         Write-Both "    [!] There are $count accounts in privileged groups, see accounts_userPrivileged.txt (KB426)"
-        Write-Nessus-Finding "AdminSDHolders" "KB426" ([System.IO.File]::ReadAllText((Get-EvidencePath 'accounts_userPrivileged.txt')))
+        Write-Nessus-Finding "PrivilegedGroupMembers" "KB426" ([System.IO.File]::ReadAllText((Get-EvidencePath 'accounts_userPrivileged.txt')))
     }
 }
 
@@ -1850,23 +1981,35 @@ Function Get-DomainAdminScaledRisk {
     $rows = @()
     foreach ($m in $effectiveMembers) {
         $obj = $null
+        $hydrated = $false
         try {
-            $obj = Get-ADObject -Identity $m.distinguishedName -Properties SamAccountName, Enabled, lastLogonTimestamp, servicePrincipalName, objectClass, sIDHistory -ErrorAction Stop
+            # NOTE: 'Enabled' is NOT a valid Get-ADObject property (it is an extended
+            # property of Get-ADUser/Get-ADComputer only) and requesting it throws for
+            # every member. Derive enabled state from userAccountControl (bit 0x2) instead.
+            $obj = Get-ADObject -Identity $m.distinguishedName -Properties SamAccountName, userAccountControl, lastLogonTimestamp, servicePrincipalName, objectClass, sIDHistory -ErrorAction Stop
+            $hydrated = $true
         } catch {
             $obj = $m
+            Write-Both "        [i] Could not fully hydrate Domain Admins member $($m.distinguishedName): $($_.Exception.Message)"
         }
         $kind = Get-PrincipalKindForDA -Member $obj -DomainSid $domainSid
+        # Default to enabled/not-stale on a hydration failure so we do not falsely
+        # escalate the whole finding to Critical when a single member cannot be read.
         $enabled = $true
-        try { if ($obj.PSObject.Properties['Enabled']) { $enabled = [bool]$obj.Enabled } } catch { }
+        if ($hydrated -and $obj.PSObject.Properties['userAccountControl'] -and $null -ne $obj.userAccountControl) {
+            $enabled = -not ([bool]([int]$obj.userAccountControl -band 0x2))
+        }
         $stale = $false
-        try {
-            if ($obj.lastLogonTimestamp) {
-                $llt = [DateTime]::FromFileTime([long]$obj.lastLogonTimestamp)
-                if ($llt -lt (Get-Date).AddDays(-90)) { $stale = $true }
-            } else {
-                $stale = $true   # never logged on
-            }
-        } catch { }
+        if ($hydrated) {
+            try {
+                if ($obj.lastLogonTimestamp) {
+                    $llt = [DateTime]::FromFileTime([long]$obj.lastLogonTimestamp)
+                    if ($llt -lt (Get-Date).AddDays(-90)) { $stale = $true }
+                } else {
+                    $stale = $true   # never logged on
+                }
+            } catch { }
+        }
         $rows += [pscustomobject]@{
             SamAccountName = $obj.SamAccountName
             DN             = $m.distinguishedName
@@ -2053,7 +2196,9 @@ Function Get-DomainAdminScaledRisk {
         $hasSpn     = ($rid500.servicePrincipalName -and $rid500.servicePrincipalName.Count -gt 0)
 
         $issues = @()
-        if (-not $rid500.Enabled) { $issues += 'account is DISABLED' }
+        # A DISABLED built-in Administrator is the recommended hardened posture, not a
+        # finding - do not flag it. (The account's enabled state is still recorded in the
+        # evidence file below for context.)
         if ($pwdAgeDays -ge 0 -and $pwdAgeDays -gt 180) { $issues += "password age $pwdAgeDays days (>180d) - rotate" }
         if ($hasSpn) { $issues += 'has SPN(s) - is being used as a service account' }
         try {
@@ -2102,7 +2247,12 @@ Function Get-DomainAdminScaledRisk {
         [void]$rid500EvSb.AppendLine(' - Consider adding to Protected Users once break-glass procedures account for the Kerberos restrictions.')
         [void]$rid500EvSb.AppendLine(' - Monitor for any logon and group-membership change.')
         Set-Content -LiteralPath (Get-EvidencePath 'domain_admin_builtin_rid500.txt') -Value $rid500EvSb.ToString() -Encoding UTF8
-        Write-Nessus-Finding "BuiltinDomainAdminRid500" "KB428" ([System.IO.File]::ReadAllText((Get-EvidencePath 'domain_admin_builtin_rid500.txt')))
+        # Only raise a Nessus finding when there is an actual hygiene issue; a hardened
+        # (disabled, fresh password, no SPN) RID-500 should not surface as a finding. Pass
+        # the computed severity so the export reflects High/Medium rather than the KB default.
+        if ($issues.Count -gt 0) {
+            Write-Nessus-Finding "BuiltinDomainAdminRid500" "KB428" ([System.IO.File]::ReadAllText((Get-EvidencePath 'domain_admin_builtin_rid500.txt'))) $rid500Sev
+        }
     } catch {
         Write-Both "    [!] Could not inspect RID-500 account: $($_.Exception.Message)"
     }
@@ -2199,7 +2349,14 @@ Function Get-ADHealth {
         # phrase ((unknown)), or a multi-token phrase like ">60 days". Match
         # robustly by anchoring on the "fails / total percentage" pattern
         # itself. Capture group #1 is the actual fails column.
+        # /replsummary prints the SAME failures twice - once in the "Source DSA" table
+        # and once in the "Destination DSA" table. Count rows from the Source table only,
+        # otherwise every failure is double-counted.
+        $inSourceTable = $false
         foreach ($line in ($replSummary -split "`r?`n")) {
+            if ($line -match 'Source DSA')      { $inSourceTable = $true;  continue }
+            if ($line -match 'Destination DSA') { $inSourceTable = $false; continue }
+            if (-not $inSourceTable) { continue }
             if ($line -match '^\s*\S+\s+.+?(\d+)\s*/\s*\d+\s+\d+(\s|$)') {
                 $f = [int]$matches[1]
                 if ($f -gt 0) { $replFailed += $f }
@@ -2226,9 +2383,11 @@ Function Get-ADHealth {
     }
 
     [void]$replSb.AppendLine('')
-    [void]$replSb.AppendLine('=== repadmin /removelingeringobjects (advisory; dry-run not supported here) ===')
+    [void]$replSb.AppendLine('=== repadmin /showrepl /errorsonly (advisory replication-error / lingering-object scan) ===')
     try {
-        # Advisory-only: many environments do not have a configured reference DC, so this often errors.
+        # Advisory-only per-DC replication error scan. This is NOT /removelingeringobjects
+        # (which requires a configured clean reference DC and would make changes); it lists
+        # replication errors so lingering-object symptoms surface without modifying anything.
         $linger = (repadmin /showrepl /errorsonly 2>&1) | Out-String
         [void]$replSb.AppendLine($linger)
         if ($LASTEXITCODE -ne 0) { $replLingeringErr = $true }
@@ -2646,7 +2805,7 @@ Function Get-ADHealth {
                     $fsmoWarn++
                 } elseif ($pdcSource -match '(?i)Local CMOS Clock|Free-running System Clock') {
                     _Add-HFinding -Category 'FSMO' -Severity 'High' -Title 'Forest-root PDC has no authoritative external time source' -Evidence "The forest-root PDC emulator '$forestRootPdc' is syncing from '$pdcSource' rather than an external/hardware NTP source. Every clock in the forest chains to this PDC; with no real upstream source the whole forest can drift and break Kerberos (auth fails at >5 min skew)." -Source $fsmoPath
-                    $fsmoWarn++
+                    $fsmoHigh++
                 } else {
                     [void]$fsmoSb.AppendLine('  Assessment     : external/upstream time source present (OK)')
                 }
@@ -2724,9 +2883,17 @@ Function Get-ADHealth {
     foreach ($dc in $dcs) {
         $dcHost = $dc.HostName
         try {
+            # Bracket the remote call with local UTC readings and compare the remote clock
+            # against the MIDPOINT of the local window. Comparing raw sequentially-sampled
+            # clocks would fold WinRM round-trip latency (and time blocked on a slow/hung DC)
+            # into the result and report it as false clock skew.
+            $localBefore = [DateTime]::UtcNow
             $nowUtc = Invoke-Command -ComputerName $dcHost -ScriptBlock { (Get-Date).ToUniversalTime() } -ErrorAction Stop
-            $samples += [pscustomobject]@{ Host = $dcHost; Time = $nowUtc }
-            [void]$timeSb.AppendLine("$dcHost UTC: $nowUtc")
+            $localAfter = [DateTime]::UtcNow
+            $localMid = $localBefore.AddTicks([long]((($localAfter - $localBefore).Ticks) / 2))
+            $offset = ($nowUtc - $localMid).TotalSeconds
+            $samples += [pscustomobject]@{ Host = $dcHost; Offset = $offset }
+            [void]$timeSb.AppendLine(("{0} UTC: {1:o}  (offset vs auditor host: {2:N1} sec)" -f $dcHost, $nowUtc, $offset))
         } catch {
             [void]$timeSb.AppendLine("$dcHost UTC: unavailable ($($_.Exception.Message))")
         }
@@ -2734,7 +2901,7 @@ Function Get-ADHealth {
     if ($samples.Count -ge 2) {
         for ($i = 0; $i -lt $samples.Count; $i++) {
             for ($j = $i + 1; $j -lt $samples.Count; $j++) {
-                $skew = [math]::Abs(($samples[$i].Time - $samples[$j].Time).TotalSeconds)
+                $skew = [math]::Abs($samples[$i].Offset - $samples[$j].Offset)
                 [void]$timeSb.AppendLine(("Skew {0} <-> {1}: {2:N1} sec" -f $samples[$i].Host, $samples[$j].Host, $skew))
                 if ($skew -gt 300) { $timeIssues++ }
             }
@@ -2899,7 +3066,8 @@ Function Get-ADHealth {
     $ghEmpty = 0
     $ghBuiltinPg = 0
     [void]$ghSb.AppendLine('Group Hygiene')
-    [void]$ghSb.AppendLine(("Generated: {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ssZ')))
+    # Stamp real UTC (the previous 'Z' suffix was a literal on a LOCAL-time value).
+    [void]$ghSb.AppendLine(("Generated: {0} UTC" -f ((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))))
     [void]$ghSb.AppendLine('-' * 70)
     try {
         $groups = Get-ADGroup -Filter * -Properties members,primaryGroupToken -ErrorAction Stop
@@ -3035,12 +3203,12 @@ html[data-theme="light"] {
     document.documentElement.setAttribute('data-theme', t);
     var b = document.getElementById('adAuditThemeToggle');
     if (b){ b.innerText = (t==='dark') ? 'Light mode' : 'Dark mode'; b.setAttribute('aria-pressed',(t==='dark')?'true':'false'); }
-    try { localStorage.setItem('adaudit-theme', t); } catch(_){}
   }
+  function setTheme(t){ applyTheme(t); try { localStorage.setItem('adaudit-theme', t); } catch(_){} }
   document.addEventListener('DOMContentLoaded', function(){
     applyTheme(currentTheme());
     var b = document.getElementById('adAuditThemeToggle');
-    if (b){ b.addEventListener('click', function(){ applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark'); }); }
+    if (b){ b.addEventListener('click', function(){ setTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark'); }); }
     if (window.matchMedia){
       var mq = window.matchMedia('(prefers-color-scheme: dark)');
       var h = function(e){ var s=null; try { s=localStorage.getItem('adaudit-theme'); } catch(_){} if (s!=='light' && s!=='dark') applyTheme(e.matches?'dark':'light'); };
@@ -3886,7 +4054,7 @@ Function Get-ProtectedUsers {
         $totalcount = ($protectedaccounts | Measure-Object | Select-Object -ExpandProperty Count)
         foreach ($members in $protectedaccounts) {
             if ($totalcount -eq 0) { break }
-            Write-Progress -Activity "Searching for protected users..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+            Write-Progress -Activity "Searching for protected users..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
             $account = Get-ADObject $members -Properties SamAccountName
             Add-Content -Path $evPath -Value "$($account.SamAccountName) ($($account.Name))"
             $count++
@@ -4073,7 +4241,7 @@ Function Get-InactiveComputerObjects {
 
     foreach ($computer in $inactiveComputers) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for inactive computer objects (>90 days)..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for inactive computer objects (>90 days)..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
 
         $datelastlogon = if ($computer.LastLogonTimeStamp) { [DateTime]::FromFileTime($computer.LastLogonTimeStamp) } else { "Never" }
 
@@ -4084,35 +4252,38 @@ Function Get-InactiveComputerObjects {
     Write-Progress -Activity "Searching for inactive computer objects (>90 days)..." -Status "Ready" -Completed
 
     if ($count -gt 0) {
-        Write-Both "    [!] $count enabled computer objects inactive for >90 days, see computers_inactive_90days.txt (KB###)"
-        Write-Nessus-Finding "InactiveComputers90Days" "KB###" ([System.IO.File]::ReadAllText($ReportPath))
+        Write-Both "    [!] $count enabled computer objects inactive for >90 days, see computers_inactive_90days.txt (KB552)"
+        Write-Nessus-Finding "InactiveComputers90Days" "KB552" ([System.IO.File]::ReadAllText($ReportPath))
     }
 }
 
 Function Get-PasswordPolicy {
     Write-Both "    [+] Checking default password policy"
-    if (!(Get-ADDefaultDomainPasswordPolicy).ComplexityEnabled) {
+    # Query the default domain password policy once and reuse it - the previous version
+    # called Get-ADDefaultDomainPasswordPolicy up to nine times per run.
+    $pol = Get-ADDefaultDomainPasswordPolicy
+    if (!$pol.ComplexityEnabled) {
         Write-Both "    [!] Password Complexity not enabled (KB262)"
         Write-Nessus-Finding "PasswordComplexity" "KB262" "Password Complexity not enabled"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).LockoutThreshold -lt 5) {
-        Write-Both "    [!] Lockout threshold is less than 5, currently set to $((Get-ADDefaultDomainPasswordPolicy).LockoutThreshold) (KB263)"
-        Write-Nessus-Finding "LockoutThreshold" "KB263" "Lockout threshold is less than 5, currently set to $((Get-ADDefaultDomainPasswordPolicy).LockoutThreshold)"
+    if ($pol.LockoutThreshold -lt 5) {
+        Write-Both "    [!] Lockout threshold is less than 5, currently set to $($pol.LockoutThreshold) (KB263)"
+        Write-Nessus-Finding "LockoutThreshold" "KB263" "Lockout threshold is less than 5, currently set to $($pol.LockoutThreshold)"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).MinPasswordLength -lt 14) {
-        Write-Both "    [!] Minimum password length is less than 14, currently set to $((Get-ADDefaultDomainPasswordPolicy).MinPasswordLength) (KB262)"
-        Write-Nessus-Finding "PasswordLength" "KB262" "Minimum password length is less than 14, currently set to $((Get-ADDefaultDomainPasswordPolicy).MinPasswordLength)"
+    if ($pol.MinPasswordLength -lt 14) {
+        Write-Both "    [!] Minimum password length is less than 14, currently set to $($pol.MinPasswordLength) (KB262)"
+        Write-Nessus-Finding "PasswordLength" "KB262" "Minimum password length is less than 14, currently set to $($pol.MinPasswordLength)"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).ReversibleEncryptionEnabled) {
+    if ($pol.ReversibleEncryptionEnabled) {
         Write-Both "    [!] Reversible encryption is enabled"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).MaxPasswordAge -eq "00:00:00") {
+    if ($pol.MaxPasswordAge -eq "00:00:00") {
         Write-Both "    [!] Passwords do not expire (KB254)"
         Write-Nessus-Finding "PasswordsDoNotExpire" "KB254" "Passwords do not expire"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount -lt 12) {
-        Write-Both "    [!] Passwords history is less than 12, currently set to $((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount) (KB262)"
-        Write-Nessus-Finding "PasswordHistory" "KB262" "Passwords history is less than 12, currently set to $((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount)"
+    if ($pol.PasswordHistoryCount -lt 12) {
+        Write-Both "    [!] Passwords history is less than 12, currently set to $($pol.PasswordHistoryCount) (KB262)"
+        Write-Nessus-Finding "PasswordHistory" "KB262" "Passwords history is less than 12, currently set to $($pol.PasswordHistoryCount)"
     }
     # NoLmHash is a per-DC machine setting. Read it from the PDC emulator rather than
     # the local host (on a jump server the local value is the jump server's, not a DC's).
@@ -4199,28 +4370,20 @@ Function Get-NULLSessions {
     }
 }
 Function Get-DomainTrusts {
-    #Lists domain trusts if they are bad
+    #Lists domain trusts and flags the risk of inbound/bidirectional (outbound-from-us) trusts
     foreach ($trust in (Get-ADObject -Filter { objectClass -eq "trustedDomain" } -Properties TrustPartner, TrustDirection, trustType, trustAttributes)) {
-        if ($trust.TrustDirection -eq 2) {
+        # Direction 2 = Outbound, 3 = Bidirectional. In both, THIS domain trusts the partner,
+        # so the partner's principals can be authorised here (the risky direction for us).
+        # Direction 1 = Inbound-only (partner trusts us) is not flagged.
+        if ($trust.TrustDirection -eq 2 -or $trust.TrustDirection -eq 3) {
             if (($trust.TrustAttributes -band 0x1) -or ($trust.TrustAttributes -band 0x4)) {
-                # 0x1 = non-transitive, 0x4 = quarantined/SID-filtered; bitmask test so combined flags are handled
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain."
+                # 0x1 = non-transitive, 0x4 = quarantined/SID-filtered: partner access is contained.
+                Write-Both "    [!] $env:UserDomain trusts the domain $($trust.Name) (non-transitive or SID-filtered - contained, but confirm the business need). (KB250)"
+                Write-Nessus-Finding "DomainTrusts" "KB250" "$env:UserDomain trusts the domain $($trust.Name). Trust is non-transitive or SID-filtered (contained). Review the business justification."
             }
             else {
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive!"
-            }
-        }
-        if ($trust.TrustDirection -eq 3) {
-            if (($trust.TrustAttributes -band 0x1) -or ($trust.TrustAttributes -band 0x4)) {
-                # 0x1 = non-transitive, 0x4 = quarantined/SID-filtered; bitmask test so combined flags are handled
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain."
-            }
-            else {
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive!"
+                Write-Both "    [!] $env:UserDomain trusts the domain $($trust.Name) and the trust is TRANSITIVE with no SID filtering - principals from $($trust.Name) (and domains it trusts) can be authorised here, so a compromise there can pivot into this domain. (KB250)"
+                Write-Nessus-Finding "DomainTrusts" "KB250" "$env:UserDomain trusts the domain $($trust.Name); the trust is TRANSITIVE with no SID filtering, so principals from the trusted forest (and its onward trusts) can be authorised in this domain. Enable SID filtering / quarantine unless a business need requires otherwise."
             }
         }
     }
@@ -4276,7 +4439,7 @@ Function Get-UserPasswordNotChangedRecently {
     $totalcount = ($accountsoldpasswords | Measure-Object | Select-Object Count).count
     foreach ($account in $accountsoldpasswords) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for passwords older than 90days..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for passwords older than 90days..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         if ($account.PasswordLastSet) {
             $datelastchanged = $account.PasswordLastSet
         }
@@ -4315,7 +4478,7 @@ Function Get-GPOsPerOU {
     $totalcount = ($ousgpos | Measure-Object | Select-Object Count).count
     foreach ($ouobject in $ousgpos) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Identifying which GPOs apply to which OUs..." -Status "Currently identifed $count OUs" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Identifying which GPOs apply to which OUs..." -Status "Currently identified $count OUs" -PercentComplete ($count / $totalcount * 100)
         $combinedgpos = ($(((Get-GPInheritance -Target $ouobject).InheritedGpoLinks) | select DisplayName) | ForEach-Object { $_.DisplayName }) -join ','
         Add-Content -Path (Get-EvidencePath 'ous_inheritedGPOs.txt') -Value "$($ouobject.Name) Inherits these GPOs: $combinedgpos"
         $count++
@@ -4464,8 +4627,8 @@ Function Get-AdminAccountChecks {
     $AdministratorSAMAccountName = $Administrator500.SamAccountName
     $AdministratorName = $Administrator500.Name
     if ($AdministratorTranslation -contains $AdministratorSAMAccountName) {
-        Write-Both "    [!] Local Administrator account (UID500) has not been renamed (KB309)"
-        Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Local Administrator account (UID500) has not been renamed"
+        Write-Both "    [!] Built-in domain Administrator account (RID 500) has not been renamed (KB309)"
+        Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Built-in domain Administrator account (RID 500) has not been renamed"
     }
     else {
         $count = 0
@@ -4473,14 +4636,14 @@ Function Get-AdminAccountChecks {
             if ((Get-ADUser -Filter { SamAccountName -eq $AdminName })) { $count++ }
         }
         if ($count -eq 0) {
-            Write-Both "    [!] Local Administrator account renamed to $AdministratorSAMAccountName ($($AdministratorName)), but a dummy account not made in it's place! (KB309)"
-            Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Local Admin account renamed to $AdministratorSAMAccountName ($($AdministratorName)), but a dummy account not made in it's place"
+            Write-Both "    [!] Built-in domain Administrator account (RID 500) renamed to $AdministratorSAMAccountName ($($AdministratorName)), but no decoy 'Administrator' account was created in its place! (KB309)"
+            Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Built-in domain Administrator account (RID 500) renamed to $AdministratorSAMAccountName ($($AdministratorName)), but no decoy 'Administrator' account was created in its place"
         }
     }
     $AdministratorLastLogonDate = $Administrator500.LastLogonDate
     if ($AdministratorLastLogonDate -gt (Get-Date).AddDays(-180)) {
-        Write-Both "    [!] UID500 (LocalAdministrator) account is still used, last used $AdministratorLastLogonDate! (KB309)"
-        Write-Nessus-Finding "AdminAccountRenamed" "KB309" "UID500 (LocalAdmini) account is still used, last used $AdministratorLastLogonDate"
+        Write-Both "    [!] Built-in domain Administrator account (RID 500) is still in use, last used $AdministratorLastLogonDate! (KB309)"
+        Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Built-in domain Administrator account (RID 500) is still in use, last used $AdministratorLastLogonDate"
     }
 }
 
@@ -4581,11 +4744,24 @@ Function Get-DomainAdminsGroupOverlap {
         try {
             $u = Get-ADUser -Identity $m.DistinguishedName -Properties Enabled,SamAccountName,Name,DistinguishedName -ErrorAction Stop
 
-            # Effective group membership (includes nested groups)
-            $groups = Get-ADPrincipalGroupMembership -Identity $u.DistinguishedName -ErrorAction Stop |
-                Select-Object -ExpandProperty SamAccountName
-
-            $groupsNorm = @($groups | Where-Object { $_ } | ForEach-Object { $_.ToString() })
+            # Effective (transitive) group membership. Get-ADPrincipalGroupMembership returns
+            # only DIRECT groups, so a Domain Admin nested into a Tier-1 group via an
+            # intermediate group would be missed - exactly the indirection this check exists to
+            # catch. Use the constructed tokenGroups attribute (all nested/indirect SIDs) and
+            # translate each SID to a group name; fall back to direct membership if unavailable.
+            $groupsNorm = @()
+            try {
+                $tokenUser = Get-ADUser -Identity $u.DistinguishedName -Properties tokenGroups -ErrorAction Stop
+                foreach ($sid in $tokenUser.tokenGroups) {
+                    try {
+                        $grp = Get-ADGroup -Identity $sid -ErrorAction Stop
+                        if ($grp.SamAccountName) { $groupsNorm += [string]$grp.SamAccountName }
+                    } catch { }
+                }
+            } catch {
+                $groupsNorm = @(Get-ADPrincipalGroupMembership -Identity $u.DistinguishedName -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty SamAccountName | Where-Object { $_ } | ForEach-Object { $_.ToString() })
+            }
 
             # Extra groups beyond baseline (case-insensitive)
             $extra = @()
@@ -4685,7 +4861,7 @@ Function Get-DisabledAccounts {
 
     if ($totalcount -gt 0) {
         # Reset file for this run
-        Set-Content -Encoding UTF8 -Path $txtPath -Value "@Disabled user accounts"
+        Set-Content -Encoding UTF8 -Path $txtPath -Value "# Disabled user accounts"
     } else {
         # Ensure no stale output from previous runs
         if (Test-Path -LiteralPath $txtPath) { Remove-Item -LiteralPath $txtPath -Force -ErrorAction SilentlyContinue }
@@ -4710,12 +4886,14 @@ Function Get-DisabledAccounts {
 
 Function Get-LockedAccounts {
     #Lists locked accounts
-    $lockedAccounts = Get-ADUser -Filter * -Properties LockedOut | Where-Object { $_.LockedOut -eq $true }
+    # Search-ADAccount -LockedOut filters server-side; the previous Get-ADUser -Filter *
+    # downloaded every user object in the domain just to filter the locked ones locally.
+    $lockedAccounts = @(Search-ADAccount -LockedOut -UsersOnly)
     $count = 0
     $totalcount = ($lockedAccounts | Measure-Object | Select-Object Count).Count
     foreach ($account in $lockedAccounts) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for locked users..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for locked users..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'accounts_locked.txt') -Value "Account $($account.SamAccountName) ($($account.Name)) is locked"
         $count++
     }
@@ -4731,7 +4909,7 @@ Function Get-AccountPassDontExpire {
     $totalcount = ($nonexpiringpasswords | Measure-Object | Select-Object Count).count
     foreach ($account in $nonexpiringpasswords) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for users with passwords that dont expire..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for users with passwords that dont expire..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'accounts_passdontexpire.txt') -Value "$($account.SamAccountName) ($($account.Name))"
         $count++
     }
@@ -4744,24 +4922,19 @@ Function Get-AccountPassDontExpire {
 Function Get-OldBoxes {
     #Lists machines running OS older than Windows Server 2019
     $count = 0
-    $oldboxes = Get-ADComputer -Filter { Enabled -eq "true" -and (OperatingSystem -Like "*2016*" -or OperatingSystem -Like "*2012*" -or OperatingSystem -Like "*2008*" -or OperatingSystem -Like "*2003*" -or OperatingSystem -Like "*2000*" -or OperatingSystem -Like "*XP*" -or OperatingSystem -like '*Windows 7*' -or OperatingSystem -like '*Windows 8*' -or OperatingSystem -like '*Windows 10*' -or OperatingSystem -like '*vista*') } -Property OperatingSystem
+    $oldboxes = Get-ADComputer -Filter { Enabled -eq "true" -and (OperatingSystem -Like "*2016*" -or OperatingSystem -Like "*2012*" -or OperatingSystem -Like "*2008*" -or OperatingSystem -Like "*2003*" -or OperatingSystem -Like "*2000*" -or OperatingSystem -Like "*XP*" -or OperatingSystem -like '*Windows 7*' -or OperatingSystem -like '*Windows 8*' -or OperatingSystem -like '*Windows 10*' -or OperatingSystem -like '*vista*') } -Property OperatingSystem, OperatingSystemVersion, OperatingSystemServicePack, IPv4Address
     $totalcount = ($oldboxes | Measure-Object | Select-Object Count).count
     foreach ($machine in $oldboxes) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for unsupported OS devices joined to the domain..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
+        Write-Progress -Activity "Searching for unsupported OS devices joined to the domain..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'machines_old.txt') -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersion), $($machine.IPv4Address)"
         $count++
     }
     Write-Progress -Activity "Searching for unsupported OS devices joined to the domain..." -Status "Ready" -Completed
     if ($count -gt 0) {
-        Write-Both "    [!] We found $count machines running an unsupported OS (older than Server 2019)! see machines_old.txt (KB3/37/38/KB259)"
+        Write-Both "    [!] $count machines are running an OS older than Windows Server 2019 (some, such as Server 2016 or Windows 10, may still be in extended support - verify each against the Microsoft product lifecycle). See machines_old.txt (KB259)"
         Write-Nessus-Finding "OldBoxes" "KB259" ([System.IO.File]::ReadAllText((Get-EvidencePath 'machines_old.txt')))
     }
-}
-if ($InactiveComputers -or ($all -and 'inactivecomputers' -notin $exclude) -or 'inactivecomputers' -in $selectedChecks) {
-    $running = $true
-    Write-Both "[*] Inactive Computer Objects Audit"
-    Get-InactiveComputerObjects
 }
 Function Get-DCsNotOwnedByDA {
     #Searches for DC objects not owned by the Domain Admins group
@@ -4772,7 +4945,7 @@ Function Get-DCsNotOwnedByDA {
     if ($totalcount -gt 0) {
         foreach ($machine in $domaincontrollers) {
             $progresscount++
-            Write-Progress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Currently identifed $count" -PercentComplete ($progresscount / $totalcount * 100)
+            Write-Progress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Currently identified $count" -PercentComplete ($progresscount / $totalcount * 100)
             if ($machine.ntsecuritydescriptor.Owner -ne "$env:UserDomain\$DomainAdmins") {
                 Add-Content -Path (Get-EvidencePath 'dcs_not_owned_by_da.txt') -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersion), $($machine.IPv4Address), owned by $($machine.ntsecuritydescriptor.Owner)"
                 $count++
@@ -4967,12 +5140,15 @@ Function Get-GPOEnum {
             $EncryptionTypesNotConfigured = $false
             $xmlreport = [xml]$GPOreport
             $EncryptionTypes = $xmlreport.GPO.Computer.ExtensionData.Extension.SecurityOptions.Display.DisplayFields.Field
-            if (($EncryptionTypes     | Where-Object { $_.Name -eq 'DES_CBC_CRC' }             | select -ExpandProperty value) -eq 'true') { Write-Both "    [!] GPO [$($GPO.DisplayName)] enabled DES_CBC_CRC for Kerberos!" }
-            elseif (($EncryptionTypes | Where-Object { $_.Name -eq 'DES_CBC_MD5' }             | select -ExpandProperty value) -eq 'true') { Write-Both "    [!] GPO [$($GPO.DisplayName)] enabled DES_CBC_MD5 for Kerberos!" }
-            elseif (($EncryptionTypes | Where-Object { $_.Name -eq 'RC4_HMAC_MD5' }            | select -ExpandProperty value) -eq 'true') { Write-Both "    [!] GPO [$($GPO.DisplayName)] enabled RC4_HMAC_MD5 for Kerberos!" }
-            elseif (($EncryptionTypes | Where-Object { $_.Name -eq 'AES128_HMAC_SHA1' }        | select -ExpandProperty value) -eq 'false') { Write-Both "    [!] AES128_HMAC_SHA1 not enabled for Kerberos!" }
-            elseif (($EncryptionTypes | Where-Object { $_.Name -eq 'AES256_HMAC_SHA1' }        | select -ExpandProperty value) -eq 'false') { Write-Both "    [!] AES256_HMAC_SHA1 not enabled for Kerberos!" }
-            elseif (($EncryptionTypes | Where-Object { $_.Name -eq 'Future encryption types' } | select -ExpandProperty value) -eq 'false') { Write-Both "    [!] Future encryption types not enabled for Kerberos!" }
+            # Independent checks (not elseif): a single GPO can enable several weak ciphers
+            # and/or leave several AES types off; the previous elseif chain reported only the
+            # first match and hid the rest.
+            if (($EncryptionTypes | Where-Object { $_.Name -eq 'DES_CBC_CRC' }             | select -ExpandProperty value) -eq 'true') { Write-Both "    [!] GPO [$($GPO.DisplayName)] enabled DES_CBC_CRC for Kerberos!" }
+            if (($EncryptionTypes | Where-Object { $_.Name -eq 'DES_CBC_MD5' }             | select -ExpandProperty value) -eq 'true') { Write-Both "    [!] GPO [$($GPO.DisplayName)] enabled DES_CBC_MD5 for Kerberos!" }
+            if (($EncryptionTypes | Where-Object { $_.Name -eq 'RC4_HMAC_MD5' }            | select -ExpandProperty value) -eq 'true') { Write-Both "    [!] GPO [$($GPO.DisplayName)] enabled RC4_HMAC_MD5 for Kerberos!" }
+            if (($EncryptionTypes | Where-Object { $_.Name -eq 'AES128_HMAC_SHA1' }        | select -ExpandProperty value) -eq 'false') { Write-Both "    [!] GPO [$($GPO.DisplayName)] does not enable AES128_HMAC_SHA1 for Kerberos!" }
+            if (($EncryptionTypes | Where-Object { $_.Name -eq 'AES256_HMAC_SHA1' }        | select -ExpandProperty value) -eq 'false') { Write-Both "    [!] GPO [$($GPO.DisplayName)] does not enable AES256_HMAC_SHA1 for Kerberos!" }
+            if (($EncryptionTypes | Where-Object { $_.Name -eq 'Future encryption types' } | select -ExpandProperty value) -eq 'false') { Write-Both "    [!] GPO [$($GPO.DisplayName)] does not enable future encryption types for Kerberos!" }
         }
         #Validates Admins local logon restrictions
         $permissionindex = $GPOreport.IndexOf('SeDenyInteractiveLogonRight')
@@ -5029,25 +5205,32 @@ Function Get-GPOEnum {
     }
     #Output for Validate Kerberos Encryption algorithm
     if ($EncryptionTypesNotConfigured) {
-        Write-Both "    [!] RC4_HMAC_MD5 enabled for Kerberos across domain!!!"
+        Write-Both "    [!] No GPO configures Kerberos SupportedEncryptionTypes, so the OS default applies and weak ciphers (RC4, and on some systems DES) may still be permitted. Explicitly configure AES-only where application compatibility allows."
     }
     #Output for deny NTLM
-    if ($DenyNTLM.count -eq 0) {
-        if ($HardenNTLM.count -eq 0) {
-            Write-Both "    [!] No GPO denies NTLM authentication!"
-            Write-Both "    [!] No GPO explicitely restricts LM or NTLMv1!"
-        }
-        else {
+    # Always record an explicit status line so the risk report can tell "NTLM is not
+    # restricted" (a finding) apart from "NTLM is restricted" (evidence, not a finding)
+    # and apart from "the GPO check never ran" (no file at all). Previously the file was
+    # only written when restrictions EXISTED, so the risk report flagged hardened domains.
+    $ntlmEvidence = Get-EvidencePath 'ntlm_restrictions.txt'
+    if ($DenyNTLM.count -eq 0 -and $HardenNTLM.count -eq 0) {
+        Write-Both "    [!] No GPO denies NTLM authentication!"
+        Write-Both "    [!] No GPO explicitely restricts LM or NTLMv1!"
+        Add-Content -Path $ntlmEvidence -Value "Status: NotRestricted - no GPO denies NTLM and no GPO restricts LM/NTLMv1 across the domain."
+    }
+    else {
+        Add-Content -Path $ntlmEvidence -Value "Status: Restricted - one or more GPOs deny or harden NTLM (details below)."
+        if ($DenyNTLM.count -eq 0) {
             Write-Both "    [+] NTLM authentication hardening implemented, but NTLM not denied"
             foreach ($record in $HardenNTLM) {
                 Write-Both "        [-] $($record.value)"
-                Add-Content -Path (Get-EvidencePath 'ntlm_restrictions.txt') -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]"
+                Add-Content -Path $ntlmEvidence -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]"
             }
         }
-    }
-    else {
-        foreach ($record in $DenyNTLM) {
-            Add-Content -Path (Get-EvidencePath 'ntlm_restrictions.txt') -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]"
+        else {
+            foreach ($record in $DenyNTLM) {
+                Add-Content -Path $ntlmEvidence -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]"
+            }
         }
     }
     #Output for NTLM exceptions
@@ -5344,11 +5527,12 @@ Function Get-RecentChanges() {
     $totalcountGroups = ($newGroups | Measure-Object | Select-Object Count).count
     if ($totalcountUsers -gt 0) {
         # Add header line (overwrite any existing file)
-"@User Created within the last 30 days" | Set-Content -Path (Get-EvidencePath 'new_users.txt')
+"# Users created within the last 30 days" | Set-Content -Path (Get-EvidencePath 'new_users.txt')
         foreach ($newUser in $newUsers ) { Add-Content -Path (Get-EvidencePath 'new_users.txt') -Value "Account $($newUser.SamAccountName) was created $($newUser.whenCreated)" }
         Write-Both "    [!] $totalcountUsers new users were created last 30 days, see $outputdir\new_users.txt"
     }
     if ($totalcountGroups -gt 0) {
+        "# Groups created within the last 30 days" | Set-Content -Path (Get-EvidencePath 'new_groups.txt')
         foreach ($newGroup in $newGroups ) { Add-Content -Path (Get-EvidencePath 'new_groups.txt') -Value "Group $($newGroup.SamAccountName) was created $($newGroup.whenCreated)" }
         Write-Both "    [!] $totalcountGroups new groups were created last 30 days, see $outputdir\new_groups.txt"
     }
@@ -5688,11 +5872,7 @@ Function Get-PasswordQuality {
             $domain = Get-ADDomain
             $domainDN = $domain.DistinguishedName
 
-            $accounts = Get-ADReplAccount `
-                -All `
-                -Server $dc `
-                -NamingContext $domainDN `
-                -ErrorAction Stop
+            $accounts = Get-ADAuditReplAccountsCached -Server $dc -NamingContext $domainDN
 
             if ($accounts) {
                 # Run DSInternals password quality test and capture the full report
@@ -5705,7 +5885,20 @@ Function Get-PasswordQuality {
                 if (Test-Path $passwordQualityPath) {
                     Write-Both "    [!] Password quality test done, see password_quality.txt"
 
-                    # Post-process the DSInternals report to clarify why accounts are marked as Kerberoastable
+                    # Split the combined report into category files FIRST, on the raw
+                    # DSInternals output. Doing this before the Kerberoast annotation below
+                    # keeps the explanatory prose out of pq_kerberoastable.txt (otherwise
+                    # each sentence is mis-counted as a Kerberoastable account).
+                    try {
+                        Split-PasswordQualityReport -ReportPath $passwordQualityPath
+                    }
+                    catch {
+                        Write-Both "    [*] Failed to split password quality report into category files: $($_.Exception.Message)"
+                    }
+
+                    # Then annotate the combined human-readable report to clarify why accounts
+                    # are marked Kerberoastable. This runs after the split so it does not affect
+                    # the category evidence files.
                     try {
                         Add-KerberoastExplanationToPasswordQualityReport `
                             -ReportPath $passwordQualityPath `
@@ -5713,14 +5906,6 @@ Function Get-PasswordQuality {
                     }
                     catch {
                         Write-Both "    [*] Failed to append Kerberoast clarification to password quality report: $($_.Exception.Message)"
-                    }
-
-                    # Split the combined report into category-specific files
-                    try {
-                        Split-PasswordQualityReport -ReportPath $passwordQualityPath
-                    }
-                    catch {
-                        Write-Both "    [*] Failed to split password quality report into category files: $($_.Exception.Message)"
                     }
                 }
                 else {
@@ -6652,12 +6837,20 @@ function ConvertFrom-UAC {
 
 function ConvertFrom-UACComputed {
     param([Parameter(ValueFromPipeline=$true)]$Value)
+    # Keys MUST be [int64] to match the [int64] lookup below. Hashtable key equality is
+    # type-sensitive, and the literals 0/16/8388608/... parse as Int32 while 2147483648
+    # parses as Int64, so a bare table made every Int32 key un-findable via an Int64 key.
     $uacComputed = @{
-        0='Refer to userAccountControl Field';16='Locked Out';8388608='Password Expired'
-        8388624='Locked Out - Password Expired';67108864='Partial Secrets Account';2147483648='Use AES Keys'
+        ([int64]0)        = 'Refer to userAccountControl Field'
+        ([int64]16)       = 'Locked Out'
+        ([int64]8388608)  = 'Password Expired'
+        ([int64]8388624)  = 'Locked Out - Password Expired'
+        ([int64]67108864) = 'Partial Secrets Account'
+        ([int64]2147483648) = 'Use AES Keys'
     }
     if ($null -eq $Value) { return "Unknown User Account Type - No Value Available" }
-    if ($uacComputed.ContainsKey([int64]$Value)) { return [string]$uacComputed[[int64]$Value] }
+    $key = [int64]$Value
+    if ($uacComputed.ContainsKey($key)) { return [string]$uacComputed[$key] }
     return "Unknown User Account Type - $Value"
 }
 
@@ -8277,7 +8470,16 @@ function Invoke-DelegatedPermissionsReport {
     function Get-PrincipalType {
       param([string]$Identity)
       try {
-        $filter = "(|(sAMAccountName=$Identity)(distinguishedName=$Identity)(objectSid=$Identity))"
+        # Trustees arrive as 'DOMAIN\name', 'BUILTIN\name', a raw SID ('S-1-5-...'), or a
+        # DN. Build the filter from the right component: sAMAccountName is the part after
+        # the last backslash, a SID must match objectSid, and a DN must match
+        # distinguishedName. The previous filter compared the whole 'DOMAIN\name' string
+        # against sAMAccountName/DN/SID and so never matched a domain trustee.
+        $name = ($Identity -split '\\')[-1]
+        $filter =
+          if ($Identity -match '^S-\d-\d+') { "(objectSid=$Identity)" }
+          elseif ($Identity -match '^(CN|OU|DC)=') { "(distinguishedName=$Identity)" }
+          else { "(sAMAccountName=$name)" }
         $obj = if ($Server) {
           Get-ADObject -Server $Server -LDAPFilter $filter -Properties objectClass -ErrorAction Stop
         } else {
@@ -8397,21 +8599,30 @@ function Invoke-DelegatedPermissionsReport {
     }
     $accountOperators = $records | Where-Object { $_.Trustee -eq 'BUILTIN\Account Operators' }
     $printOperators   = $records | Where-Object { $_.Trustee -eq 'BUILTIN\Print Operators' }
+    # Trustee values carry a 'DOMAIN\' or 'BUILTIN\' prefix, so compare the name part
+    # after the last backslash - otherwise these matches never fire (e.g. the real value
+    # is 'CONTOSO\Exchange Trusted Subsystem', not the bare name).
     $exchangePattern  = 'Exchange Trusted Subsystem','Organization Management','Exchange Windows Permissions'
-    $exchangeDelegations = $records | Where-Object { $_.Trustee -in $exchangePattern }
+    $exchangeDelegations = $records | Where-Object { (($_.Trustee -split '\\')[-1]) -in $exchangePattern }
     $serviceAcctDelegations = $records | Where-Object {
-      $_.Trustee -match '^(svc|SVC)[\-_]' -or $_.Trustee -match 'DomainJoin' -or $_.Trustee -match 'DJ\b'
+      $name = ($_.Trustee -split '\\')[-1]
+      ($name -match '^(svc|sa)[\-_]') -or ($_.Trustee -match 'DomainJoin') -or ($name -match '\bDJ\b')
     }
     $unknownSids = @($records | Where-Object { $_.TrusteeType -eq 'SID' } | Select-Object -Expand Trustee | Sort-Object -Unique)
     $membershipControl = $records | Where-Object {
       $_.ActiveDirectoryRights.ToString() -match 'WriteProperty' -and $_.AppliesToProperty -eq 'member'
     }
-    $preWin2k  = $records | Where-Object { $_.Trustee -eq 'Pre-Windows 2000 Compatible Access' }
+    $preWin2k  = $records | Where-Object { (($_.Trustee -split '\\')[-1]) -eq 'Pre-Windows 2000 Compatible Access' }
     $lapsRead  = $records | Where-Object {
       $_.AppliesToProperty -in $lapsAttributes -and $_.ActiveDirectoryRights.ToString() -match 'ReadProperty|ExtendedRight'
     }
+    # The child-object type a CreateChild ACE may create is in ObjectType (AppliesToProperty),
+    # NOT the inheritance-scope class InheritedObjectType (AppliesToClass). A "Create Computer
+    # objects" delegation therefore shows up as AppliesToProperty='computer'; a blanket
+    # CreateChild (empty ObjectType) also permits creating computers.
     $computerCreate = $records | Where-Object {
-      $_.ActiveDirectoryRights.ToString() -match 'CreateChild' -and ($_.AppliesToClass -match 'computer')
+      $_.ActiveDirectoryRights.ToString() -match 'CreateChild' -and
+      (($_.AppliesToProperty -match 'computer') -or (-not $_.ObjectTypeGuid))
     }
 
     # Safe counts under StrictMode
@@ -8815,11 +9026,15 @@ Function Get-HighRiskADBaselineReport {
         param(
             [Parameter(Mandatory=$true)][string]$Identity
         )
+        # Return $null on failure (distinct from an empty array) so the caller can tell
+        # "enumeration failed" apart from "group is genuinely empty". Get-ADGroupMember
+        # -Recursive routinely throws on foreign security principals from trusted domains
+        # or the 5000-member limit; treating that as an empty group is a false all-clear.
         try {
             $g = Get-ADGroup -Identity $Identity -ErrorAction Stop
-            return @(Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop)
+            return ,@(Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop)
         } catch {
-            return @()
+            return $null
         }
     }
 
@@ -8845,9 +9060,15 @@ Function Get-HighRiskADBaselineReport {
     )
 
     $privDetails = @()
+    $privGroupFailed = @{}
     $privSamSet = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($gd in $groupDefs) {
         $members = _Get-GroupMembersBySidOrName -Identity $gd.Identity
+        if ($null -eq $members) {
+            $privGroupFailed[$gd.RiskId] = $true
+            Register-ADAuditNotAssessed -Name 'HighRisk privileged group enumeration' -Target $gd.Name -Reason 'Get-ADGroupMember -Recursive failed (foreign security principals from a trusted domain, the 5000-member limit, or insufficient rights). Membership count is unknown - re-run with adequate permissions.'
+            continue
+        }
         foreach ($m in $members) {
             $sam = $m.SamAccountName
             if ($sam) { [void]$privSamSet.Add([string]$sam) }
@@ -8866,6 +9087,20 @@ Function Get-HighRiskADBaselineReport {
     # Summarize privileged group counts vs baseline thresholds
     $privSummary = @()
     foreach ($gd in $groupDefs) {
+        if ($privGroupFailed[$gd.RiskId]) {
+            # Enumeration failed - record as not assessed rather than a clean pass.
+            $privSummary += [pscustomobject]@{
+                RiskId         = $gd.RiskId
+                Category       = 'Privileged Group Membership'
+                Item           = $gd.Name
+                Severity       = $gd.Severity
+                Baseline       = $gd.Baseline
+                Observed       = 'Unknown (enumeration failed)'
+                IsFinding      = $false
+                Recommendation = 'Re-run with sufficient rights. Get-ADGroupMember -Recursive can fail on foreign security principals or the 5000-member limit; this group was NOT assessed.'
+            }
+            continue
+        }
         $cnt = ($privDetails | Where-Object { $_.RiskId -eq $gd.RiskId } | Measure-Object).Count
 
         $isFinding = $false
@@ -9081,7 +9316,7 @@ $inactiveObj = [pscustomobject]@{
             $domain = Get-ADDomain
             $domainDN = $domain.DistinguishedName
 
-            $replAccounts = Get-ADReplAccount -All -Server $dc -NamingContext $domainDN -ErrorAction Stop
+            $replAccounts = Get-ADAuditReplAccountsCached -Server $dc -NamingContext $domainDN
             $hashGroups = @()
 
             foreach ($ra in $replAccounts) {
@@ -9388,7 +9623,7 @@ Function Get-PrintSpoolerOnDCs {
         Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -RequiresRemotePS -Reason "Print Spooler state could not be queried on ANY domain controller ($($dcList.Count) total). Requires CIM/DCOM or WinRM to the DCs; from a non-DC host with those blocked the spooler posture is unknown, not 'not running'."
     }
     else {
-        Write-Both "    [+] Print Spooler is not running on any of the $assessed of $($dcList.Count) domain controller(s) assessed"
+        Write-Both "    [+] Print Spooler is not running on any of the $assessed assessed domain controller(s) (of $($dcList.Count) total)"
     }
 }
 
@@ -10083,6 +10318,16 @@ $script:ReportDownloadsDir = $script:LegacyArtifactsDir  # Merged: Prepared now 
 if (!(Test-Path $script:HtmlReportsDir)) { New-Item -ItemType Directory -Path $script:HtmlReportsDir -Force | Out-Null }
 if (!(Test-Path $script:EvidenceFilesDir)) { New-Item -ItemType Directory -Path $script:EvidenceFilesDir -Force | Out-Null }
 if (!(Test-Path $script:LegacyArtifactsDir)) { New-Item -ItemType Directory -Path $script:LegacyArtifactsDir -Force | Out-Null }
+
+# Clear the prior run's per-check evidence files so this run starts clean.
+# Many checks append (Add-Content) rather than overwrite their evidence file;
+# because the output folder is reused, without this the files accumulate stale
+# lines across runs - duplicating Nessus findings and inflating the risk-report
+# scores that are computed from line counts. -KeepLegacyArtifacts preserves them.
+if (-not $KeepLegacyArtifacts) {
+    Get-ChildItem -LiteralPath $script:LegacyArtifactsDir -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
 Write-Both " _____ ____     _____       _ _ _
 |  _  |    \   |  _  |_ _ _| |_| |_
 |     |  |  |  |     | | | . | |  _|
@@ -10220,7 +10465,7 @@ if ($needsActiveDirectory) {
 }
 if ($installdeps) {
     $running = $true
-    Invoke-AuditCheck -Name 'InstallDependencies' -Switch 'installdeps' -Description 'Installing optionnal features' -Body { Install-Dependencies }
+    Invoke-AuditCheck -Name 'InstallDependencies' -Switch 'installdeps' -Description 'Installing optional features' -Body { Install-Dependencies }
 }
 if ($hostdetails -or ($all -and 'hostdetails' -notin $exclude) -or 'hostdetails' -in $selectedChecks) {
     $running = $true
@@ -10377,7 +10622,7 @@ if ($adhealth -or ($all -and 'adhealth' -notin $exclude) -or 'adhealth' -in $sel
 if (!$running) {
     Write-Both "[!] No arguments selected"
     Write-Both "[!] Other options are as follows, they can be used in combination"
-    Write-Both "    -installdeps installs optionnal features (DSInternals)"
+    Write-Both "    -installdeps installs optional features (DSInternals)"
     Write-Both "    -hostdetails retrieves hostname and other useful audit info"
     Write-Both "    -domainaudit retrieves information about the AD such as functional level, delegation, spooler, SMB signing, tombstone"
     Write-Both "    -trusts retrieves information about any doman trusts"
@@ -10403,23 +10648,17 @@ if (!$running) {
     Write-Both "    -portconnectivity tests TCP ports DCs need (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC) from this host and (via WinRM) cross-DC. Aliases: -dcports, -dc-ports, -portcheck"
     Write-Both "    -adhealth runs AD platform health checks (replication, dcdiag, SYSVOL/DFSR, NTDS, time, services, events, sites, recycle bin, group hygiene) and writes AD_Health.html. Aliases: -ad-health, -health"
     Write-Both "    -all runs all checks, e.g. $scriptname -all"
-    Write-Both "    -KeepLegacyArtifacts is retained for backward compatibility; raw data and evidence files are preserved in .\\<COMPUTERNAME>\\Raw Data by default"
+    Write-Both "    -exclude <check[,check...]> skips the named checks when running -all, e.g. $scriptname -all -exclude gpo,dnszone"
+    Write-Both "    -select <check[,check...]> runs only the named checks (comma-separated), e.g. $scriptname -select accounts,spn"
+    Write-Both "    -KeepLegacyArtifacts keeps the previous run's per-check evidence files instead of clearing them at startup (by default each run starts with a clean .\\<COMPUTERNAME>\\Raw Data\\Source folder)"
 }
 Write-CheckFailuresReport -BaseRoot $outputdir
 Write-NotAssessedReport -BaseRoot $outputdir
 Write-Nessus-Footer
-
-# Sanitize .nessus XML characters in-place (no duplicate file)
-$nessusPath = "$outputdir\adaudit.nessus"
-if (Test-Path $nessusPath) {
-    $nessusContent = Get-Content $nessusPath
-    $nessusContent = $nessusContent -Replace "&", "&amp;"
-    $nessusContent = $nessusContent -Replace ([char]8220), "&quot;"
-    $nessusContent = $nessusContent -Replace ([char]8221), "&quot;"
-    $nessusContent = $nessusContent -Replace "`'", "&apos;"
-    $nessusContent = $nessusContent -Replace ([char]252), "u"
-    $nessusContent | Out-File $nessusPath -Force
-}
+# Note: .nessus content is XML-escaped at write time inside Write-Nessus-Finding
+# (and the header/footer are static), so no post-hoc character sanitisation is
+# needed. The previous whole-file pass could not escape < and > without
+# corrupting the markup and has been removed.
 
 $endtime = Get-Date
 Write-Both "[*] Script end time $endtime"
@@ -10899,7 +11138,7 @@ function Invoke-ManagementReport {
             'Built-in domain Administrator \(RID-500\) hygiene' {
                 return 'The built-in domain Administrator account (SID ending in -500) cannot be deleted, has unrestricted access in the domain (and across the forest in the root domain), and is the prime target if its credential is compromised. Microsoft Defender for Identity explicitly flags this account when its password is older than 180 days. It must be reserved for build / break-glass / disaster recovery, not used for daily work, and never used as a service account or scheduled task account.'
             }
-            'Duplicate passwords' {
+            'Duplicate passwords|sharing the same password|identical NTLM hash' {
                 return 'Password reuse across privileged or service accounts can materially reduce the effort required to expand access after a single compromise.'
             }
             'KRBTGT password age' {
@@ -10917,8 +11156,8 @@ function Invoke-ManagementReport {
             'privileged group|Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|overlap' {
                 return 'Excessive or overlapping privilege expands blast radius and increases the probability of privileged misuse or lateral movement.'
             }
-            'inactive|disabled stale|Inactive computer' {
-                return 'Inactive objects increase attack surface, complicate review, and often indicate weak lifecycle controls.'
+            'inactive|disabled|Inactive computer' {
+                return 'Inactive or disabled objects increase attack surface, complicate review, and often indicate weak lifecycle controls. Disabled accounts left in place can be re-enabled by an attacker who gains sufficient rights.'
             }
             'PasswordNeverExpires|never expire' {
                 return 'Passwords that never expire are frequently associated with unmanaged service accounts and create long-lived credential exposure.'
@@ -10932,7 +11171,7 @@ function Invoke-ManagementReport {
             'LAPS' {
                 return 'Overly broad local administrator password access or expired LAPS passwords weakens workstation and server credential hygiene.'
             }
-            'LDAP security|NTLM' {
+            'LDAP security|NTLM authentication|NTLM restrictions|NTLM is not restricted' {
                 return 'Weak LDAP or NTLM settings enable downgrade and relay scenarios and indicate incomplete hardening of identity protocols.'
             }
             'DNS zones allowing insecure updates' {
@@ -10958,6 +11197,9 @@ function Invoke-ManagementReport {
             }
             'LM hashes' {
                 return 'LM hashes use weak DES-based encryption and can be cracked in seconds. Their presence indicates legacy password storage that should have been eliminated.'
+            }
+            'no password set \((all )?disabled\)' {
+                return 'These accounts have PASSWD_NOTREQD set but are currently disabled, so they cannot be used as-is. The risk is latent: if re-enabled they could be used with no password. Their presence also indicates weak account-creation hygiene.'
             }
             'no password set' {
                 return 'Accounts without passwords can be accessed without any authentication, providing trivial entry points for attackers.'
@@ -11003,7 +11245,7 @@ function Invoke-ManagementReport {
             'Built-in domain Administrator \(RID-500\) hygiene' {
                 return 'Reserve the built-in RID-500 account for initial build and break-glass / disaster recovery only - do not use it for daily admin work. Rotate its password on a defined schedule (180 days max recommended) and store the password in a sealed/escrowed location. Set "Account is sensitive and cannot be delegated". Remove any SPNs - this account must not be used as a service account or scheduled task account. Restrict interactive logon (deny logon from workstations / member servers via GPO). Consider adding to Protected Users once break-glass procedures account for the Kerberos restrictions. Monitor for any logon and group-membership change.'
             }
-            'Duplicate passwords' {
+            'Duplicate passwords|sharing the same password|identical NTLM hash' {
                 return 'Reset affected passwords, eliminate password reuse, prefer gMSA where applicable, and verify privileged accounts follow a separate credential standard.'
             }
             'KRBTGT password age' {
@@ -11021,8 +11263,8 @@ function Invoke-ManagementReport {
             'privileged group|Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|overlap' {
                 return 'Reduce standing privilege, separate admin tiers, remove stale memberships, and require approval and periodic recertification for privileged access.'
             }
-            'inactive|disabled stale|Inactive computer' {
-                return 'Review ownership, disable or remove stale accounts and computer objects, and enforce a documented lifecycle and exception process.'
+            'inactive|disabled|Inactive computer' {
+                return 'Review ownership, remove genuinely unused accounts and computer objects, and enforce a documented lifecycle and exception process. Leave accounts disabled (not re-enabled with a fresh password) until they are confirmed unused, then delete them.'
             }
             'PasswordNeverExpires|never expire' {
                 return 'Minimize PasswordNeverExpires usage, migrate eligible services to gMSA, and maintain approved exceptions with regular review.'
@@ -11036,7 +11278,7 @@ function Invoke-ManagementReport {
             'LAPS' {
                 return 'Restrict password readers to the minimum required set, rotate expired passwords, and validate LAPS policy application across managed systems.'
             }
-            'LDAP security|NTLM' {
+            'LDAP security|NTLM authentication|NTLM restrictions|NTLM is not restricted' {
                 return 'Harden LDAP signing and channel binding, reduce NTLM usage, and validate compatibility before enforcing stricter settings.'
             }
             'DNS zones allowing insecure updates' {
@@ -11063,8 +11305,11 @@ function Invoke-ManagementReport {
             'LM hashes' {
                 return 'Disable LM hash storage via Group Policy (Network security: Do not store LAN Manager hash value on next password change = Enabled). Force password changes for all affected accounts to eliminate stored LM hashes.'
             }
+            'no password set \((all )?disabled\)' {
+                return 'These accounts are disabled - do NOT set a password and re-enable them. Confirm each is genuinely unused, then delete it, or keep it disabled and clear the PASSWD_NOTREQD flag (Set-ADUser <account> -PasswordNotRequired $false) so it cannot later be re-enabled without a policy-compliant password. Investigate why the flag was set.'
+            }
             'no password set' {
-                return 'Set passwords on all affected accounts immediately. Review why these accounts were created without passwords and enforce the domain password policy.'
+                return 'Set passwords on all affected (enabled) accounts immediately and clear the PASSWD_NOTREQD flag (Set-ADUser <account> -PasswordNotRequired $false). Review why these accounts were created without passwords and enforce the domain password policy.'
             }
             'dictionary|breach' {
                 return 'Force immediate password changes for all affected accounts. Implement Azure AD Password Protection or a third-party banned-password filter to prevent dictionary passwords from being set.'
@@ -11792,7 +12037,7 @@ function Invoke-ManagementReport {
                 $definition.DownloadName = 'LDAPSecurity.txt'
                 break
             }
-            '^NTLM restrictions require hardening$' {
+            '^NTLM authentication is not restricted or hardened by GPO$|^NTLM restrictions require hardening$' {
                 $definition.Type = 'text'
                 $definition.SourcePath = Join-Path $InputRoot 'ntlm_restrictions.txt'
                 $definition.DownloadName = 'ntlm_restrictions.txt'
@@ -12554,6 +12799,12 @@ body[data-theme="dark"] .result-table th{background:#0b1220}
       btn.innerText = theme === 'dark' ? 'Light mode' : 'Dark mode';
       btn.setAttribute('aria-pressed', theme === 'dark' ? 'true' : 'false');
     }
+  }
+  // Persist ONLY on an explicit user choice. applyTheme() must not write to
+  // localStorage, or the first auto-detect call would pin the theme and the
+  // "follow OS live" handler below would never fire again.
+  function setTheme(theme){
+    applyTheme(theme);
     try { localStorage.setItem('adaudit-theme', theme); } catch (e) {}
   }
 
@@ -12578,7 +12829,7 @@ body[data-theme="dark"] .result-table th{background:#0b1220}
   if (btn) {
     btn.addEventListener('click', function(){
       var next = document.body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-      applyTheme(next);
+      setTheme(next);
     });
   }
 
@@ -12735,6 +12986,8 @@ $js
 
     $baselineHasInactive180 = $false
     $baselineHasPNE         = $false
+    $baselineHasKrbtgt      = $false
+    $baselineHasMAQ         = $false
 
     if ($baselinePath -and (Test-Path -LiteralPath $baselinePath)) {
         $lines = Get-Content -LiteralPath $baselinePath -ErrorAction SilentlyContinue
@@ -12764,6 +13017,7 @@ $js
                 switch -Regex ($title) {
 
                     '^krbtgt password age$' {
+                        $baselineHasKrbtgt = $true
                         $obsDays = 0
                         if ($obs -match '\(([0-9]+)\s*days\)') { $obsDays = [int]$matches[1] }
                         elseif ($obs -match '([0-9]+)') { $obsDays = [int]$matches[1] }
@@ -12835,6 +13089,7 @@ $js
                     }
 
                     '^ms-DS-MachineAccountQuota$' {
+                        $baselineHasMAQ = $true
                         $obsVal = 0
                         if ($obs -match '([0-9]+)') { $obsVal = [int]$matches[1] }
                         if ($obsVal -gt 0) {
@@ -12849,6 +13104,11 @@ $js
             }
         }
     }
+
+    # PasswordNeverExpires is reported by up to three sources (baseline text,
+    # HighRisk CSV, DSInternals pq file, and accounts_passdontexpire.txt). Track a
+    # single "already reported" flag so the finding appears exactly once.
+    $pneReported = $baselineHasPNE
 
     # ---------------------------
     # Domain stats from ADExtract (optional)
@@ -12884,13 +13144,19 @@ $js
             Summary                 = Join-Path $highRiskDir 'Summary.csv'
         }
 
+        # The DSInternals password-quality file (pq_duplicate_passwords.txt) reports the
+        # same shared-password accounts below with richer per-group detail, so only emit
+        # this HighRisk-CSV finding when that richer source is not present.
+        $pqDupEarlyPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_duplicate_passwords.txt')
+        $pqDupEarlyPresent = ($pqDupEarlyPath -and (Test-Path -LiteralPath $pqDupEarlyPath) -and ((Get-PqAccountLines $pqDupEarlyPath).Count -gt 0))
         $dupRows = Get-CsvSafe $hrFiles.DUPLICATE_PASSWORDS
-        if ($dupRows.Count -gt 0) {
+        if ($dupRows.Count -gt 0 -and -not $pqDupEarlyPresent) {
             Add-FindingOnce 'Critical' 'Duplicate passwords detected' "Affected accounts in shared-password groups: $($dupRows.Count)" $hrFiles.DUPLICATE_PASSWORDS (Score-Scaled 'Critical' $dupRows.Count 100)
         }
 
+        # Suppress when the baseline text already reported krbtgt password age.
         $krbtgt = Get-CsvSafe $hrFiles.KRBTGT
-        if ($krbtgt.Count -gt 0) {
+        if ($krbtgt.Count -gt 0 -and -not $baselineHasKrbtgt) {
             $ageVal = 0
             try {
                 $first = $krbtgt | Select-Object -First 1
@@ -12927,12 +13193,13 @@ $js
             }
         }
 
-        # Keep ONLY baseline PasswordNeverExpires, suppress HighRisk\PASSWORD_NEVER_EXPIRES.csv
-        if (-not $baselineHasPNE) {
+        # Report PasswordNeverExpires from a single source only (see $pneReported).
+        if (-not $pneReported) {
             $pneRows = Get-CsvSafe $hrFiles.PASSWORD_NEVER_EXPIRES
             if ($pneRows.Count -gt 0) {
                 $sev = if ($pneRows.Count -ge 50) { 'High' } elseif ($pneRows.Count -ge 10) { 'Medium' } else { 'Low' }
                 Add-FindingOnce $sev 'Passwords set to never expire' "Accounts: $($pneRows.Count)" $hrFiles.PASSWORD_NEVER_EXPIRES (Score-Scaled $sev $pneRows.Count)
+                $pneReported = $true
             }
         }
 
@@ -12942,17 +13209,22 @@ $js
             Add-FindingOnce $sev 'Disabled stale accounts' "Accounts: $($dsRows.Count)" $hrFiles.DISABLED_STALE (Score-Scaled $sev $dsRows.Count)
         }
 
+        # Suppress when the baseline text already reported ms-DS-MachineAccountQuota.
         $maqRows = Get-CsvSafe $hrFiles.MACHINE_ACCOUNT_QUOTA
-        if ($maqRows.Count -gt 0) {
-            $quota = 10
-            try {
-                $firstRow = $maqRows | Select-Object -First 1
-                $quotaCol = ($firstRow | Get-Member -MemberType NoteProperty | Where-Object { $_.Name -match 'quota|Machine|Account' } | Select-Object -ExpandProperty Name -First 1)
-                if ($quotaCol) { $quota = [int]$firstRow.$quotaCol }
-            } catch { $quota = 10 }
-
-            $sev = if ($quota -gt 10) { 'High' } elseif ($quota -gt 0) { 'Medium' } else { 'Low' }
-            Add-FindingOnce $sev 'MachineAccountQuota permits user-created computers' "Quota: $quota" $hrFiles.MACHINE_ACCOUNT_QUOTA (Score-Scaled $sev $quota)
+        if ($maqRows.Count -gt 0 -and -not $baselineHasMAQ) {
+            $firstRow = $maqRows | Select-Object -First 1
+            # The real quota is in the Observed column ('Unknown' when it could not be
+            # read); IsFinding is the collector's verdict. Read the actual value and only
+            # flag when the quota is really > 0 (a correctly hardened MAQ=0 is not a finding).
+            $quota = 0
+            if ($firstRow.Observed -and "$($firstRow.Observed)" -ne 'Unknown') {
+                $quota = [int]("$($firstRow.Observed)" -replace '[^0-9]', '')
+            }
+            $maqIsFinding = ("$($firstRow.IsFinding)" -match '^(true|1)$')
+            if ($maqIsFinding -and $quota -gt 0) {
+                $sev = if ($quota -gt 10) { 'High' } else { 'Medium' }
+                Add-FindingOnce $sev 'MachineAccountQuota permits user-created computers' "ms-DS-MachineAccountQuota is $quota (baseline: 0)" $hrFiles.MACHINE_ACCOUNT_QUOTA (Score-Scaled $sev $quota)
+            }
         }
     }
 
@@ -13163,10 +13435,14 @@ $js
         Add-FindingOnce 'Medium' 'Historical (previous) passwords found in dictionary/breach list' "Accounts: $($pqHistDictLines.Count)" $pqHistDictPath (Score-Scaled 'Medium' $pqHistDictLines.Count)
     }
 
-    # Kerberos pre-auth not required (DSInternals view, complements ASREP.txt)
+    # Kerberos pre-auth not required. ASREP.txt (native -asrep check, below) reports the
+    # same accounts as Critical with a user list, so only emit this DSInternals view when
+    # ASREP.txt is not present - otherwise the same issue appears twice with two severities.
+    $asrepEarlyPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ASREP.txt')
+    $asrepEarlyPresent = ($asrepEarlyPath -and (Test-Path -LiteralPath $asrepEarlyPath) -and (@(Get-AsrepAccounts -path $asrepEarlyPath).Count -gt 0))
     $pqNoPreauthPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_no_preauth.txt')
     $pqNoPreauthLines = Get-PqAccountLines $pqNoPreauthPath
-    if ($pqNoPreauthLines.Count -gt 0) {
+    if ($pqNoPreauthLines.Count -gt 0 -and -not $asrepEarlyPresent) {
         $score = Score-BaselineZeroLog -Severity 'High' -Observed $pqNoPreauthLines.Count -MaxAdd 20 -K 8
         Add-FindingOnce 'High' 'Accounts with Kerberos pre-authentication disabled (AS-REP roastable)' "Accounts: $($pqNoPreauthLines.Count)" $pqNoPreauthPath $score
     }
@@ -13174,15 +13450,18 @@ $js
     # Password never expires (DSInternals view, complements accounts_passdontexpire.txt)
     $pqPwdNeverExpPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_password_never_expires.txt')
     $pqPwdNeverExpLines = Get-PqAccountLines $pqPwdNeverExpPath
-    if ($pqPwdNeverExpLines.Count -gt 0) {
+    if ($pqPwdNeverExpLines.Count -gt 0 -and -not $pneReported) {
         $sev = if ($pqPwdNeverExpLines.Count -ge 50) { 'High' } elseif ($pqPwdNeverExpLines.Count -ge 10) { 'Medium' } else { 'Low' }
         Add-FindingOnce $sev 'Accounts with PasswordNeverExpires set' "Accounts: $($pqPwdNeverExpLines.Count)" $pqPwdNeverExpPath (Score-Scaled $sev $pqPwdNeverExpLines.Count)
+        $pneReported = $true
     }
 
-    # Kerberoastable (DSInternals view, complements SPNs.txt)
+    # Kerberoastable (DSInternals view, complements SPNs.txt). This is the richer of the
+    # two kerberoast sources; when present it suppresses the SPNs.txt finding below.
     $pqKerbPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_kerberoastable.txt')
     $pqKerbLines = Get-PqAccountLines $pqKerbPath
-    if ($pqKerbLines.Count -gt 0) {
+    $pqKerbPresent = ($pqKerbLines.Count -gt 0)
+    if ($pqKerbPresent) {
         $score = Score-BaselineZeroLog -Severity 'High' -Observed $pqKerbLines.Count -MaxAdd 20 -K 8
         Add-FindingOnce 'High' 'Kerberoastable accounts (SPN set on user account, weak password risk)' "Accounts: $($pqKerbLines.Count)" $pqKerbPath $score
     }
@@ -13205,9 +13484,12 @@ $js
         Add-FindingOnce $sev 'Accounts without Kerberos pre-auth (AS-REP roastable)' "Accounts: $asrepCount | Users: $samPreview" $asrepPath $score
     }
 
+    # Exclude the "no findings" sentinel line so a clean domain does not produce a
+    # false "Kerberoastable SPNs present" finding, and defer to the richer DSInternals
+    # kerberoastable finding above when it is present.
     $spnPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'SPNs.txt')
-    $spnLines = Get-NonHeaderLines $spnPath
-    if ($spnLines.Count -gt 0) {
+    $spnLines = @(Get-NonHeaderLines $spnPath | Where-Object { $_ -notmatch '^\s*No high value kerberoastable user accounts identified\.?\s*$' })
+    if ($spnLines.Count -gt 0 -and -not $pqKerbPresent) {
         Add-FindingOnce 'Medium' 'Kerberoastable SPNs present (review high-value service accounts)' "Lines: $($spnLines.Count)" $spnPath (Score-Scaled 'Medium' $spnLines.Count)
     }
 
@@ -13222,9 +13504,9 @@ $js
         Add-FindingOnce $sev 'Inactive computer accounts (>90 days)' "Computers inactive: $obs (Baseline: <= $base)" $inactiveCompsPath $score
     }
 
-    # Suppress accounts_passdontexpire.txt when baseline already provides PasswordNeverExpires
+    # Suppress accounts_passdontexpire.txt when PasswordNeverExpires was already reported.
     $pndePath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'accounts_passdontexpire.txt')
-    if (-not $baselineHasPNE) {
+    if (-not $pneReported) {
         $pndeLines = Get-NonHeaderLines $pndePath
         if ($pndeLines.Count -gt 0) {
             $sev = if ($pndeLines.Count -ge 50) { 'High' } elseif ($pndeLines.Count -ge 10) { 'Medium' } else { 'Low' }
@@ -13246,9 +13528,15 @@ $js
         Add-FindingOnce 'High' 'LDAP security misconfiguration detected' 'See LDAPSecurity.txt for details' $ldapSecPath $SeverityScore.High
     }
 
+    # Flag only when the collector recorded that NTLM is NOT restricted. A file that
+    # merely lists existing restrictions is evidence of hardening, not a finding; a
+    # missing file means the GPO check did not run.
     $ntlmRestrictPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ntlm_restrictions.txt')
-    if ((Get-NonHeaderLines $ntlmRestrictPath).Count -gt 0) {
-        Add-FindingOnce 'Medium' 'NTLM restrictions require hardening' 'Review NTLM configuration and restrictions' $ntlmRestrictPath $SeverityScore.Medium
+    if ($ntlmRestrictPath -and (Test-Path -LiteralPath $ntlmRestrictPath)) {
+        $ntlmContent = Get-Content -LiteralPath $ntlmRestrictPath -ErrorAction SilentlyContinue
+        if ($ntlmContent -match '^Status:\s*NotRestricted') {
+            Add-FindingOnce 'Medium' 'NTLM authentication is not restricted or hardened by GPO' 'No GPO denies NTLM or restricts LM/NTLMv1 across the domain. Audit first (Network security: Restrict NTLM: Audit ...), then restrict, to cut NTLM relay and pass-the-hash exposure.' $ntlmRestrictPath $SeverityScore.Medium
+        }
     }
 
     $dnsInsecureZonesPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'insecure_dns_zones.txt')
@@ -13834,6 +14122,11 @@ table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-l
       btn.innerText = (t === 'dark') ? 'Light mode' : 'Dark mode';
       btn.setAttribute('aria-pressed', (t === 'dark') ? 'true' : 'false');
     }
+  }
+  // Persist ONLY on explicit user choice, so the initial auto-detect does not
+  // pin the theme and disable the follow-OS handler below.
+  function setTheme(t){
+    applyTheme(t);
     try { localStorage.setItem('adaudit-theme', t); } catch(e){}
   }
   applyTheme(currentTheme());
@@ -13841,7 +14134,7 @@ table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-l
   if (tBtn){
     tBtn.addEventListener('click', function(){
       var next = (document.documentElement.getAttribute('data-theme') === 'dark') ? 'light' : 'dark';
-      applyTheme(next);
+      setTheme(next);
     });
   }
   // React to OS theme changes only when the user has not picked a theme.
@@ -14378,15 +14671,15 @@ a:hover{text-decoration:underline}
       btn.innerText = (t==='dark') ? 'Light mode' : 'Dark mode';
       btn.setAttribute('aria-pressed', (t==='dark') ? 'true' : 'false');
     }
-    try { localStorage.setItem('adaudit-theme', t); } catch(_){}
   }
+  function setTheme(t){ applyTheme(t); try { localStorage.setItem('adaudit-theme', t); } catch(_){} }
   document.addEventListener('DOMContentLoaded', function(){
     applyTheme(currentTheme());
     var btn=document.getElementById('wrapperThemeToggle');
     if (btn){
       btn.addEventListener('click', function(){
         var next = (document.documentElement.getAttribute('data-theme')==='dark') ? 'light' : 'dark';
-        applyTheme(next);
+        setTheme(next);
       });
     }
     if (window.matchMedia){
@@ -14583,10 +14876,11 @@ Invoke-ManagementReport -InputRoot $outputdir -OutputHtml (Join-Path (Get-HtmlRe
 Update-CompanionHtmlReports -Root $outputdir
 
 # <<< add cleanup here (absolute last action) >>>
-# Keep only the five primary HTML reports the user wants surfaced. Anything
-# else in HTML Reports (companion wrappers, GPOReport, dangerousACLs, DNS
-# audit/recommendations, baseline index, .source.html files, etc.) is removed
-# at the end of the run so the output folder stays focused.
+# Keep the five primary HTML reports the user wants surfaced, PLUS the companion
+# reports that ADAudit-Results.html links to (its "Open Report" buttons and the
+# companion list) and their wrapped .source.html originals. Deleting those left dead
+# links in the flagship report, so they are now retained. Only genuinely orphaned
+# HTML (nothing links to it) is removed so the folder stays reasonably focused.
 $__htmlReportsDir = Get-HtmlReportsDir -BaseRoot $outputdir
 $__keep = @(
     'overlapping_group_memberships.html'
@@ -14594,12 +14888,20 @@ $__keep = @(
     'multiple_nested_paths.html'
     'ADAudit-Results.html'
     'AD_Health.html'
+    # Companion reports linked from ADAudit-Results.html:
+    'GPOReport.html'
+    'dangerousACLs.html'
+    'ad_high_risk_baseline_index.html'
 )
 if (Test-Path -LiteralPath $__htmlReportsDir) {
     foreach ($f in (Get-ChildItem -LiteralPath $__htmlReportsDir -File -Filter '*.html' -ErrorAction SilentlyContinue)) {
-        if ($__keep -notcontains $f.Name) {
-            try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch { }
-        }
+        # Preserve primary + named companion reports, every companion wrapper's
+        # .source.html original, and any wrapper that has one (its "Open original HTML"
+        # button links straight to that .source.html).
+        $isSource  = $f.Name -like '*.source.html'
+        $hasSource = Test-Path -LiteralPath (Join-Path $f.DirectoryName (([System.IO.Path]::GetFileNameWithoutExtension($f.Name)) + '.source.html'))
+        if (($__keep -contains $f.Name) -or $isSource -or $hasSource) { continue }
+        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch { }
     }
 }
 }
