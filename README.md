@@ -2,6 +2,10 @@
 
 A comprehensive PowerShell 7 script for auditing Active Directory security configurations, policies, and vulnerabilities. Originally created by phillips321, converted to PowerShell 7 and extended by Keberneth.
 
+## Password Audit
+Password Audit is a standalone script that checks accounts with the same NTLM hash (same passwords) and checks Active Directory account NTLM hashes against the
+https://api.pwnedpasswords.com service using a k-anonymity range query.
+
 ## Quick Start
 
 **From the GUI version you can install dependencies and choose what audits to run**
