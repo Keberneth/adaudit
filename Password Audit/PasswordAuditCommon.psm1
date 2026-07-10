@@ -28,7 +28,13 @@ function Resolve-DefaultServer {
     $dcObj = Get-ADDomainController -Discover -ErrorAction Stop
 
     foreach ($propertyName in @('DNSHostName', 'HostName', 'Name')) {
-        $candidate = $dcObj.$propertyName
+        # ADDirectoryServer has no DNSHostName property; probing it directly
+        # would throw under the module's StrictMode.
+        $property = $dcObj.PSObject.Properties[$propertyName]
+        if ($null -eq $property) {
+            continue
+        }
+        $candidate = $property.Value
         if (-not [string]::IsNullOrWhiteSpace($candidate)) {
             return [string]$candidate
         }
@@ -287,7 +293,7 @@ function Invoke-HibpNtlmRangeLookup {
             }
 
             if ($attempt -gt $MaxRetries) {
-                Write-Warning ("Failed pwned lookup for hash prefix {0} after {1} attempt(s): {2}" -f $Prefix, ($attempt - 1), $ex.Message)
+                Write-Warning ("Failed pwned lookup for hash prefix {0} after {1} attempt(s): {2}" -f $Prefix, $attempt, $ex.Message)
                 return [pscustomobject]@{
                     Prefix   = $Prefix
                     Failed   = $true

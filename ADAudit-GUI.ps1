@@ -32,7 +32,7 @@ Write-Host "Opening GUI..."
 $ScriptDir = $PSScriptRoot
 $AuditScriptPath = Join-Path $ScriptDir 'AdAudit-PS7.ps1'
 
-if (-not (Test-Path $AuditScriptPath)) {
+if (-not (Test-Path -LiteralPath $AuditScriptPath)) {
     Write-Error "AdAudit-PS7.ps1 not found in '$ScriptDir'. Place this GUI script in the same folder as AdAudit-PS7.ps1."
     exit 1
 }
@@ -90,10 +90,11 @@ function Get-BestNupkg {
         [Parameter(Mandatory)][string]$Pattern,
         [Parameter(Mandatory)][string]$SearchRoot
     )
-    $candidates = Get-ChildItem -Path $SearchRoot -Filter $Pattern -File -ErrorAction SilentlyContinue
+    $candidates = Get-ChildItem -LiteralPath $SearchRoot -Filter $Pattern -File -ErrorAction SilentlyContinue
     if (-not $candidates) { return $null }
     $best = $null
     $bestVer = $null
+    $lastError = $null
     foreach ($f in $candidates) {
         $tmp = $null
         try {
@@ -103,9 +104,13 @@ function Get-BestNupkg {
                 $bestVer = $v
                 $best = [pscustomobject]@{ File = $f; Version = $v }
             }
-        } catch { } finally {
+        } catch { $lastError = $_ } finally {
             if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
         }
+    }
+    if (-not $best -and $lastError) {
+        # Files were present but unreadable - the caller must not report MISSING_NUPKG
+        throw "Found $(@($candidates).Count) file(s) matching '$Pattern' in '$SearchRoot' but none could be read: $($lastError.Exception.Message)"
     }
     $best
 }
@@ -424,7 +429,7 @@ Add-Separator $y
 $y += 12
 
 # === INDIVIDUAL CHECKS ===
-Add-LabelBold "Individual Audit Checks" $y | Out-Null
+Add-LabelBold "Individual Audit Checks" $y 240 | Out-Null
 $lblIndivHint = Add-Label "(enabled when 'Run All' is unchecked)" ($y + 2) 300 ($leftLabel + 250)
 $lblIndivHint.ForeColor = [System.Drawing.Color]::Gray
 $y += $rowHeight + 2
@@ -463,7 +468,6 @@ $excludeCheckboxes = @{}
 $excludeDescLabels = @()
 # Display exclude checkboxes in a more compact 2-column layout
 $excludeKeys = @($AuditChecks.Keys)
-$excludeStartY = $y
 $col = 0
 foreach ($key in $excludeKeys) {
     $xPos = if ($col -eq 0) { $leftLabel } else { $leftLabel + 470 }
@@ -574,7 +578,10 @@ $panel.AutoScrollMinSize = New-Object System.Drawing.Size(0, ($y + 20))
 # Update command preview
 # -------------------------
 function Update-Preview {
-    $cmd = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "' + $script:AuditScriptPath + '"'
+    # Embed runtime values in SINGLE quotes (with embedded quotes doubled): the
+    # command runs verbatim in a child pwsh, where double quotes would re-expand
+    # $, backticks and embedded quotes inside paths (e.g. 'D:\AD$Reports').
+    $cmd = "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & '" + ($script:AuditScriptPath -replace "'", "''") + "'"
 
     if ($script:chkAll.Checked) {
         $cmd += " -all"
@@ -602,12 +609,12 @@ function Update-Preview {
     if ($script:chkKeepLegacy.Checked)       { $cmd += " -KeepLegacyArtifacts" }
     if ($script:chkDnsRecordCounts.Checked)  { $cmd += " -DnsIncludeRecordCounts" }
     if ($script:chkDnsSystemZones.Checked)   { $cmd += " -DnsIncludeSystemZones" }
-    if ($script:txtDnsOutputRoot.Text.Trim()) { $cmd += ' -DnsZoneOutputRoot "' + $script:txtDnsOutputRoot.Text.Trim() + '"' }
+    if ($script:txtDnsOutputRoot.Text.Trim().Trim('"')) { $cmd += " -DnsZoneOutputRoot '" + ($script:txtDnsOutputRoot.Text.Trim().Trim('"') -replace "'", "''") + "'" }
     if ($script:chkDelegSystem.Checked)      { $cmd += " -DelegIncludeSystemTrustees" }
     if ($script:chkDelegDeny.Checked)        { $cmd += " -DelegIncludeDeny" }
     if ($script:chkDelegInherited.Checked)   { $cmd += " -DelegIncludeInherited" }
-    if ($script:txtDelegServer.Text.Trim())  { $cmd += ' -DelegServer "' + $script:txtDelegServer.Text.Trim() + '"' }
-    if ($script:txtDelegOutputRoot.Text.Trim()) { $cmd += ' -DelegatedOutputRoot "' + $script:txtDelegOutputRoot.Text.Trim() + '"' }
+    if ($script:txtDelegServer.Text.Trim().Trim('"'))  { $cmd += " -DelegServer '" + ($script:txtDelegServer.Text.Trim().Trim('"') -replace "'", "''") + "'" }
+    if ($script:txtDelegOutputRoot.Text.Trim().Trim('"')) { $cmd += " -DelegatedOutputRoot '" + ($script:txtDelegOutputRoot.Text.Trim().Trim('"') -replace "'", "''") + "'" }
 
     $script:txtPreview.Text = $cmd
 }
@@ -665,7 +672,7 @@ $txtDelegOutputRoot.Add_TextChanged({ Update-Preview })
 
 # Install Online button
 $btnOnline.Add_Click({
-    $cmd = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "' + $script:AuditScriptPath + '" -installdeps'
+    $cmd = "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & '" + ($script:AuditScriptPath -replace "'", "''") + "' -installdeps"
     try {
         # Launch via EncodedCommand so paths containing spaces/quotes cannot be
         # corrupted by Start-Process argument joining or child-pwsh quote stripping.

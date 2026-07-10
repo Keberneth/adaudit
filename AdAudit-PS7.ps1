@@ -511,7 +511,10 @@ Param (
 )
 
 $selectedChecks = @()
-if ($select) { $selectedChecks = @($select.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+# Split on commas AND whitespace: unquoted '-select accounts,spn' binds to the
+# [string] parameter as 'accounts spn' (space-joined array), which a plain
+# comma split would turn into one unmatchable token.
+if ($select) { $selectedChecks = @($select -split '[,\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 # Normalise -exclude too: accept "-exclude gpo,dnszone" and "-exclude 'gpo, dnszone'"
 # alike by splitting on commas and trimming, so a stray space never silently
 # defeats the match (e.g. ' dnszone' -notin the check names).
@@ -819,8 +822,16 @@ Function Get-Variables() {
     $script:DomainAdminsSID = $domainSidValue + "-512"
     $script:DomainUsersSID = $domainSidValue + "-513"
     $script:DomainControllersSID = $domainSidValue + "-516"
-    $script:SchemaAdminsSID = $domainSidValue + "-518"
-    $script:EnterpriseAdminsSID = $domainSidValue + "-519"
+    # Schema Admins (518) and Enterprise Admins (519) exist only in the FOREST
+    # ROOT domain; in a child domain the current domain's SID-518/519 resolve
+    # to nothing and the lookups below would leave the names null.
+    $rootDomainSidValue = $domainSidValue
+    try {
+        $forestRootDomain = (Get-ADForest -ErrorAction Stop).RootDomain
+        $rootDomainSidValue = (Get-ADDomain -Identity $forestRootDomain -ErrorAction Stop).domainsid.value
+    } catch { }
+    $script:SchemaAdminsSID = $rootDomainSidValue + "-518"
+    $script:EnterpriseAdminsSID = $rootDomainSidValue + "-519"
     $script:EveryOneSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-1-0"
     $script:EntrepriseDomainControllersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-9"
     $script:AuthenticatedUsersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-11"
@@ -829,8 +840,10 @@ Function Get-Variables() {
     $script:DomainAdmins = (Get-ADGroup -Identity $DomainAdminsSID).SamAccountName
     $script:DomainUsers = (Get-ADGroup -Identity $DomainUsersSID).SamAccountName
     $script:DomainControllers = (Get-ADGroup -Identity $DomainControllersSID).SamAccountName
-    $script:SchemaAdmins = (Get-ADGroup -Identity $SchemaAdminsSID).SamAccountName
-    $script:EnterpriseAdmins = (Get-ADGroup -Identity $EnterpriseAdminsSID).SamAccountName
+    # Fall back to the well-known English names rather than leaving these null:
+    # downstream -match/-eq checks against a null name would match everything.
+    $script:SchemaAdmins = try { (Get-ADGroup -Identity $SchemaAdminsSID -ErrorAction Stop).SamAccountName } catch { 'Schema Admins' }
+    $script:EnterpriseAdmins = try { (Get-ADGroup -Identity $EnterpriseAdminsSID -ErrorAction Stop).SamAccountName } catch { 'Enterprise Admins' }
     $script:EveryOne = $EveryOneSID.Translate([System.Security.Principal.NTAccount]).Value
     $script:EntrepriseDomainControllers = $EntrepriseDomainControllersSID.Translate([System.Security.Principal.NTAccount]).Value
     $script:AuthenticatedUsers = $AuthenticatedUsersSID.Translate([System.Security.Principal.NTAccount]).Value
@@ -1399,7 +1412,12 @@ Function Get-ADAuditRemoteRegistryDword {
     if ($isLocal) {
         try {
             $r = Invoke-CimMethod -Namespace 'root/default' -ClassName StdRegProv -MethodName GetDWORDValue -Arguments $regArgs -ErrorAction Stop
-            $result.Success = $true; $result.Value = $r.uValue
+            # Invoke-CimMethod does not throw on provider-level failures; StdRegProv
+            # reports them via ReturnValue (1/2 = value/key not present, 5 = access
+            # denied, other = read failure). Only 1/2 mean 'value is not set'.
+            if ($r.ReturnValue -eq 0) { $result.Success = $true; $result.Value = $r.uValue }
+            elseif ($r.ReturnValue -in 1, 2) { $result.Success = $true; $result.Value = $null }
+            else { $result.Error = "StdRegProv GetDWORDValue failed (ReturnValue=$($r.ReturnValue))" }
         }
         catch { $result.Error = $_.Exception.Message }
         return $result
@@ -1411,8 +1429,10 @@ Function Get-ADAuditRemoteRegistryDword {
             $opt = New-CimSessionOption -Protocol $proto
             $session = New-CimSession -ComputerName $ComputerName -SessionOption $opt -ErrorAction Stop
             $r = Invoke-CimMethod -CimSession $session -Namespace 'root/default' -ClassName StdRegProv -MethodName GetDWORDValue -Arguments $regArgs -ErrorAction Stop
-            $result.Success = $true; $result.Value = $r.uValue; $result.Error = $null
-            return $result
+            if ($r.ReturnValue -eq 0) { $result.Success = $true; $result.Value = $r.uValue; $result.Error = $null }
+            elseif ($r.ReturnValue -in 1, 2) { $result.Success = $true; $result.Value = $null; $result.Error = $null }
+            else { $result.Success = $false; $result.Value = $null; $result.Error = "StdRegProv GetDWORDValue failed (ReturnValue=$($r.ReturnValue))" }
+            if ($result.Success) { return $result }
         }
         catch { $result.Error = $_.Exception.Message }
         finally { if ($session) { $session | Remove-CimSession -ErrorAction SilentlyContinue } }
@@ -1639,9 +1659,10 @@ Function Get-OUPerms {
         $progresscount++
         Write-Progress -Activity "Searching for non-standard OU permissions..." -Status "Currently identified $count" -PercentComplete ($progresscount / $totalcount * 100)
         try {
-            $output = (Get-Acl -Path "AD:$object" -ErrorAction Stop).Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
+            $output = (Get-Acl -LiteralPath "AD:$($object.DistinguishedName)" -ErrorAction Stop).Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
         } catch {
             $output = $null
+            Add-Content -Path (Get-EvidencePath 'ou_permissions.txt') -Value "[?] Could not read ACL on $($object.DistinguishedName): $($_.Exception.Message)"
         }
         if ($output -ne $null) {
             $count++
@@ -1662,21 +1683,27 @@ Function Get-LAPSStatus {
     $schemaNC = (Get-ADRootDSE).SchemaNamingContext
     $legacySchema = $null
     $windowsSchema = $null
+    $schemaQueryError = $null
 
     try {
         $legacySchema = Get-ADObject -LDAPFilter '(lDAPDisplayName=ms-Mcs-AdmPwd)' -SearchBase $schemaNC -ErrorAction Stop
     }
-    catch { }
+    catch { $schemaQueryError = $_.Exception.Message }
 
     try {
         $windowsSchema = Get-ADObject -LDAPFilter '(lDAPDisplayName=msLAPS-PasswordExpirationTime)' -SearchBase $schemaNC -ErrorAction Stop
     }
-    catch { }
+    catch { $schemaQueryError = $_.Exception.Message }
 
     $legacyDetected = ($null -ne $legacySchema)
     $windowsDetected = ($null -ne $windowsSchema)
 
     if (-not $legacyDetected -and -not $windowsDetected) {
+        if ($schemaQueryError) {
+            # A failed schema query must not be reported as 'LAPS not installed'
+            Register-ADAuditNotAssessed -Name 'Get-LAPSStatus' -Switch 'laps' -Reason "LAPS schema could not be queried: $schemaQueryError"
+            return
+        }
         Write-Both "    [!] LAPS Not Installed in domain (KB258)"
         Write-Nessus-Finding "LAPSMissing" "KB258" "LAPS Not Installed in domain"
         return
@@ -1852,6 +1879,10 @@ Function Get-PrincipalKindForDA {
 
     $sid = $null
     try { $sid = [string]$Member.SID } catch { $sid = $null }
+    # Get-ADObject-hydrated members carry objectSid instead of the SID extended property
+    if ([string]::IsNullOrEmpty($sid)) {
+        try { $sid = [string]$Member.objectSid } catch { $sid = $null }
+    }
     $cls = ''
     try { $cls = [string]$Member.objectClass } catch { $cls = '' }
     $sam = [string]$Member.SamAccountName
@@ -1986,7 +2017,7 @@ Function Get-DomainAdminScaledRisk {
             # NOTE: 'Enabled' is NOT a valid Get-ADObject property (it is an extended
             # property of Get-ADUser/Get-ADComputer only) and requesting it throws for
             # every member. Derive enabled state from userAccountControl (bit 0x2) instead.
-            $obj = Get-ADObject -Identity $m.distinguishedName -Properties SamAccountName, userAccountControl, lastLogonTimestamp, servicePrincipalName, objectClass, sIDHistory -ErrorAction Stop
+            $obj = Get-ADObject -Identity $m.distinguishedName -Properties SamAccountName, userAccountControl, lastLogonTimestamp, servicePrincipalName, objectClass, sIDHistory, objectSid -ErrorAction Stop
             $hydrated = $true
         } catch {
             $obj = $m
@@ -2077,7 +2108,7 @@ Function Get-DomainAdminScaledRisk {
         $rowsLocal = @()
         foreach ($m in $members) {
             $obj = $m
-            try { $obj = Get-ADObject -Identity $m.distinguishedName -Properties SamAccountName, objectClass, servicePrincipalName -ErrorAction Stop } catch { }
+            try { $obj = Get-ADObject -Identity $m.distinguishedName -Properties SamAccountName, objectClass, servicePrincipalName, objectSid -ErrorAction Stop } catch { }
             $k = Get-PrincipalKindForDA -Member $obj -DomainSid $domainSid
             if (-not $kindCounts.ContainsKey($k)) { $kindCounts[$k] = 0 }
             $kindCounts[$k]++
@@ -2181,7 +2212,10 @@ Function Get-DomainAdminScaledRisk {
     Set-Content -LiteralPath (Get-EvidencePath 'domain_admins_scaled.txt') -Value $sb.ToString() -Encoding UTF8
     Write-Both "    [!] Domain Admins review: severity=$severity (effective=$effectivePerm, high-risk=$highRiskCount, threshold=$sizeLimit, target=$targetMax for $enabledHumanUsers users). See domain_admins_scaled.txt"
 
-    Write-Nessus-Finding "DomainAdminsSizeAdjustedReview" "KB427" ([System.IO.File]::ReadAllText((Get-EvidencePath 'domain_admins_scaled.txt')))
+    # Pass the computed size-adjusted severity; Get-NessusSeverityTuple has no
+    # 'Information' case, so map it to the tuple's 'Info' key.
+    $nessusSev = if ($severity -eq 'Information') { 'Info' } else { $severity }
+    Write-Nessus-Finding "DomainAdminsSizeAdjustedReview" "KB427" ([System.IO.File]::ReadAllText((Get-EvidencePath 'domain_admins_scaled.txt'))) $nessusSev
 
     # ---- RID-500 hygiene as a separate finding ----
     $rid500Sev = 'Information'
@@ -2973,6 +3007,7 @@ Function Get-ADHealth {
     $evtPath = Join-Path $rawDir 'health_events_72h.txt'
     $evtSb   = New-Object System.Text.StringBuilder
     $evtIssues = 0
+    $evtQueryFailures = 0
     $badIds = @{
         'Directory Service' = 1311,1865,1925,1988,2042
         'DNS Server'        = 4000,4013,4015
@@ -2995,7 +3030,12 @@ Function Get-ADHealth {
                     }
                 }
             } catch {
-                # Logs may simply have no matching events; that's fine.
+                # 'No events were found' is benign; anything else is a failed query,
+                # which must not be reported as a clean Pass.
+                if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+                    [void]$evtSb.AppendLine("  ${logName}: query failed - $($_.Exception.Message)")
+                    $evtQueryFailures++
+                }
             }
         }
     }
@@ -3003,6 +3043,8 @@ Function Get-ADHealth {
     if ($evtIssues -gt 0) {
         _Add-HFinding -Category 'Event Logs' -Severity 'Medium' -Title 'Known bad event IDs found in DC logs (last 72h)' -Evidence "Events: $evtIssues" -Source $evtPath
         _Add-HTest -Title 'Event log scrape (72h)' -Subtitle 'Directory Service / DNS / DFSR / System logs, known bad IDs' -Status 'Warn' -Detail "$evtIssues event(s)" -EvidencePath $evtPath
+    } elseif ($evtQueryFailures -gt 0) {
+        _Add-HTest -Title 'Event log scrape (72h)' -Subtitle 'Directory Service / DNS / DFSR / System logs, known bad IDs' -Status 'Warn' -Detail "$evtQueryFailures log query failure(s)" -EvidencePath $evtPath
     } else {
         _Add-HTest -Title 'Event log scrape (72h)' -Subtitle 'Directory Service / DNS / DFSR / System logs, known bad IDs' -Status 'Pass' -Detail 'No issues' -EvidencePath $evtPath
     }
@@ -3121,7 +3163,6 @@ Function Write-ADHealthReport {
     $cHigh = ($Findings | Where-Object { $_.Severity -eq 'High' }).Count
     $cMed  = ($Findings | Where-Object { $_.Severity -eq 'Medium' }).Count
     $cLow  = ($Findings | Where-Object { $_.Severity -eq 'Low' }).Count
-    $cInfo = ($Findings | Where-Object { $_.Severity -eq 'Info' }).Count
     $totalFindings = $cCrit + $cHigh + $cMed + $cLow
 
     $score = (25 * $cCrit) + (12 * $cHigh) + (5 * $cMed) + (1 * $cLow)
@@ -3702,6 +3743,11 @@ function Get-OverlappingGroupMemberships {
         if (Get-Command Write-Both -ErrorAction SilentlyContinue) { Write-Both $Message } else { Write-Host $Message }
     }
 
+    function _Enc([string]$s) {
+        if ($null -eq $s) { return '' }
+        return [System.Net.WebUtility]::HtmlEncode($s)
+    }
+
     Import-ADAuditModule -Name ActiveDirectory -Required | Out-Null
 
     if (-not $OutputDir) {
@@ -3950,13 +3996,13 @@ function Get-OverlappingGroupMemberships {
             $disp = ($userRows | Select-Object -First 1).UserDisplayName
 
             [void]$sb.AppendLine("<details>")
-            [void]$sb.AppendLine("<summary>$($ug.Name) &mdash; $disp ($($userRows.Count) target group(s) with overlap)</summary>")
-            [void]$sb.AppendLine("<div class='detail-body'><p><code>$dn</code></p>")
+            [void]$sb.AppendLine("<summary>$(_Enc $ug.Name) &mdash; $(_Enc $disp) ($($userRows.Count) target group(s) with overlap)</summary>")
+            [void]$sb.AppendLine("<div class='detail-body'><p><code>$(_Enc $dn)</code></p>")
             [void]$sb.AppendLine("<table><thead><tr><th>Target Group</th><th>Overlap Type</th><th>Direct Entry Groups</th><th>Contributing Groups</th><th>Common Groups</th><th>Paths</th></tr></thead><tbody>")
 
             foreach ($r in ($userRows | Sort-Object TargetGroup)) {
-                $pathsHtml = ($r.Paths -split '\s\|\s' | ForEach-Object { "<div><code>$($_)</code></div>" }) -join ''
-                [void]$sb.AppendLine("<tr><td>$($r.TargetGroup)</td><td>$($r.OverlapType)</td><td>$($r.DirectEntryGroups)</td><td>$($r.ContributingGroups)</td><td>$($r.CommonGroups)</td><td>$pathsHtml</td></tr>")
+                $pathsHtml = ($r.Paths -split '\s\|\s' | ForEach-Object { "<div><code>$(_Enc $_)</code></div>" }) -join ''
+                [void]$sb.AppendLine("<tr><td>$(_Enc $r.TargetGroup)</td><td>$($r.OverlapType)</td><td>$(_Enc $r.DirectEntryGroups)</td><td>$(_Enc $r.ContributingGroups)</td><td>$(_Enc $r.CommonGroups)</td><td>$pathsHtml</td></tr>")
             }
 
             [void]$sb.AppendLine("</tbody></table></div></details>")
@@ -3992,13 +4038,13 @@ function Get-OverlappingGroupMemberships {
             $disp = ($userRows | Select-Object -First 1).UserDisplayName
 
             [void]$sb2.AppendLine("<details>")
-            [void]$sb2.AppendLine("<summary>$($ug.Name) &mdash; $disp ($($userRows.Count) target group(s) with multiple paths)</summary>")
-            [void]$sb2.AppendLine("<div class='detail-body'><p><code>$dn</code></p>")
+            [void]$sb2.AppendLine("<summary>$(_Enc $ug.Name) &mdash; $(_Enc $disp) ($($userRows.Count) target group(s) with multiple paths)</summary>")
+            [void]$sb2.AppendLine("<div class='detail-body'><p><code>$(_Enc $dn)</code></p>")
             [void]$sb2.AppendLine("<table><thead><tr><th>Target Group</th><th>Overlap Type</th><th>Direct Entry Groups</th><th>Contributing Groups</th><th>Common Groups</th><th>Paths</th></tr></thead><tbody>")
 
             foreach ($r in ($userRows | Sort-Object TargetGroup)) {
-                $pathsHtml = ($r.Paths -split '\s\|\s' | ForEach-Object { "<div><code>$($_)</code></div>" }) -join ''
-                [void]$sb2.AppendLine("<tr><td>$($r.TargetGroup)</td><td>$($r.OverlapType)</td><td>$($r.DirectEntryGroups)</td><td>$($r.ContributingGroups)</td><td>$($r.CommonGroups)</td><td>$pathsHtml</td></tr>")
+                $pathsHtml = ($r.Paths -split '\s\|\s' | ForEach-Object { "<div><code>$(_Enc $_)</code></div>" }) -join ''
+                [void]$sb2.AppendLine("<tr><td>$(_Enc $r.TargetGroup)</td><td>$($r.OverlapType)</td><td>$(_Enc $r.DirectEntryGroups)</td><td>$(_Enc $r.ContributingGroups)</td><td>$(_Enc $r.CommonGroups)</td><td>$pathsHtml</td></tr>")
             }
 
             [void]$sb2.AppendLine("</tbody></table></div></details>")
@@ -4224,7 +4270,12 @@ Function Get-AuthenticationPoliciesAndSilos {
 Function Get-MachineAccountQuota {
     #Get number of machines a user can add to a domain
     $MachineAccountQuota = (Get-ADDomain | select -ExpandProperty DistinguishedName | Get-ADObject -Property 'ms-DS-MachineAccountQuota' | select -ExpandProperty ms-DS-MachineAccountQuota)
-    if ($MachineAccountQuota -gt 0) {
+    if ($null -eq $MachineAccountQuota) {
+        # Attribute unset: SAM still applies the documented default of 10
+        Write-Both "    [!] ms-DS-MachineAccountQuota is not set; domain users can add the default 10 devices to the domain! (KB251)"
+        Write-Nessus-Finding "DomainAccountQuota" "KB251" "ms-DS-MachineAccountQuota is not set; domain users can add the default 10 devices to the domain"
+    }
+    elseif ($MachineAccountQuota -gt 0) {
         Write-Both "    [!] Domain users can add $MachineAccountQuota devices to the domain! (KB251)"
         Write-Nessus-Finding "DomainAccountQuota" "KB251" "Domain users can add $MachineAccountQuota devices to the domain"
     }
@@ -4236,7 +4287,15 @@ Function Get-InactiveComputerObjects {
     $ReportPath = Get-EvidencePath 'computers_inactive_90days.txt'
     Remove-Item -Path $ReportPath -ErrorAction SilentlyContinue
 
-    $inactiveComputers = Get-ADComputer -Filter { LastLogonTimeStamp -lt $DaysAgo -and Enabled -eq "true" } -Properties LastLogonTimeStamp, DNSHostName, OperatingSystem
+    # LDAP filter so computers that have NEVER logged on are included too; the
+    # AD-cmdlet filter 'LastLogonTimeStamp -lt X' requires the attribute to be
+    # present and silently excluded them (same approach as Get-InactiveAccounts).
+    $cutoffFt = $DaysAgo.ToFileTimeUtc()
+    $ldapFilter =
+        "(&(objectCategory=computer)" +
+        "(!(userAccountControl:1.2.840.113556.1.4.803:=2))" +
+        "(|(lastLogonTimestamp<=$cutoffFt)(!(lastLogonTimestamp=*))))"
+    $inactiveComputers = Get-ADComputer -LDAPFilter $ldapFilter -Properties LastLogonTimeStamp, DNSHostName, OperatingSystem
     $totalcount = ($inactiveComputers | Measure-Object | Select-Object Count).count
 
     foreach ($computer in $inactiveComputers) {
@@ -4505,7 +4564,7 @@ Function Get-SYSVOLXMLS {
             $Filename = Split-Path $File -Leaf
             $Distinguishedname = (Split-Path (Split-Path (Split-Path( Split-Path (Split-Path $File -Parent) -Parent ) -Parent ) -Parent) -Leaf).Substring(1).TrimEnd('}')
             [xml]$Xml = Get-Content ($File)
-            if ($Xml.innerxml -like "*cpassword*" -and $Xml.innerxml -notlike '*cpassword=""*') {
+            if ($Xml.InnerXml -match 'cpassword="[^"]+"') {
                 if (!(Test-Path "$outputdir\sysvol")) { New-Item -ItemType Directory -Path "$outputdir\sysvol" | Out-Null }
                 Write-Both "    [!] cpassword found in file, copying to output folder (KB329)"
                 Write-Both "        $File"
@@ -4520,8 +4579,6 @@ Function Get-SYSVOLXMLS {
     }
     else {
         $GPOxml = (Get-Content "$outputdir\sysvol\*.xml" -ErrorAction SilentlyContinue)
-        $GPOxml = $GPOxml -Replace "<", "&lt;"
-        $GPOxml = $GPOxml -Replace ">", "&gt;"
         Write-Nessus-Finding "GPOPasswordStorage" "KB329" "$GPOxml"
     }
 }
@@ -4564,7 +4621,7 @@ Function Get-InactiveAccounts {
     $totalcount = ($inactiveUsers | Measure-Object).Count
 
     if ($totalcount -gt 0) {
-        "@Accounts inactive (no logon) for the past $InactiveDays days (based on lastLogonTimestamp)" |
+        "Accounts inactive (no logon) for the past $InactiveDays days (based on lastLogonTimestamp)" |
             Set-Content -Encoding UTF8 -Path $txtPath
     } else {
         # Ensure no stale file from previous runs
@@ -4657,6 +4714,8 @@ Function Get-DomainAdminsGroupOverlap {
             'Domain Admins',
             'Administrators',
             'Users',
+            # Default transitive membership for all Tier-0 groups since the 2008 schema
+            'Denied RODC Password Replication Group',
 
             # Common Tier-0 extensions (policy-based but usually acceptable for Tier-0 accounts)
             'Group Policy Creator Owners',
@@ -4740,9 +4799,14 @@ Function Get-DomainAdminsGroupOverlap {
         return
     }
 
+    # Recursive DA members share most transitive groups; cache the SID-to-name
+    # translation so each group is resolved once instead of once per member.
+    $groupNameBySid = @{}
     foreach ($m in $members) {
         try {
-            $u = Get-ADUser -Identity $m.DistinguishedName -Properties Enabled,SamAccountName,Name,DistinguishedName -ErrorAction Stop
+            # tokenGroups is fetched together with the other properties - a second
+            # per-member Get-ADUser call just for it doubled the LDAP round trips.
+            $u = Get-ADUser -Identity $m.DistinguishedName -Properties Enabled,SamAccountName,Name,DistinguishedName,tokenGroups -ErrorAction Stop
 
             # Effective (transitive) group membership. Get-ADPrincipalGroupMembership returns
             # only DIRECT groups, so a Domain Admin nested into a Tier-1 group via an
@@ -4751,12 +4815,13 @@ Function Get-DomainAdminsGroupOverlap {
             # translate each SID to a group name; fall back to direct membership if unavailable.
             $groupsNorm = @()
             try {
-                $tokenUser = Get-ADUser -Identity $u.DistinguishedName -Properties tokenGroups -ErrorAction Stop
-                foreach ($sid in $tokenUser.tokenGroups) {
-                    try {
-                        $grp = Get-ADGroup -Identity $sid -ErrorAction Stop
-                        if ($grp.SamAccountName) { $groupsNorm += [string]$grp.SamAccountName }
-                    } catch { }
+                if (-not $u.tokenGroups -or $u.tokenGroups.Count -eq 0) { throw 'tokenGroups unavailable' }
+                foreach ($sid in $u.tokenGroups) {
+                    $sidKey = [string]$sid
+                    if (-not $groupNameBySid.ContainsKey($sidKey)) {
+                        $groupNameBySid[$sidKey] = try { [string](Get-ADGroup -Identity $sid -ErrorAction Stop).SamAccountName } catch { $null }
+                    }
+                    if ($groupNameBySid[$sidKey]) { $groupsNorm += $groupNameBySid[$sidKey] }
                 }
             } catch {
                 $groupsNorm = @(Get-ADPrincipalGroupMembership -Identity $u.DistinguishedName -ErrorAction SilentlyContinue |
@@ -4940,14 +5005,18 @@ Function Get-DCsNotOwnedByDA {
     #Searches for DC objects not owned by the Domain Admins group
     $count = 0
     $progresscount = 0
-    $domaincontrollers = Get-ADComputer -Filter { PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521 } -Property *
+    $domaincontrollers = Get-ADComputer -Filter { PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521 } -Property ntSecurityDescriptor, OperatingSystem, OperatingSystemServicePack, OperatingSystemVersion, IPv4Address
     $totalcount = ($domaincontrollers | Measure-Object | Select-Object Count).count
     if ($totalcount -gt 0) {
         foreach ($machine in $domaincontrollers) {
             $progresscount++
             Write-Progress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Currently identified $count" -PercentComplete ($progresscount / $totalcount * 100)
-            if ($machine.ntsecuritydescriptor.Owner -ne "$env:UserDomain\$DomainAdmins") {
-                Add-Content -Path (Get-EvidencePath 'dcs_not_owned_by_da.txt') -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersion), $($machine.IPv4Address), owned by $($machine.ntsecuritydescriptor.Owner)"
+            $owner = $machine.ntSecurityDescriptor.Owner
+            if ($null -eq $owner) {
+                Write-Both "    [!] Could not read owner of DC object $($machine.Name); skipping."
+            }
+            elseif ($owner -ne "$env:UserDomain\$DomainAdmins") {
+                Add-Content -Path (Get-EvidencePath 'dcs_not_owned_by_da.txt') -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersion), $($machine.IPv4Address), owned by $owner"
                 $count++
             }
         }
@@ -5078,24 +5147,46 @@ Function Get-GPOEnum {
                 $AllowedJoin += $obj
             }
         }
-        #Look for GPO that hardens NTLM
+        #Look for GPO that hardens NTLM. Only count the GPO when the configured
+        #VALUE actually hardens: NoLMHash=Disabled or LmCompatibilityLevel 0-2
+        #configure the key without restricting anything. When the value cannot
+        #be parsed (e.g. localized display text), keep the previous behavior
+        #and count it rather than raise a false 'not restricted' finding.
         $permissionindex = $GPOreport.IndexOf('NoLMHash</q1:KeyName>')
         if ($permissionindex -gt 0) {
             $xmlreport = [xml]$GPOreport
             $value = $xmlreport.GPO.Computer.ExtensionData.Extension.SecurityOptions | Where-Object { $_.KeyName -Match 'NoLMHash' }
-            $obj = New-Object -TypeName PSObject
-            $obj | Add-Member -MemberType NoteProperty -Name GPO   -Value $GPO.DisplayName
-            $obj | Add-Member -MemberType NoteProperty -Name Value -Value "NoLMHash $($value.Display.DisplayBoolean)"
-            $HardenNTLM += $obj
+            $noLmHardens = $true
+            try {
+                if ($value.Display.DisplayBoolean) { $noLmHardens = ([string]$value.Display.DisplayBoolean -ieq 'true') }
+                elseif ($value.SettingNumber)      { $noLmHardens = ([int]$value.SettingNumber -ne 0) }
+            } catch { }
+            if ($noLmHardens) {
+                $obj = New-Object -TypeName PSObject
+                $obj | Add-Member -MemberType NoteProperty -Name GPO   -Value $GPO.DisplayName
+                $obj | Add-Member -MemberType NoteProperty -Name Value -Value "NoLMHash $($value.Display.DisplayBoolean)"
+                $HardenNTLM += $obj
+            }
         }
         $permissionindex = $GPOreport.IndexOf('LmCompatibilityLevel</q1:KeyName>')
         if ($permissionindex -gt 0) {
             $xmlreport = [xml]$GPOreport
             $value = $xmlreport.GPO.Computer.ExtensionData.Extension.SecurityOptions | Where-Object { $_.KeyName -Match 'LmCompatibilityLevel' }
-            $obj = New-Object -TypeName PSObject
-            $obj | Add-Member -MemberType NoteProperty -Name GPO   -Value $GPO.DisplayName
-            $obj | Add-Member -MemberType NoteProperty -Name Value -Value "LmCompatibilityLevel $($value.Display.DisplayString)"
-            $HardenNTLM += $obj
+            $lmHardens = $true
+            try {
+                if ($value.SettingNumber) { $lmHardens = ([int]$value.SettingNumber -ge 3) }
+                elseif ($value.Display.DisplayString) {
+                    # Levels 0-2 (English): 'Send LM & NTLM ...' / 'Send NTLM response only'
+                    $lmDisplay = [string]$value.Display.DisplayString
+                    if ($lmDisplay -like 'Send LM *' -or $lmDisplay -ieq 'Send NTLM response only') { $lmHardens = $false }
+                }
+            } catch { }
+            if ($lmHardens) {
+                $obj = New-Object -TypeName PSObject
+                $obj | Add-Member -MemberType NoteProperty -Name GPO   -Value $GPO.DisplayName
+                $obj | Add-Member -MemberType NoteProperty -Name Value -Value "LmCompatibilityLevel $($value.Display.DisplayString)"
+                $HardenNTLM += $obj
+            }
         }
         #Look for GPO that denies NTLM
         $permissionindex = $GPOreport.IndexOf('RestrictNTLMInDomain</q1:KeyName>')
@@ -5286,6 +5377,8 @@ Function Get-DCEval {
         if (($ADs | Where-Object { $_.OperatingSystem -Match '2019' }) -ne $null) { Write-Both "        [+] Domain controllers with WS 2019"    ; $ADs | Where-Object { $_.OperatingSystem -Match '2019' }       | ForEach-Object { Write-Both "            [-] $($_.Name) has $($_.OperatingSystem)" } }
         if (($ADs | Where-Object { $_.OperatingSystem -Match '2022' }) -ne $null) { Write-Both "        [+] Domain controllers with WS 2022"    ; $ADs | Where-Object { $_.OperatingSystem -Match '2022' }       | ForEach-Object { Write-Both "            [-] $($_.Name) has $($_.OperatingSystem)" } }
         if (($ADs | Where-Object { $_.OperatingSystem -Match '2025' }) -ne $null) { Write-Both "        [+] Domain controllers with WS 2025"    ; $ADs | Where-Object { $_.OperatingSystem -Match '2025' }       | ForEach-Object { Write-Both "            [-] $($_.Name) has $($_.OperatingSystem)" } }
+        $otherDCs = @($ADs | Where-Object { $_.OperatingSystem -notmatch '2019|2022|2025' })
+        if ($otherDCs.Count -gt 0) { Write-Both "        [+] Domain controllers with other/older OS"    ; $otherDCs | ForEach-Object { Write-Both "            [-] $($_.Name) has $($_.OperatingSystem)" } }
     }
     #Validate DCs hotfix level
     if ( (( $ADs | Select-Object OperatingSystemHotfix -Unique ) | measure).count -eq 1 -or ( $ADs | Select-Object OperatingSystemHotfix -Unique ) -eq $null ) {
@@ -5519,10 +5612,6 @@ Function Get-RecentChanges() {
     $DateCutOff = ((Get-Date).AddDays(-30)).Date
     $newUsers = Get-ADUser  -Filter { whenCreated -ge $DateCutOff } -Properties whenCreated | select whenCreated, SamAccountName
     $newGroups = Get-ADGroup -Filter { whenCreated -ge $DateCutOff } -Properties whenCreated | select whenCreated, SamAccountName
-    $countUsers = 0
-    $countGroups = 0
-    $progresscountUsers = 0
-    $progresscountGroups = 0
     $totalcountUsers = ($newUsers  | Measure-Object | Select-Object Count).count
     $totalcountGroups = ($newGroups | Measure-Object | Select-Object Count).count
     if ($totalcountUsers -gt 0) {
@@ -5539,7 +5628,6 @@ Function Get-RecentChanges() {
 }
 Function Get-ReplicationType {
     #Retrieve replication mechanism (FRS or DFSR)
-    $objectName = "DFSR-GlobalSettings"
     $searcher = [ADSISearcher] "(objectClass=msDFSR-GlobalSettings)"
     $objectExists = $searcher.FindOne() -ne $null
     if ($objectExists) {
@@ -5790,14 +5878,6 @@ function Add-KerberoastExplanationToPasswordQualityReport {
         if ($sam -ieq 'krbtgt') { $krbtgtAccounts += $acct } else { $serviceAccounts += $acct }
     }
 
-    # Optional: krbtgt details
-    $krbtgtInfo = $null
-    if ($krbtgtAccounts.Count -gt 0 -and $DomainController) {
-        try {
-            $krbtgtInfo = Get-ADUser -Server $DomainController -Filter { SamAccountName -eq 'krbtgt' } -Properties PasswordLastSet -ErrorAction Stop
-        } catch { }
-    }
-
     # Build replacement
     $replacement = New-Object System.Collections.Generic.List[string]
     $replacement.Add($header)
@@ -5987,7 +6067,15 @@ function Split-PasswordQualityReport {
             $currentLines  = New-Object 'System.Collections.Generic.List[string]'
         }
         elseif ($currentHeader) {
-            $currentLines.Add($line) | Out-Null
+            if ($line -match '^\S' -and $trimmed.EndsWith(':')) {
+                # Unknown section header - close the current section instead of absorbing it
+                $sections[$currentHeader] = $currentLines.ToArray()
+                $currentHeader = $null
+                $currentLines  = New-Object 'System.Collections.Generic.List[string]'
+            }
+            else {
+                $currentLines.Add($line) | Out-Null
+            }
         }
     }
     # Save last section
@@ -6148,10 +6236,10 @@ Function Get-ADCSVulns {
             if ($detail -like "*CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT -- 1*") { $SuppliesSubjectCheck = $true }
             if ($detail -like "*Client Authentication*") { $ClientAuthCheck = $true }
             if ($detail -match "^\s*Allow Enroll\s+.*\\Authenticated Users\s*$|^\s*Allow Enroll\s+.*\\Domain Users\s*$") { $AllowEnrollCheck = $true }
-            if ($detail -like "2.5.29.37.0 Any Purpose") { $AnyPurposeCheck = $true }
+            if ($detail -like "*2.5.29.37.0 Any Purpose*") { $AnyPurposeCheck = $true }
             if ($detail -match "^\s*Allow Write\s+.*\\Authenticated Users\s*$|^\s*Allow Write\s+.*\\Domain Users\s*$") { $AllowWriteCheck = $true }
             if ($detail -match "^\s*Allow Full Control\s+.*\\Authenticated Users\s*$|^\s*Allow Full Control\s+.*\\Domain Users\s*$") { $AllowFullControl = $true }
-            if ($detail -like "Certificate Request Agent (1.3.6.1.4.1.311.20.2.1)") { $CertificateRequestAgentCheck = $true }
+            if ($detail -like "*Certificate Request Agent (1.3.6.1.4.1.311.20.2.1)*") { $CertificateRequestAgentCheck = $true }
         }
 
         return [pscustomobject]@{
@@ -6679,8 +6767,13 @@ function Find-DangerousACLPermissions {
     $ui = 0
 
     $userResults = foreach ($user in $users) {
-        $acl = $null
-        $acl = Get-ADObjectAclSafe -DistinguishedName $user.DistinguishedName
+        try {
+            $acl = Get-ADObjectAclSafe -DistinguishedName $user.DistinguishedName
+        }
+        catch {
+            Write-Warning "Could not retrieve ACL for user '$user': $_"
+            continue
+        }
         if ($acl) {
             $dangerousRules = $acl.Access | Where-Object {
             ([string]$_.IdentityReference -in $groupsToCheck) -and
@@ -6697,9 +6790,9 @@ function Find-DangerousACLPermissions {
                     }
                 }
             }
-            $ui++
-            Write-Progress -Activity "Searching for dangerous ACL permissions on users" -Status "Users searched: $ui/$($users.Count)" -PercentComplete ($ui / $users.Count * 100)
         }
+        $ui++
+        Write-Progress -Activity "Searching for dangerous ACL permissions on users" -Status "Users searched: $ui/$($users.Count)" -PercentComplete ($ui / $users.Count * 100)
     }
 
     # Output results
@@ -6757,7 +6850,7 @@ function Find-DangerousACLPermissions {
             [void]$sb.AppendLine("<h2>$title ($($results.Count))</h2>")
             [void]$sb.AppendLine("<table><thead><tr><th>Type</th><th>$nameLabel</th><th>Allowed Group</th><th>Access Control</th><th>AD Rights</th></tr></thead><tbody>")
             foreach ($r in $results) {
-                [void]$sb.AppendLine("<tr><td><span class='badge badge-high'>$title</span></td><td><code>$($r.ObjectName)</code></td><td>$($r.IdentityReference)</td><td>$($r.AccessControlType)</td><td>$($r.ActiveDirectoryRights)</td></tr>")
+                [void]$sb.AppendLine("<tr><td><span class='badge badge-high'>$title</span></td><td><code>$([System.Net.WebUtility]::HtmlEncode([string]$r.ObjectName))</code></td><td>$([System.Net.WebUtility]::HtmlEncode([string]$r.IdentityReference))</td><td>$([System.Net.WebUtility]::HtmlEncode([string]$r.AccessControlType))</td><td>$([System.Net.WebUtility]::HtmlEncode([string]$r.ActiveDirectoryRights))</td></tr>")
             }
             [void]$sb.AppendLine("</tbody></table>")
         }
@@ -7072,7 +7165,6 @@ function Export-ADAuditDataExtract {
                 $accountExpirationDate = _SafeFileTimeToString (_PropFirst $p 'accountexpires')
                 $passwordLastSet       = _SafeFileTimeToString (_PropFirst $p 'pwdlastset')
                 $lastLogonDate         = _SafeFileTimeToString (_PropFirst $p 'lastlogontimestamp')
-                $pwdExpiryComputed     = _SafeFileTimeToString (_PropFirst $p 'msds-userpasswordexpirytimecomputed')
 
                 # PasswordExpired was previously from AD cmdlet; keep best-effort blank (or compute if you want later)
                 $passwordExpired = ''
@@ -7459,7 +7551,9 @@ function New-ReportsFolder {
             if ($ok) { return $ip }
         }
 
-        $dnsIps[0]
+        # @() guards the single-server case: indexing a scalar string would
+        # return its first character instead of the IP.
+        @($dnsIps)[0]
     }
 
     # ----------------------------
@@ -8149,8 +8243,6 @@ $(Get-ADAuditReportFooter)
     # ----------------------------
     # HTML audit report
     # ----------------------------
-    $css = Get-ADAuditReportCss
-
     $riskBadgeClass = switch ($serverRisk.RiskLevel) { 'High' { 'badge-high' } 'Medium' { 'badge-medium' } default { 'badge-low' } }
 
     $serverSummaryHtml = @"
@@ -8181,8 +8273,10 @@ $(Get-ADAuditReportFooter)
         -replace '<td>Medium</td>','<td><span class="badge badge-medium">Medium</span></td>' `
         -replace '<td>Low</td>','<td><span class="badge badge-low">Low</span></td>'
 
-    # Fix ConvertTo-Html <table> to use <thead>/<tbody>
-    $zonesHtml = $zonesHtml -replace '<table>\s*<tr><th','<table><thead><tr><th' -replace '</th></tr>\s*<tr><td','</th></tr></thead><tbody><tr><td' -replace '</td></tr>\s*</table>','</td></tr></tbody></table>'
+    # Fix ConvertTo-Html <table> to use <thead>/<tbody>. ConvertTo-Html -Fragment
+    # returns one string per line, so the patterns must not span lines; join first
+    # and anchor on the header row / closing tags, each of which occurs exactly once.
+    $zonesHtml = ($zonesHtml -join "`n") -replace '<tr><th','<thead><tr><th' -replace '</th></tr>','</th></tr></thead><tbody>' -replace '</table>','</tbody></table>'
 
     # ----------------------------
     # Findings by Issue (grouped) - replaces the old "Top Findings" mini-table.
@@ -8272,7 +8366,7 @@ $(Get-ADAuditReportFooter)
         foreach ($g in $issueGroupList) {
             $badgeCls = switch ($g.Severity) { 'High' { 'badge-high' } 'Medium' { 'badge-medium' } 'Low' { 'badge-low' } default { 'badge-info' } }
             $zoneCount = $g.Zones.Count
-            $zoneListHtml = ($g.Zones | Sort-Object | ForEach-Object { "<li><code>$_</code></li>" }) -join "`n"
+            $zoneListHtml = ($g.Zones | Sort-Object | ForEach-Object { "<li><code>$([System.Web.HttpUtility]::HtmlEncode([string]$_))</code></li>" }) -join "`n"
             $whyEnc = [System.Web.HttpUtility]::HtmlEncode($g.Why)
             $fixEnc = [System.Web.HttpUtility]::HtmlEncode($g.Fix)
             $issueEnc = [System.Web.HttpUtility]::HtmlEncode($g.Issue)
@@ -8467,8 +8561,13 @@ function Invoke-DelegatedPermissionsReport {
     }
 
     # Trustee classification
+    # Both helpers run once per ACE; the same trustees and scope DNs recur
+    # constantly, so memoize to avoid thousands of duplicate LDAP queries.
+    $principalTypeCache = @{}
     function Get-PrincipalType {
       param([string]$Identity)
+      if ($principalTypeCache.ContainsKey($Identity)) { return $principalTypeCache[$Identity] }
+      $ptResult = $null
       try {
         # Trustees arrive as 'DOMAIN\name', 'BUILTIN\name', a raw SID ('S-1-5-...'), or a
         # DN. Build the filter from the right component: sAMAccountName is the part after
@@ -8485,23 +8584,30 @@ function Invoke-DelegatedPermissionsReport {
         } else {
           Get-ADObject -LDAPFilter $filter -Properties objectClass -ErrorAction Stop
         }
-        if ($obj.objectClass -contains 'group')     { return 'Group' }
-        if ($obj.objectClass -contains 'user')      { return 'User' }
-        if ($obj.objectClass -contains 'computer')  { return 'Computer' }
-        if ($obj.objectClass -contains 'foreignSecurityPrincipal') { return 'FSP' }
+        if ($obj.objectClass -contains 'group')          { $ptResult = 'Group' }
+        elseif ($obj.objectClass -contains 'user')       { $ptResult = 'User' }
+        elseif ($obj.objectClass -contains 'computer')   { $ptResult = 'Computer' }
+        elseif ($obj.objectClass -contains 'foreignSecurityPrincipal') { $ptResult = 'FSP' }
       } catch {}
-      if ($Identity -match '^S-\d-\d+') { return 'SID' }
-      return 'WellKnownOrExternal'
+      if (-not $ptResult) {
+        $ptResult = if ($Identity -match '^S-\d-\d+') { 'SID' } else { 'WellKnownOrExternal' }
+      }
+      $principalTypeCache[$Identity] = $ptResult
+      return $ptResult
     }
 
     # Canonical path helper
+    $canonicalCache = @{}
     function Get-Canonical {
       param([string]$Dn)
-      try {
+      if ($canonicalCache.ContainsKey($Dn)) { return $canonicalCache[$Dn] }
+      $cn = try {
         $p = @{ Identity=$Dn; Properties='CanonicalName'; ErrorAction='Stop' }
         if ($Server) { $p['Server'] = $Server }
         (Get-ADObject @p).CanonicalName
       } catch { $null }
+      $canonicalCache[$Dn] = $cn
+      return $cn
     }
 
     # Built-in trustees to optionally suppress
@@ -8586,13 +8692,13 @@ function Invoke-DelegatedPermissionsReport {
     }
 
     # De-duplicate identical ACE rows to reduce noise
-    $records = $records |
-      Sort-Object ScopeDN,Trustee,AccessControlType,ActiveDirectoryRights,AppliesToClass,AppliesToProperty,InheritanceType,IsInherited,ObjectTypeGuid,InheritedObjectGuid -Unique
+    $records = @($records |
+      Sort-Object ScopeDN,Trustee,AccessControlType,ActiveDirectoryRights,AppliesToClass,AppliesToProperty,InheritanceType,IsInherited,ObjectTypeGuid,InheritedObjectGuid -Unique)
 
     # ------- Analytics and risk outputs (always generated) -------
 
     # Windows LAPS + legacy LAPS attributes
-    $lapsAttributes = @('ms-Mcs-AdmPwd','ms-Mcs-AdmPwdExpirationTime','msLAPS-Password','msLAPS-PasswordExpirationTime')
+    $lapsAttributes = @('ms-Mcs-AdmPwd','ms-Mcs-AdmPwdExpirationTime','msLAPS-Password','msLAPS-PasswordExpirationTime','msLAPS-EncryptedPassword','msLAPS-EncryptedPasswordHistory','msLAPS-EncryptedDSRMPassword','msLAPS-EncryptedDSRMPasswordHistory')
 
     $overDelegations = $records | Where-Object {
       $_.ActiveDirectoryRights.ToString() -match 'GenericAll|WriteDacl|DeleteTree'
@@ -8963,8 +9069,11 @@ $sampleBlock
     $index.Add('</ul>')
 
     $index.Add('<h2>Per-Scope CSV (drill-down)</h2>')
-    $index.Add('<details><summary>Show all ' + (@($scopes).Count) + ' scope CSVs</summary><div class="detail-body"><ul class="link-list">')
-    foreach ($dn in $scopes) {
+    # Only scopes that produced ACE records get a CSV on disk; linking every
+    # scope would leave mostly-dead links with the default switches.
+    $scopesWithCsv = @($byScope | ForEach-Object Name)
+    $index.Add('<details><summary>Show all ' + (@($scopesWithCsv).Count) + ' scope CSVs</summary><div class="detail-body"><ul class="link-list">')
+    foreach ($dn in $scopesWithCsv) {
         $safe = ($dn -replace '[=,]','_') -replace '[^\w\.-]','_'
         $dnEnc = [System.Web.HttpUtility]::HtmlEncode([string]$dn)
         $index.Add("<li><a href='OUs/ADAudit_$safe.csv'><code>$dnEnc</code></a></li>")
@@ -9179,11 +9288,20 @@ function _SafeFromFileTimeUtc {
     try { return [datetime]::FromFileTimeUtc([int64]$FileTime) } catch { return $null }
 }
 
-$inactiveDetails = @()
+# Generic list: array += in a loop over every enabled user is O(n^2)
+$inactiveDetails = [System.Collections.Generic.List[object]]::new()
 
-# Enabled users (bitwise filter for "not disabled")
-$enabledUsers = Get-ADUser -LDAPFilter '(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
-    -Properties lastLogonTimestamp,whenCreated,SamAccountName,Name -ErrorAction SilentlyContinue
+# Enabled users (bitwise filter for "not disabled"). A failed query must be
+# recorded as not-assessed, never as a clean Observed=0.
+$inactiveQueryFailed = $false
+try {
+    $enabledUsers = Get-ADUser -LDAPFilter '(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+        -Properties lastLogonTimestamp,whenCreated,SamAccountName,Name -ErrorAction Stop
+} catch {
+    $inactiveQueryFailed = $true
+    $enabledUsers = @()
+    Register-ADAuditNotAssessed -Name 'HighRisk inactive-account enumeration' -Reason "Get-ADUser query failed: $($_.Exception.Message)"
+}
 
 foreach ($u in $enabledUsers) {
     $lltRaw = $null
@@ -9198,7 +9316,7 @@ foreach ($u in $enabledUsers) {
         (($llt -eq $null) -and ($u.whenCreated -lt $cutoff))
 
     if ($isInactive) {
-        $inactiveDetails += [pscustomobject]@{
+        $inactiveDetails.Add([pscustomobject]@{
             RiskId               = 'ACCT_INACTIVE'
             SamAccountName       = $u.SamAccountName
             Name                 = $u.Name
@@ -9209,7 +9327,7 @@ foreach ($u in $enabledUsers) {
             Baseline             = "Disable if inactive > $inactiveDays days"
             Severity             = 'HIGH'
             IsPrivileged         = $privSamSet.Contains([string]$u.SamAccountName)
-        }
+        })
     }
 }
 
@@ -9219,23 +9337,30 @@ $inactiveObj = [pscustomobject]@{
     Item="Enabled accounts inactive > $inactiveDays days"
     Severity='HIGH'
     Baseline="0 (disable if inactive > $inactiveDays days)"
-    Observed=($inactiveDetails | Measure-Object).Count
+    Observed=$(if ($inactiveQueryFailed) { 'Unknown (query failed)' } else { ($inactiveDetails | Measure-Object).Count })
     IsFinding=((($inactiveDetails | Measure-Object).Count) -gt 0)
     Recommendation='Disable or remove accounts that are no longer used; verify HR/offboarding; prioritize privileged and service accounts.'
 }
     
     # Password never expires (enabled users)
-    $pneUsers = Search-ADAccount -PasswordNeverExpires -UsersOnly -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $true }
-    $pneDetails = @()
+    $pneQueryFailed = $false
+    try {
+        $pneUsers = Search-ADAccount -PasswordNeverExpires -UsersOnly -ErrorAction Stop | Where-Object { $_.Enabled -eq $true }
+    } catch {
+        $pneQueryFailed = $true
+        $pneUsers = @()
+        Register-ADAuditNotAssessed -Name 'HighRisk PasswordNeverExpires enumeration' -Reason "Search-ADAccount query failed: $($_.Exception.Message)"
+    }
+    $pneDetails = [System.Collections.Generic.List[object]]::new()
     foreach ($u in $pneUsers) {
-        $pneDetails += [pscustomobject]@{
+        $pneDetails.Add([pscustomobject]@{
             RiskId='PWD_NEVER_EXPIRES'
             SamAccountName=$u.SamAccountName
             Name=$u.Name
             Baseline='0 (humans); use gMSA/MSA for services'
             Severity= $(if ($privSamSet.Contains([string]$u.SamAccountName)) { 'CRITICAL' } else { 'HIGH' })
             IsPrivileged= $privSamSet.Contains([string]$u.SamAccountName)
-        }
+        })
     }
     $pneObj = [pscustomobject]@{
         RiskId='PWD_NEVER_EXPIRES'
@@ -9243,25 +9368,32 @@ $inactiveObj = [pscustomobject]@{
         Item='Enabled user accounts with PasswordNeverExpires'
         Severity='HIGH'
         Baseline='0 (humans); services should use gMSA/MSA'
-        Observed=($pneDetails | Measure-Object).Count
+        Observed=$(if ($pneQueryFailed) { 'Unknown (query failed)' } else { ($pneDetails | Measure-Object).Count })
         IsFinding=((($pneDetails | Measure-Object).Count) -gt 0)
         Recommendation='Eliminate non-expiring human passwords; migrate service accounts to gMSA; rotate credentials; enforce MFA for admins.'
     }
 
     # Disabled accounts stale (>180 days) based on whenChanged (best-effort)
     $disabledRetentionDays = 180
-    $disabledOld = Get-ADUser -Filter { Enabled -eq $false } -Properties whenChanged,SamAccountName,Name -ErrorAction SilentlyContinue |
-                   Where-Object { $_.whenChanged -lt (Get-Date).AddDays(-$disabledRetentionDays) }
-    $disabledOldDetails = @()
+    $disabledQueryFailed = $false
+    try {
+        $disabledOld = Get-ADUser -Filter { Enabled -eq $false } -Properties whenChanged,SamAccountName,Name -ErrorAction Stop |
+                       Where-Object { $_.whenChanged -lt (Get-Date).AddDays(-$disabledRetentionDays) }
+    } catch {
+        $disabledQueryFailed = $true
+        $disabledOld = @()
+        Register-ADAuditNotAssessed -Name 'HighRisk stale disabled-account enumeration' -Reason "Get-ADUser query failed: $($_.Exception.Message)"
+    }
+    $disabledOldDetails = [System.Collections.Generic.List[object]]::new()
     foreach ($u in $disabledOld) {
-        $disabledOldDetails += [pscustomobject]@{
+        $disabledOldDetails.Add([pscustomobject]@{
             RiskId='ACCT_DISABLED_STALE'
             SamAccountName=$u.SamAccountName
             Name=$u.Name
             whenChanged=$u.whenChanged
             Baseline="Review/remove if disabled > $disabledRetentionDays days"
             Severity='MEDIUM'
-        }
+        })
     }
     $disabledOldObj = [pscustomobject]@{
         RiskId='ACCT_DISABLED_STALE'
@@ -9269,7 +9401,7 @@ $inactiveObj = [pscustomobject]@{
         Item="Disabled accounts not reviewed > $disabledRetentionDays days"
         Severity='MEDIUM'
         Baseline="0 (review/remove if disabled > $disabledRetentionDays days)"
-        Observed=($disabledOldDetails | Measure-Object).Count
+        Observed=$(if ($disabledQueryFailed) { 'Unknown (query failed)' } else { ($disabledOldDetails | Measure-Object).Count })
         IsFinding=((($disabledOldDetails | Measure-Object).Count) -gt 0)
         Recommendation='Remove or archive long-disabled accounts; verify business/legal retention; reduce directory clutter and attack surface.'
     }
@@ -9761,8 +9893,14 @@ Function Get-RC4OnlyAccounts {
     $props = @('SamAccountName','DistinguishedName','ObjectClass','Enabled','msDS-SupportedEncryptionTypes','PasswordLastSet','ServicePrincipalName','userAccountControl')
 
     $allAccounts = New-Object System.Collections.Generic.List[object]
-    try { Get-ADUser     -Filter * -Properties $props -ErrorAction SilentlyContinue | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { }
-    try { Get-ADComputer -Filter * -Properties $props -ErrorAction SilentlyContinue | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { }
+    $enumFailures = @()
+    try { Get-ADUser     -Filter * -Properties $props -ErrorAction Stop | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { $enumFailures += "Get-ADUser: $($_.Exception.Message)" }
+    try { Get-ADComputer -Filter * -Properties $props -ErrorAction Stop | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { $enumFailures += "Get-ADComputer: $($_.Exception.Message)" }
+    if ($allAccounts.Count -eq 0 -and $enumFailures.Count -gt 0) {
+        # A failed enumeration must not fall through to the 'no accounts found' all-clear
+        Register-ADAuditNotAssessed -Name 'Get-RC4OnlyAccounts' -Switch 'accounts' -Reason "Account enumeration failed: $($enumFailures -join '; ')"
+        return
+    }
 
     # Domain default fallback (when attribute is null/0). Best effort - read from PDC.
     $domainDefault = $null
@@ -9908,11 +10046,12 @@ Function Get-RC4OnlyAccounts {
             # 0x11 (17) = AES128, 0x12 (18) = AES256
             $encVal = $null
             try {
-                # 4769: Properties index 5 = TicketEncryptionType ; 4768: index 8 (varies by OS)
+                # 4769: Properties index 5 = TicketEncryptionType ; 4768: index 7
+                # (TicketEncryptionType; index 8 is PreAuthType)
                 if ($evt.Id -eq 4769 -and $evt.Properties.Count -ge 6) {
                     $encVal = $evt.Properties[5].Value
-                } elseif ($evt.Id -eq 4768 -and $evt.Properties.Count -ge 9) {
-                    $encVal = $evt.Properties[8].Value
+                } elseif ($evt.Id -eq 4768 -and $evt.Properties.Count -ge 8) {
+                    $encVal = $evt.Properties[7].Value
                 }
             } catch { }
             if ($null -eq $encVal) { continue }
@@ -10239,7 +10378,7 @@ Function Test-DCPortConnectivity {
                 [void]$sb.AppendLine("  Port $($first.Port)/$($first.Proto) - $($first.PortName)")
                 [void]$sb.AppendLine("    Why : $($first.Why)")
                 $fix = switch -Regex ($first.PortName) {
-                    'LDAPS' { 'Issue an LDAPS certificate to the DC (Server Authentication EKU, subject = DC FQDN), reload the DC schannel store (e.g. restart NTDS), and verify with `ldp.exe` to <DC>:636.' ; break }
+                    '^LDAPS' { 'Issue an LDAPS certificate to the DC (Server Authentication EKU, subject = DC FQDN), reload the DC schannel store (e.g. restart NTDS), and verify with `ldp.exe` to <DC>:636.' ; break }
                     'LDAP \(plaintext\)' { 'LDAP itself must be open (clients still use 389). The risk is unsigned/cleartext binds. Enforce LDAP signing (HKLM\System\CurrentControlSet\Services\NTDS\Parameters\LDAPServerIntegrity=2) and channel binding (LdapEnforceChannelBinding=2) - both should already be on per the LDAPSecurity check above.' ; break }
                     'WinRM HTTP|WinRM HTTPS' { 'Enable WinRM (`Enable-PSRemoting -Force`) or open TCP 5985/5986 on the DC firewall to the management subnet. Cross-DC checks in this audit need 5985 reachable from the audit host.' ; break }
                     'AD Web Services' { 'Verify the ADWS service is running on the DC (`Get-Service ADWS`). Open TCP 9389 from any host that uses the ActiveDirectory PowerShell module.' ; break }
@@ -10325,7 +10464,9 @@ if (!(Test-Path $script:LegacyArtifactsDir)) { New-Item -ItemType Directory -Pat
 # lines across runs - duplicating Nessus findings and inflating the risk-report
 # scores that are computed from line counts. -KeepLegacyArtifacts preserves them.
 if (-not $KeepLegacyArtifacts) {
-    Get-ChildItem -LiteralPath $script:LegacyArtifactsDir -File -ErrorAction SilentlyContinue |
+    # -Recurse: subfolders (e.g. HighRisk) hold per-run CSVs that would otherwise
+    # be re-imported by the management report as current findings.
+    Get-ChildItem -LiteralPath $script:LegacyArtifactsDir -File -Recurse -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 Write-Both " _____ ____     _____       _ _ _
@@ -11156,6 +11297,11 @@ function Invoke-ManagementReport {
             'privileged group|Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|overlap' {
                 return 'Excessive or overlapping privilege expands blast radius and increases the probability of privileged misuse or lateral movement.'
             }
+            # Specific before generic: these titles also contain 'disabled' and
+            # must not fall into the generic inactive/disabled case below.
+            'no password set \((all )?disabled\)' {
+                return 'These accounts have PASSWD_NOTREQD set but are currently disabled, so they cannot be used as-is. The risk is latent: if re-enabled they could be used with no password. Their presence also indicates weak account-creation hygiene.'
+            }
             'inactive|disabled|Inactive computer' {
                 return 'Inactive or disabled objects increase attack surface, complicate review, and often indicate weak lifecycle controls. Disabled accounts left in place can be re-enabled by an attacker who gains sufficient rights.'
             }
@@ -11197,9 +11343,6 @@ function Invoke-ManagementReport {
             }
             'LM hashes' {
                 return 'LM hashes use weak DES-based encryption and can be cracked in seconds. Their presence indicates legacy password storage that should have been eliminated.'
-            }
-            'no password set \((all )?disabled\)' {
-                return 'These accounts have PASSWD_NOTREQD set but are currently disabled, so they cannot be used as-is. The risk is latent: if re-enabled they could be used with no password. Their presence also indicates weak account-creation hygiene.'
             }
             'no password set' {
                 return 'Accounts without passwords can be accessed without any authentication, providing trivial entry points for attackers.'
@@ -11263,6 +11406,11 @@ function Invoke-ManagementReport {
             'privileged group|Domain Admins|Enterprise Admins|Schema Admins|Administrators|Operators|overlap' {
                 return 'Reduce standing privilege, separate admin tiers, remove stale memberships, and require approval and periodic recertification for privileged access.'
             }
+            # Specific before generic: these titles also contain 'disabled' and
+            # must not fall into the generic inactive/disabled case below.
+            'no password set \((all )?disabled\)' {
+                return 'These accounts are disabled - do NOT set a password and re-enable them. Confirm each is genuinely unused, then delete it, or keep it disabled and clear the PASSWD_NOTREQD flag (Set-ADUser <account> -PasswordNotRequired $false) so it cannot later be re-enabled without a policy-compliant password. Investigate why the flag was set.'
+            }
             'inactive|disabled|Inactive computer' {
                 return 'Review ownership, remove genuinely unused accounts and computer objects, and enforce a documented lifecycle and exception process. Leave accounts disabled (not re-enabled with a fresh password) until they are confirmed unused, then delete them.'
             }
@@ -11304,9 +11452,6 @@ function Invoke-ManagementReport {
             }
             'LM hashes' {
                 return 'Disable LM hash storage via Group Policy (Network security: Do not store LAN Manager hash value on next password change = Enabled). Force password changes for all affected accounts to eliminate stored LM hashes.'
-            }
-            'no password set \((all )?disabled\)' {
-                return 'These accounts are disabled - do NOT set a password and re-enable them. Confirm each is genuinely unused, then delete it, or keep it disabled and clear the PASSWD_NOTREQD flag (Set-ADUser <account> -PasswordNotRequired $false) so it cannot later be re-enabled without a policy-compliant password. Investigate why the flag was set.'
             }
             'no password set' {
                 return 'Set passwords on all affected (enabled) accounts immediately and clear the PASSWD_NOTREQD flag (Set-ADUser <account> -PasswordNotRequired $false). Review why these accounts were created without passwords and enforce the domain password policy.'
@@ -11763,7 +11908,7 @@ function Invoke-ManagementReport {
                 break
             }
 
-            '^NTLM restrictions require hardening$' {
+            '^NTLM authentication is not restricted or hardened by GPO$|^NTLM restrictions require hardening$' {
                 $tmp = New-Object 'System.Collections.Generic.List[object]'
                 foreach ($line in $lines) {
                     if ($line -match '^NTLM restricted by GPO \[(?<GPO>.+?)\] with value \[(?<Value>.+?)\]$') {
@@ -12815,7 +12960,7 @@ body[data-theme="dark"] .result-table th{background:#0b1220}
 
     findings().forEach(function(item){
       var itemSev = item.getAttribute('data-sev');
-      var text = (item.innerText || '').toLowerCase();
+      var text = (item.textContent || '').toLowerCase();
       var show = (sev === 'All' || itemSev === sev) && (!query || text.indexOf(query) >= 0);
       item.style.display = show ? '' : 'none';
       if(show){ visible++; }
@@ -12982,8 +13127,6 @@ $js
     $baselineHasDA        = $false
     $baselineHasEA        = $false
     $baselineHasSA        = $false
-    $baselineHasDAOverlap = $false
-
     $baselineHasInactive180 = $false
     $baselineHasPNE         = $false
     $baselineHasKrbtgt      = $false
@@ -13063,7 +13206,6 @@ $js
                     }
 
                     '^Domain Admins group overlap' {
-                        $baselineHasDAOverlap = $true
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
                         if ($obsCount -gt 0) {
@@ -13178,10 +13320,14 @@ $js
             }
         }
 
+        # PRIVILEGED_GROUPS.csv is an unconditional full membership dump (never
+        # empty in any domain); only raise the finding when the baseline
+        # collector itself judged at least one group to be over baseline.
         $privRows = Get-CsvSafe $hrFiles.PRIVILEGED_GROUPS
-        if ($privRows.Count -gt 0) {
+        $privOverBaseline = @(Get-CsvSafe $hrFiles.Summary | Where-Object { "$($_.RiskId)" -like 'PRIV_*' -and "$($_.IsFinding)" -match '^(true|1)$' })
+        if ($privRows.Count -gt 0 -and $privOverBaseline.Count -gt 0) {
             $sev = if ($privRows.Count -ge 20) { 'High' } elseif ($privRows.Count -ge 10) { 'Medium' } else { 'Low' }
-            Add-FindingOnce $sev 'Large privileged group membership' "Rows: $($privRows.Count)" $hrFiles.PRIVILEGED_GROUPS (Score-Scaled $sev $privRows.Count)
+            Add-FindingOnce $sev 'Large privileged group membership' "Groups over baseline: $($privOverBaseline.Count); membership rows: $($privRows.Count)" $hrFiles.PRIVILEGED_GROUPS (Score-Scaled $sev $privRows.Count)
         }
 
         # Keep ONLY baseline inactive >180 days (renamed), suppress HighRisk\INACTIVE_ACCOUNTS.csv
@@ -13233,8 +13379,11 @@ $js
     # ---------------------------
     $weakKerbPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dcs_weak_kerberos_ciphersuite.txt')
     $weakKerbLines = Get-NonHeaderLines $weakKerbPath
-    if ($weakKerbLines.Count -gt 0) {
-        Add-FindingOnce 'High' 'Domain controllers allow weak Kerberos ciphers' "DCs flagged: $($weakKerbLines.Count)" $weakKerbPath (Score-Scaled 'High' $weakKerbLines.Count)
+    # The evidence file holds four lines per DC plus a Link footer; count one
+    # marker line per DC block so 'DCs flagged' reflects actual DCs.
+    $weakKerbDcCount = @($weakKerbLines | Where-Object { $_ -match '^Decimal Value:' }).Count
+    if ($weakKerbDcCount -gt 0) {
+        Add-FindingOnce 'High' 'Domain controllers allow weak Kerberos ciphers' "DCs flagged: $weakKerbDcCount" $weakKerbPath (Score-Scaled 'High' $weakKerbDcCount)
     }
 
     # ---------------------------
@@ -13276,8 +13425,12 @@ $js
     # ---------------------------
     $pqRevPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_reversible_encryption.txt')
     $pqPath    = Resolve-AuditArtifactPath (Join-Path $InputRoot 'password_quality.txt')
-    $revAccounts = @(Get-ReversibleEncryptionAccounts -Path $(if ($pqRevPath) { $pqRevPath } else { $pqPath }))
-    if ($revAccounts.Count -eq 0 -and $pqRevPath -ne $pqPath) {
+    # The split pq_reversible_encryption.txt carries header/footer lines that
+    # Get-ReversibleEncryptionAccounts (written for the combined report) would
+    # count as accounts; parse it with the DOMAIN\account-only parser instead.
+    $revAccounts = @()
+    if ($pqRevPath -and (Test-Path -LiteralPath $pqRevPath)) { $revAccounts = @(Get-PqAccountLines $pqRevPath) }
+    if ($revAccounts.Count -eq 0) {
         $revAccounts = @(Get-ReversibleEncryptionAccounts -Path $pqPath)
     }
     $revCount = $revAccounts.Count
@@ -13318,7 +13471,8 @@ $js
             if ($adExtractDir -and (Test-Path -LiteralPath $adExtractDir)) {
                 $uCsv = Get-ChildItem -Path $adExtractDir -Recurse -File -Filter '*-Users.csv' | Select-Object -First 1
                 if ($uCsv) {
-                    $allUserRows = Get-CsvSafe $uCsv.FullName
+                    # ADExtract CSVs are written pipe-delimited (see Export-ADAuditDataExtract)
+                    $allUserRows = @(Import-Csv -LiteralPath $uCsv.FullName -Delimiter '|' -ErrorAction Stop)
                     $noPwdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
                     foreach ($s in $noPwdSams) { $noPwdSet.Add($s) | Out-Null }
                     $enabledNoPwd = 0
@@ -13758,7 +13912,6 @@ $js
     # ---------------------------
     # Prepare report download artifacts and in-report result previews
     # ---------------------------
-    $htmlReportsDirLocal = Get-HtmlReportsDir -BaseRoot $InputRoot
     $downloadsDirLocal = Get-HtmlDownloadsDir -BaseRoot $InputRoot
     Publish-CommonDownloadArtifacts -Root $InputRoot -DownloadRoot $downloadsDirLocal
 
@@ -14507,12 +14660,29 @@ function Update-CompanionHtmlReports {
             ForEach-Object { $_.Value }
         )
 
+        # Carry over head-scoped <script> blocks too: reports like GPOReport.html
+        # (Get-GPOReport) define their expand/collapse functions in <head>, and
+        # dropping them breaks every onclick handler in the wrapped body.
+        $headHtml = ''
+        if ($rawHtml -match '(?is)<head[^>]*>(?<head>.*?)</head>') {
+            $headHtml = $matches['head']
+        }
+        $headScriptBlocks = @(
+            [regex]::Matches($headHtml, '(?is)<script[^>]*>.*?</script>') |
+            ForEach-Object { $_.Value }
+        )
+
         $sourcePath = Join-Path $file.DirectoryName (([System.IO.Path]::GetFileNameWithoutExtension($file.Name)) + '.source.html')
         if (Test-Path -LiteralPath $sourcePath) {
             Remove-Item -LiteralPath $sourcePath -Force -ErrorAction SilentlyContinue
         }
 
-        Move-Item -LiteralPath $targetPath -Destination $sourcePath -Force -ErrorAction SilentlyContinue
+        # If the original cannot be preserved, skip wrapping rather than
+        # overwrite it (which would destroy head scripts/meta for good and
+        # leave a dead 'Open original HTML' link).
+        try {
+            Move-Item -LiteralPath $targetPath -Destination $sourcePath -Force -ErrorAction Stop
+        } catch { continue }
 
         $title = Get-CompanionHtmlReportTitle -FileName $file.Name
         $generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
@@ -14533,6 +14703,7 @@ function Update-CompanionHtmlReports {
 <meta name="adaudit-companion-wrapper" content="1">
 <title>ADAudit - $title</title>
 $($styleBlocks -join "`n")
+$($headScriptBlocks -join "`n")
 <style>
 :root{
   --bg:#f5f7fb;
@@ -14865,6 +15036,12 @@ function Move-RootHtmlReports {
             $srcFull = [System.IO.Path]::GetFullPath($file.FullName)
             $destFull = [System.IO.Path]::GetFullPath($destFile)
             if ($srcFull -ieq $destFull) { continue }
+            # Legacy migration only: never overwrite a report this run just
+            # generated in the destination with a stale root-level file.
+            if (Test-Path -LiteralPath $destFile) {
+                $existing = Get-Item -LiteralPath $destFile -ErrorAction SilentlyContinue
+                if ($existing -and $existing.LastWriteTimeUtc -ge $file.LastWriteTimeUtc) { continue }
+            }
             Move-Item -LiteralPath $file.FullName -Destination $destFile -Force -ErrorAction Stop
         } catch { }
     }
