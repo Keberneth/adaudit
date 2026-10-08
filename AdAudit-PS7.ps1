@@ -57,7 +57,7 @@
                     Password Audit scripts renamed to Invoke-PwnedPasswordCheck.ps1 and
                     Invoke-SamePasswordCheck.ps1 and are launchable from the GUI, separate from
                     -all. Checks\Invoke-LateralMovementCheck.ps1 moved into the Checks folder.
-            [X] Version 8.9 - 03/07/2026
+            [ ] Version 8.9 - 03/07/2026
                 Code-review fix pass (correctness, duplication, efficiency, report/output clarity).
                 Correctness fixes:
                     - Removed a stray top-level dispatch that ran the InactiveComputers check
@@ -102,7 +102,7 @@
                     file headers, admin-account terminology (RID 500, not "Local Administrator"),
                     trust-risk wording, and -select/-exclude trimming + usage docs. -KeepLegacyArtifacts
                     now clears prior-run evidence files at startup (fixes append-across-runs).
-            [X] Version 8.8 - 08/05/2026
+            [ ] Version 8.8 - 08/05/2026
                 Added Get-ADHealth (-adhealth / -ad-health / -health). New AD platform
                     health check covering replication health, DC diagnostics (dcdiag),
                     SYSVOL/DFSR backlog, NTDS database, time synchronization, core AD
