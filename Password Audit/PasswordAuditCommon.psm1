@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Shared helpers for the Password Audit scripts (pwned_password_prof.ps1 and same_passwd_prof.ps1).
+Shared helpers for the Password Audit scripts (Invoke-PwnedPasswordCheck.ps1 and Invoke-SamePasswordCheck.ps1).
 
 .DESCRIPTION
 Centralizes the functions that were previously copy-pasted across both scripts:

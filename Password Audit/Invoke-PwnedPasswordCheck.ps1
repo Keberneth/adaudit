@@ -24,10 +24,10 @@ a single informational row.
 - Account with rights required for Get-ADReplAccount
 
 .EXAMPLES
-.\pwned_password_prof.ps1
-.\pwned_password_prof.ps1 -Server dc01.contoso.local
-.\pwned_password_prof.ps1 -OutCsv C:\Temp\PWNED_PASSWORD_HASH.csv
-.\pwned_password_prof.ps1 -IncludeComputers
+.\Invoke-PwnedPasswordCheck.ps1
+.\Invoke-PwnedPasswordCheck.ps1 -Server dc01.contoso.local
+.\Invoke-PwnedPasswordCheck.ps1 -OutCsv C:\Temp\PWNED_PASSWORD_HASH.csv
+.\Invoke-PwnedPasswordCheck.ps1 -IncludeComputers
 #>
 
 [CmdletBinding()]
@@ -136,7 +136,7 @@ Write-Host ("Checking {0} unique NTLM hash(es) against HIBP..." -f $uniqueHashes
 
 # Prefix-batched lookup: one range fetch per 5-char prefix, matched locally (k-anonymity
 # preserved). Returns a map of full-hash -> { Pwned; PwnedCount } including 'LookupFailed'.
-$pwnedCache = Get-PwnedResultsForHashes -Hashes $uniqueHashes -UserAgent 'pwned_password_prof.ps1'
+$pwnedCache = Get-PwnedResultsForHashes -Hashes $uniqueHashes -UserAgent 'Invoke-PwnedPasswordCheck.ps1'
 
 $results = New-Object System.Collections.Generic.List[object]
 $failedResults = New-Object System.Collections.Generic.List[object]

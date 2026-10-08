@@ -16,10 +16,10 @@ Requirements:
 - Account with rights required for Get-ADReplAccount
 
 Examples:
-.\same_passwd_prof.ps1
-.\same_passwd_prof.ps1 -UsersOnly
-.\same_passwd_prof.ps1 -Pwned
-.\same_passwd_prof.ps1 -Server dc01.contoso.local -OutCsv C:\Temp\DUPLICATE_PASSWORDS.csv -Pwned
+.\Invoke-SamePasswordCheck.ps1
+.\Invoke-SamePasswordCheck.ps1 -UsersOnly
+.\Invoke-SamePasswordCheck.ps1 -Pwned
+.\Invoke-SamePasswordCheck.ps1 -Server dc01.contoso.local -OutCsv C:\Temp\DUPLICATE_PASSWORDS.csv -Pwned
 #>
 
 [CmdletBinding()]
@@ -115,7 +115,7 @@ if ($Pwned -and $duplicateGroups.Count -gt 0) {
     # Prefix-batched lookup: one range fetch per 5-char prefix, matched locally (k-anonymity
     # preserved). Returns full-hash -> { Pwned; PwnedCount } including explicit 'LookupFailed'
     # (a failed lookup is NEVER collapsed to 'No').
-    $pwnedCache = Get-PwnedResultsForHashes -Hashes $uniqueDuplicateHashes -UserAgent 'same_passwd_prof.ps1'
+    $pwnedCache = Get-PwnedResultsForHashes -Hashes $uniqueDuplicateHashes -UserAgent 'Invoke-SamePasswordCheck.ps1'
 }
 
 $results = New-Object System.Collections.Generic.List[object]
@@ -164,7 +164,7 @@ foreach ($group in $duplicateGroups) {
 }
 
 if ($results.Count -eq 0) {
-    # Mirror pwned_password_prof.ps1: emit a self-describing informational row instead of a
+    # Mirror Invoke-PwnedPasswordCheck.ps1: emit a self-describing informational row instead of a
     # headerless empty CSV when there are no duplicate-password groups.
     $emptyResult = @(
         [pscustomobject]([ordered]@{

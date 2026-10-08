@@ -1,8 +1,23 @@
-# Script description
-Run scripts: <br>
-**Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "FULL PATH TO SCRIPT"**
-<br><br>
-`pwned_password_prof.ps1` checks Active Directory account NTLM hashes against the  
+# Password Audit
+
+Two standalone scripts that read NTLM hashes through DSInternals replication (`Get-ADReplAccount`, so the account running them needs replication rights). They are deliberately **separate from the audit run**: `AdAudit-PS7.ps1 -all` never runs them. Start them from the GUI (`ADAudit-GUI.ps1`, section "Password Audit") or from a PowerShell 7 prompt:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\Invoke-PwnedPasswordCheck.ps1 [-Server dc01.contoso.local] [-OutCsv <path>] [-IncludeComputers]
+.\Invoke-SamePasswordCheck.ps1  [-Server dc01.contoso.local] [-OutCsv <path>] [-UsersOnly] [-Pwned]
+```
+
+| Script | What it reports | Default output |
+|---|---|---|
+| `Invoke-PwnedPasswordCheck.ps1` | Accounts whose NTLM hash appears in the Have I Been Pwned corpus (`Yes` / `No` / `LookupFailed`) | `PWNED_PASSWORD_HASH.csv` next to the script (the GUI writes to `<COMPUTERNAME>\Password Audit\`) |
+| `Invoke-SamePasswordCheck.ps1` | Accounts that share the same password (identical NTLM hash), grouped; `-Pwned` also checks each duplicate hash against Have I Been Pwned | `DUPLICATE_PASSWORDS.csv` next to the script (the GUI writes to `<COMPUTERNAME>\Password Audit\`) |
+
+`PasswordAuditCommon.psm1` holds the shared helpers (replication read, hash conversion, HIBP range lookup). NTLM hashes are kept in memory only and are never written to the CSV files.
+
+## How the Have I Been Pwned lookup works
+
+`Invoke-PwnedPasswordCheck.ps1` checks Active Directory account NTLM hashes against the  
 https://api.pwnedpasswords.com service using a **k-anonymity range query**.
 
 This ensures the script **never sends the full NTLM hash over the network**.

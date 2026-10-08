@@ -32,9 +32,11 @@
         and users can be filtered and followed hop by hop.
 
         Runs standalone, from AdAudit-PS7.ps1 (-lateralmovement, or -all) and from the GUI.
-        When dot-sourced by AdAudit-PS7.ps1 it reuses the main script's logging,
-        not-assessed tracking, Nessus export and report styling. Standalone it needs only
-        the ActiveDirectory module (RSAT).
+        When dot-sourced by AdAudit-PS7.ps1 it reuses the runner's logging, not-assessed
+        tracking, Nessus export and report styling (Library\ADAudit.Common.ps1). Standalone
+        it needs only the ActiveDirectory module (RSAT). Unlike the other Checks\ files it
+        is self-contained with its own parameters, so the runner dot-sources it at run time
+        with the arguments it needs instead of loading it at startup.
 
         What this check can NOT see (use BloodHound / Delegated-permissions report for that):
         local Administrators groups on member servers, GPO Restricted Groups / Group
@@ -114,15 +116,15 @@
         Return the analysis result object (graph, findings, summary).
 
     .EXAMPLE
-        .\Invoke-LateralMovementCheck.ps1
+        .\Checks\Invoke-LateralMovementCheck.ps1
         Analyses the current domain, writes .\<COMPUTERNAME>\Raw Data\Source\LateralMovement\*
         and .\<COMPUTERNAME>\HTML Reports\Lateral-Movement.html
 
     .EXAMPLE
-        .\Invoke-LateralMovementCheck.ps1 -OutputRoot D:\Audit\CORP -Tier0Groups 'PAM-T0-Admins','ADFS-Admins'
+        .\Checks\Invoke-LateralMovementCheck.ps1 -OutputRoot D:\Audit\CORP -Tier0Groups 'PAM-T0-Admins','ADFS-Admins'
 
     .EXAMPLE
-        .\Invoke-LateralMovementCheck.ps1 -BaselinePath .\baseline\lateral_movement_edges.csv
+        .\Checks\Invoke-LateralMovementCheck.ps1 -BaselinePath .\baseline\lateral_movement_edges.csv
         Reports group-to-group edges added/removed since the baseline.
 
     .EXAMPLE
@@ -136,7 +138,7 @@
         Version: 1.0 - 08/10/2026
         Requires PowerShell 7 and the ActiveDirectory module. Read-only - never modifies AD.
 
-        Rule ids (LM01-LM21) are documented in the 'Rules & guidance' tab of the HTML map and
+        Rule ids (LM01-LM23) are documented in the 'Rules & guidance' tab of the HTML map and
         in lateral_movement.txt. The reasoning follows the AGDLP model (Accounts -> Global
         role groups -> Domain Local resource groups -> Permissions) and the Microsoft
         tiering / Enterprise Access model.
@@ -229,8 +231,12 @@ function Get-LmPrimaryNav {
 #region ===================================================== Catalogs
 # Well-known groups. RID-based entries are resolved against the domain SID (or forest root
 # SID for the forest-level groups), BUILTIN entries against S-1-5-32-<rid>. Name entries
-# cover groups without a fixed RID (DnsAdmins, Exchange). Tier: 0 = Tier 0 (control of AD
-# / DCs), 'P' = privileged but not full Tier 0, 'B' = broad (everyone), 'N' = neutral.
+# cover groups without a fixed RID (DnsAdmins, Exchange). Tier: 0 = classic Tier 0 (full
+# control of AD / the forest: Domain/Enterprise/Schema Admins, Administrators, the three
+# AdminSDHolder operator groups, Key Admins, DC accounts and the Exchange groups that hold
+# rights on the domain), 'P' = privileged (rights on domain controllers or a Tier 0 service,
+# but not AD control - reported on their own severity, never counted as "reaches Tier 0"),
+# 'B' = broad (everyone), 'N' = neutral.
 # Severity = severity of an unexpected principal reaching the group through nesting.
 function Get-LmWellKnownCatalog {
     return @(
@@ -241,22 +247,22 @@ function Get-LmWellKnownCatalog {
         @{ Key='AO';   Rid=548; Where='Builtin'; Name='Account Operators';        Tier=0;   Severity='Critical'; Tag='Can modify most users and groups - including adding itself to other groups'; Why='Account Operators can create and modify accounts and groups that are not protected by AdminSDHolder, and can log on to domain controllers. It is a privilege escalation path that needs no exploit, only Add-ADGroupMember.'; Fix='Keep empty. Delegate create-user / reset-password on specific OUs instead.' }
         @{ Key='SO';   Rid=549; Where='Builtin'; Name='Server Operators';         Tier=0;   Severity='Critical'; Tag='Can log on to DCs, control services, shut down and back up'; Why='Server Operators can log on locally to domain controllers, start/stop services and change service binaries - that is SYSTEM on a DC with one extra step.'; Fix='Keep empty. Use dedicated Tier 0 accounts for DC maintenance.' }
         @{ Key='BO';   Rid=551; Where='Builtin'; Name='Backup Operators';         Tier=0;   Severity='Critical'; Tag='Can read and write every file on DCs, including NTDS.dit, bypassing ACLs'; Why='SeBackupPrivilege/SeRestorePrivilege on domain controllers means every file is readable and writable regardless of its ACL. Dumping NTDS.dit and SYSTEM gives every password hash in the domain.'; Fix='Keep empty. Back up DCs with a dedicated Tier 0 service identity and treat the backup infrastructure as Tier 0.' }
-        @{ Key='PO';   Rid=550; Where='Builtin'; Name='Print Operators';          Tier=0;   Severity='High';     Tag='Can load printer drivers (kernel code) on DCs and log on locally'; Why='Print Operators can log on to domain controllers and install printer drivers, which run as SYSTEM. Microsoft lists the group as Tier 0.'; Fix='Keep empty. DCs should not be print servers; manage printing from Tier 1 servers.' }
-        @{ Key='REPL'; Rid=552; Where='Builtin'; Name='Replicator';               Tier=0;   Severity='High';     Tag='Legacy file replication group'; Why='Legacy group for NT4 file replication. Nothing should be in it; membership indicates misuse or an attacker hiding privilege.'; Fix='Keep empty.' }
-        @{ Key='GPCO'; Rid=520; Where='Domain';  Name='Group Policy Creator Owners'; Tier=0; Severity='High';   Tag='Can create Group Policy Objects'; Why='Members can create GPOs. Combined with link rights (or a careless OU admin) a GPO runs code as SYSTEM on every targeted machine, including DCs.'; Fix='Keep empty; delegate GPO management to a dedicated Tier 0 group with change control.' }
+        @{ Key='PO';   Rid=550; Where='Builtin'; Name='Print Operators';          Tier='P';   Severity='Medium';     Tag='Can load printer drivers (kernel code) on DCs and log on locally'; Why='Print Operators can log on to domain controllers and install printer drivers, which run as SYSTEM. Microsoft lists the group as Tier 0.'; Fix='Keep empty. DCs should not be print servers; manage printing from Tier 1 servers.' }
+        @{ Key='REPL'; Rid=552; Where='Builtin'; Name='Replicator';               Tier='P';   Severity='Low';     Tag='Legacy file replication group'; Why='Legacy group for NT4 file replication. Nothing should be in it; membership indicates misuse or an attacker hiding privilege.'; Fix='Keep empty.' }
+        @{ Key='GPCO'; Rid=520; Where='Domain';  Name='Group Policy Creator Owners'; Tier='P'; Severity='High';   Tag='Can create Group Policy Objects'; Why='Members can create GPOs. Combined with link rights (or a careless OU admin) a GPO runs code as SYSTEM on every targeted machine, including DCs.'; Fix='Keep empty; delegate GPO management to a dedicated Tier 0 group with change control.' }
         @{ Key='KA';   Rid=526; Where='Domain';  Name='Key Admins';               Tier=0;   Severity='Critical'; Tag='Can write msDS-KeyCredentialLink (shadow credentials) on any object'; Why='Key Admins can add key credentials to any user or computer, including domain controllers, and then authenticate as that object with a certificate - a direct takeover path.'; Fix='Keep empty unless Windows Hello for Business key trust is actively being administered; then use dedicated Tier 0 accounts.' }
         @{ Key='EKA';  Rid=527; Where='Root';    Name='Enterprise Key Admins';    Tier=0;   Severity='Critical'; Tag='Forest-wide shadow credential rights'; Why='Same as Key Admins but forest-wide.'; Fix='Keep empty.' }
-        @{ Key='CP';   Rid=517; Where='Domain';  Name='Cert Publishers';          Tier=0;   Severity='High';     Tag='Can publish certificates to AD (userCertificate / NTAuth)'; Why='Cert Publishers can write certificates to user objects and the enterprise CA containers. With a rogue CA certificate an attacker can mint authentication certificates for any account.'; Fix='Only the certification authority computer accounts belong here.'; ExpectComputers=$true }
+        @{ Key='CP';   Rid=517; Where='Domain';  Name='Cert Publishers';          Tier='P';   Severity='Medium';     Tag='Can publish certificates to AD (userCertificate / NTAuth)'; Why='Cert Publishers can write certificates to user objects and the enterprise CA containers. With a rogue CA certificate an attacker can mint authentication certificates for any account.'; Fix='Only the certification authority computer accounts belong here.'; ExpectComputers=$true }
         @{ Key='DCS';  Rid=516; Where='Domain';  Name='Domain Controllers';       Tier=0;   Severity='Critical'; Tag='Domain controller computer accounts'; Why='Only DC computer accounts belong here. Any other principal gets DC-equivalent rights such as DCSync.'; Fix='Remove every non-DC member immediately and investigate.'; ExpectComputers=$true }
         @{ Key='RODC'; Rid=521; Where='Domain';  Name='Read-only Domain Controllers'; Tier=0; Severity='Critical'; Tag='RODC computer accounts'; Why='Only RODC computer accounts belong here.'; Fix='Remove every non-RODC member and investigate.'; ExpectComputers=$true }
         @{ Key='ERODC';Rid=498; Where='Root';    Name='Enterprise Read-only Domain Controllers'; Tier=0; Severity='Critical'; Tag='Forest RODC accounts'; Why='Only RODC computer accounts belong here.'; Fix='Remove every non-RODC member and investigate.'; ExpectComputers=$true }
-        @{ Key='CDC';  Rid=522; Where='Domain';  Name='Cloneable Domain Controllers'; Tier=0; Severity='Medium'; Tag='DCs allowed to be cloned'; Why='Members may be cloned as virtual DCs. Unexpected members indicate misuse of DC cloning.'; Fix='Only DC accounts that are intentionally cloneable.'; ExpectComputers=$true }
-        @{ Key='IFTB'; Rid=557; Where='Builtin'; Name='Incoming Forest Trust Builders'; Tier=0; Severity='High'; Tag='Can create incoming forest trusts'; Why='A trust is an authentication path. Members can create one-way incoming forest trusts and open the forest to a foreign forest.'; Fix='Keep empty; create trusts with Enterprise Admins under change control.' }
-        @{ Key='DNSA'; Name='DnsAdmins';       Where='Name'; Tier=0; Severity='High'; Tag='Historically code execution as SYSTEM on DCs through the DNS service'; Why='DnsAdmins could load an arbitrary DLL into the DNS service running on domain controllers (CVE-2021-40469). Microsoft hardened it, but the group still manages a Tier 0 service and should be treated as Tier 0.'; Fix='Use dedicated Tier 0 accounts for DNS administration or delegate rights on specific zones.' }
+        @{ Key='CDC';  Rid=522; Where='Domain';  Name='Cloneable Domain Controllers'; Tier='P'; Severity='Medium'; Tag='DCs allowed to be cloned'; Why='Members may be cloned as virtual DCs. Unexpected members indicate misuse of DC cloning.'; Fix='Only DC accounts that are intentionally cloneable.'; ExpectComputers=$true }
+        @{ Key='IFTB'; Rid=557; Where='Builtin'; Name='Incoming Forest Trust Builders'; Tier='P'; Severity='High'; Tag='Can create incoming forest trusts'; Why='A trust is an authentication path. Members can create one-way incoming forest trusts and open the forest to a foreign forest.'; Fix='Keep empty; create trusts with Enterprise Admins under change control.' }
+        @{ Key='DNSA'; Name='DnsAdmins';       Where='Name'; Tier='P'; Severity='High'; Tag='Historically code execution as SYSTEM on DCs through the DNS service'; Why='DnsAdmins could load an arbitrary DLL into the DNS service running on domain controllers (CVE-2021-40469). Microsoft hardened it, but the group still manages a Tier 0 service and should be treated as Tier 0.'; Fix='Use dedicated Tier 0 accounts for DNS administration or delegate rights on specific zones.' }
         @{ Key='DNSP'; Name='DnsUpdateProxy'; Where='Name'; Tier='P'; Severity='Low'; Tag='DHCP servers registering DNS records'; Why='Records created by members are unsecured and can be overwritten by anyone - a name-spoofing path when user accounts are members.'; Fix='Only DHCP server computer accounts belong here.'; ExpectComputers=$true }
-        @{ Key='HVA';  Rid=578; Where='Builtin'; Name='Hyper-V Administrators';   Tier=0;   Severity='High';     Tag='Full control of Hyper-V on DCs / virtualization hosts'; Why='A Hyper-V administrator on a host that runs a domain controller can copy the DC virtual disk and read NTDS.dit offline. Virtualization hosts for DCs are Tier 0.'; Fix='Keep empty on DCs; manage virtualization with dedicated Tier 0 accounts.' }
-        @{ Key='RDU';  Rid=555; Where='Builtin'; Name='Remote Desktop Users';     Tier=0;   Severity='High';     Tag='RDP logon right to domain controllers (if allowed by policy)'; Why='The BUILTIN group in AD applies to domain controllers. If the DC logon-rights policy includes it, members can open an interactive session on a DC.'; Fix='Keep the AD BUILTIN group empty; RDP to member servers is granted through each server''s local group.' }
-        @{ Key='RMU';  Rid=580; Where='Builtin'; Name='Remote Management Users';  Tier=0;   Severity='High';     Tag='WinRM / PowerShell remoting to domain controllers'; Why='Members may connect to the PowerShell remoting endpoint of domain controllers and run code there.'; Fix='Keep empty on DCs; use JEA endpoints with dedicated accounts instead.' }
+        @{ Key='HVA';  Rid=578; Where='Builtin'; Name='Hyper-V Administrators';   Tier='P';   Severity='High';     Tag='Full control of Hyper-V on DCs / virtualization hosts'; Why='A Hyper-V administrator on a host that runs a domain controller can copy the DC virtual disk and read NTDS.dit offline. Virtualization hosts for DCs are Tier 0.'; Fix='Keep empty on DCs; manage virtualization with dedicated Tier 0 accounts.' }
+        @{ Key='RDU';  Rid=555; Where='Builtin'; Name='Remote Desktop Users';     Tier='P';   Severity='Medium';     Tag='RDP logon right to domain controllers (only if the DC logon-rights policy allows it)'; Why='The BUILTIN group in AD applies to domain controllers only. By default it grants nothing on a DC (Allow log on through Remote Desktop Services is not assigned to it there); it matters when that right has been granted. It is not a Tier 0 group - RDP to member servers is governed by each server''s local group.'; Fix='Keep the AD BUILTIN group empty; RDP to member servers is granted through each server''s local group.' }
+        @{ Key='RMU';  Rid=580; Where='Builtin'; Name='Remote Management Users';  Tier='P';   Severity='Medium';     Tag='WinRM / PowerShell remoting to domain controllers'; Why='Members may connect to the PowerShell remoting endpoint of domain controllers and run code there.'; Fix='Keep empty on DCs; use JEA endpoints with dedicated accounts instead.' }
         @{ Key='CO';   Rid=569; Where='Builtin'; Name='Cryptographic Operators';  Tier='P'; Severity='Medium';   Tag='Can perform cryptographic operations on DCs'; Why='Can manage IPsec / crypto configuration on domain controllers.'; Fix='Keep empty.' }
         @{ Key='DCOM'; Rid=562; Where='Builtin'; Name='Distributed COM Users';    Tier='P'; Severity='Medium';   Tag='Can launch / activate DCOM objects on DCs'; Why='DCOM activation rights on domain controllers are a lateral movement primitive (WMI/DCOM execution).'; Fix='Keep empty.' }
         @{ Key='NCO';  Rid=556; Where='Builtin'; Name='Network Configuration Operators'; Tier='P'; Severity='Medium'; Tag='Can change network settings on DCs'; Why='Changing DNS/IP settings of a domain controller enables traffic interception.'; Fix='Keep empty.' }
@@ -379,6 +385,14 @@ function Get-LmRuleCatalog {
                     What='An account is a transitive member of a very large number of groups.'
                     Why='Beyond roughly 1,000 SIDs Kerberos tickets exceed MaxTokenSize and logons / group policy fail; it is also a sign that nobody understands what the account can reach.'
                     Fix='Clean up nested memberships; use resource groups per system instead of per permission; set MaxTokenSize only as a stop-gap.' }
+        'LM22' = @{ Title='Group grants administrative access on many systems through nesting'; Default='High'
+                    What='Through its memberOf chain the group is a transitive member of several administrative groups (local Administrators / sysadmin / RDP style resource groups, matched by name). Everyone who is put into this group is an administrator on every one of those systems, whatever the group''s own name suggests. Severity follows the number of administrative groups reached: 10 or more = Critical, 5 or more = High, 2 or more = Medium.'
+                    Why='This is Tier 1 lateral movement in one edge: an account in an innocent-looking role group (a SQL sysadmin group for one server, a support group) is local administrator on dozens of servers because that group sits inside an aggregation group that sits inside every SRV-*-Administrators group. A single compromised member credential gives an attacker the whole server estate.'
+                    Fix='Cut the chain: remove the group from the aggregation group that carries the administrative memberships (the first hop of the path shown), and add only the people who really administer those servers to a dedicated server-admin role group. Keep per-system admin groups flat (role group -> SRV-x-Administrators) and never nest a resource-style group into another one.' }
+        'LM23' = @{ Title='Account is administrator on many systems'; Default='Medium'
+                    What='An account whose transitive group membership contains several administrative groups (see LM22). The account can log on with administrative rights to every one of those systems.'
+                    Why='The more systems one credential administers, the more places it can be stolen from and the bigger the blast radius when it is. A daily-use account (not a dedicated admin account) with admin on many servers combines browsing/mail exposure with server-wide impact.'
+                    Fix='Give the person a dedicated admin account (-adm / -t1 naming) for server administration and remove the administrative memberships from the daily-use account. Scope admin groups per system or per application tier instead of one group for everything.' }
     }
 }
 
@@ -1378,9 +1392,13 @@ function Invoke-LmFindings {
             if ($members.Count -eq 0) { continue }
             $sev = 'Medium'
             if ($members | Where-Object { $_.ReachesT0 -or $_.AdminIsh -or $_.WkTier -eq 0 -or $_.WkTier -eq 'P' }) { $sev = 'High' }
+            # A loop that carries administrative memberships is one big admin group: every
+            # member of the smallest group in it is administrator everywhere the loop reaches.
+            $loopAdm = ($members | ForEach-Object { $_.AdminReach } | Measure-Object -Maximum).Maximum
+            if ($loopAdm -ge 5 -or ($members | Where-Object { $_.ReachesT0 })) { $sev = 'Critical' }
             $names = @($members | ForEach-Object { $_.Name })
             Add-LmFinding -Data $Data -RuleId 'LM05' -Severity $sev -Subject $members[0] -Kind 'cycle' -Path (($names + $names[0]) -join ' -> ') `
-                -Detail "Groups in a membership loop: $($names -join ', '). They are functionally one group; every member of any of them has the union of all their rights." | Out-Null
+                -Detail "Groups in a membership loop: $($names -join ', '). They are functionally one group; every member of any of them has the union of all their rights$(if ($loopAdm -ge 2) { " - including administrative access on $loopAdm system(s)" })." | Out-Null
         }
     }
 
@@ -1465,6 +1483,38 @@ function Invoke-LmFindings {
         if ($parents.TryGetValue($gid, [ref]$pl)) { $onward = @($pl | ForEach-Object { $nodes[$_].Name }) }
         Add-LmFinding -Data $Data -RuleId 'LM10' -Severity $sev -Subject $g -Kind 'group' -Path "$($nested -join ', ') -> $($g.Name)$(if ($onward.Count) { " -> $($onward -join ', ')" })" `
             -Detail "$(Get-LmGroupLabel $g) aggregates $($g.DirectGroups) groups ($($nested -join ', '))$(if ($onward.Count) { " and is itself nested onward into $($onward -join ', ')" })$(if ($resourceish) { ' and its name suggests it stands in ACLs' }). It behaves as role and resource at the same time$(if ($g.ReachesT0) { " and reaches Tier 0 ($($g.T0Path))" })." | Out-Null
+    }
+
+    # ---- LM22: groups that are administrator on many systems through their memberOf chain
+    $admGroupNames = { param($Node) @($Data.UpClosure[$Node.Id] | ForEach-Object { $nodes[$_] } | Where-Object { $_.AdminIsh -and -not $_.WellKnown } | ForEach-Object { $_.Name } | Sort-Object) }
+    foreach ($gid in $Data.GroupIds) {
+        $g = $nodes[$gid]
+        if ($g.WellKnown -or -not $g.Security -or $g.ReachesT0 -or $g.DeclTier -eq 0) { continue }   # Tier 0 reach is LM01 - already Critical
+        if ($g.AdminReach -lt 2) { continue }
+        $reached = @(& $admGroupNames $g)
+        if ($reached.Count -lt 2) { continue }
+        $sev = if ($reached.Count -ge 10) { 'Critical' } elseif ($reached.Count -ge 5) { 'High' } else { 'Medium' }
+        if ($g.TransUsers -eq 0 -and $g.TransComputers -eq 0) { $sev = 'Low' }   # dormant: nobody holds it yet
+        $pl = $null; $firstHop = @()
+        if ($parents.TryGetValue($gid, [ref]$pl)) { $firstHop = @($pl | ForEach-Object { $nodes[$_] } | Where-Object { $_.Type -eq 'group' -and $_.Security -and -not $_.WellKnown -and ($_.AdminIsh -or $_.AdminReach -gt 0) } | Sort-Object -Property @{ Expression = 'AdminReach'; Descending = $true } | Select-Object -First 3 | ForEach-Object { $_.Name }) }
+        Add-LmFinding -Data $Data -RuleId 'LM22' -Severity $sev -Subject $g -Kind 'group' `
+            -Path "$($g.Name) -> $(if ($firstHop.Count) { ($firstHop -join ' / ') + ' -> ' })$($reached.Count) administrative groups" `
+            -Detail "$(Get-LmGroupLabel $g) is a transitive member of $($reached.Count) administrative group(s): $(($reached | Select-Object -First 15) -join ', ')$(if ($reached.Count -gt 15) { " ... (+$($reached.Count - 15) more)" }). Its $($g.TransUsers) transitive user(s)$(if ($g.TransComputers) { " and $($g.TransComputers) computer(s)" }) are administrators on every one of those systems$(if ($g.InCycle) { ' (the group is part of a membership loop - see LM05)' })." `
+            -Fix "Remove '$($g.Name)' from $(if ($firstHop.Count) { "'$($firstHop[0])'" } else { 'the group that carries the administrative memberships' }) (Remove-ADGroupMember) and grant server administration through a dedicated server-admin role group with reviewed, direct members." | Out-Null
+    }
+
+    # ---- LM23: accounts that are administrator on many systems
+    foreach ($prId in $Data.PrincipalIds) {
+        $u = $nodes[$prId]
+        if ($u.Type -ne 'user' -or $u.ReachesT0 -or $u.AdminReach -lt 5 -or -not $u.Enabled) { continue }   # Tier 0 accounts are LM02/LM14/LM15
+        $pl = $null; $set = New-Object System.Collections.Generic.HashSet[int]
+        if ($parents.TryGetValue($prId, [ref]$pl)) { foreach ($g in $pl) { if ($nodes[$g].Type -eq 'group' -and $nodes[$g].Security) { [void]$set.Add($g); $cs = $null; if ($Data.UpClosure.TryGetValue($g, [ref]$cs)) { $set.UnionWith($cs) } } } }
+        $reached = @($set | ForEach-Object { $nodes[$_] } | Where-Object { $_.AdminIsh -and -not $_.WellKnown } | ForEach-Object { $_.Name } | Sort-Object)
+        if ($reached.Count -lt 5) { continue }
+        $sev = if ($reached.Count -ge 10) { if ($u.AdminNamed) { 'Medium' } else { 'High' } } else { if ($u.AdminNamed) { 'Low' } else { 'Medium' } }
+        $direct = @($pl | ForEach-Object { $nodes[$_] } | Where-Object { $_.Type -eq 'group' -and $_.AdminIsh -and -not $_.WellKnown }).Count
+        Add-LmFinding -Data $Data -RuleId 'LM23' -Severity $sev -Subject $u -Kind 'principal' -Path "$($u.Sam) -> $($reached.Count) administrative groups ($direct direct, $($reached.Count - $direct) through nesting)" `
+            -Detail "$($u.Sam) ($($u.Name)) holds administrative membership on $($reached.Count) system(s)$(if (-not $u.AdminNamed) { ' with an account that does not look like a dedicated admin account' }): $(($reached | Select-Object -First 15) -join ', ')$(if ($reached.Count -gt 15) { " ... (+$($reached.Count - 15) more)" }). $($reached.Count - $direct) of them come through group nesting and are not visible on the account's member-of tab as administrative groups." | Out-Null
     }
 
     # ---- LM11: temporary / legacy groups still granting access
@@ -1593,6 +1643,12 @@ function Invoke-LmFindings {
             continue
         }
         $unexpected = @($members | Where-Object { -not ($g.ExpectComputers -and $_.Type -eq 'computer') })
+        # Default members that are not findings: the built-in Administrator (RID 500) in the
+        # admin groups and GPCO, the built-in Guest (RID 501) in Domain Guests via its primary
+        # group, Exchange Trusted Subsystem inside Exchange Windows Permissions.
+        if ($g.WkKey -in @('DA','EA','SA','GPCO','ADM')) { $unexpected = @($unexpected | Where-Object { -not $_.IsRid500 }) }
+        if ($g.WkKey -eq 'DG')   { $unexpected = @($unexpected | Where-Object { $_.Rid -ne 501 }) }
+        if ($g.WkKey -eq 'EXWP') { $unexpected = @($unexpected | Where-Object { $_.WkKey -ne 'EXTS' }) }
         if ($g.WkKey -eq 'WAAG') { $unexpected = @($unexpected | Where-Object { $_.Sid -ne 'S-1-5-9' }) }
         if ($g.WkKey -eq 'CSDA') { $unexpected = @($unexpected | Where-Object { $_.WkKey -notin @('DU','DC') -and $_.Sid -ne 'S-1-5-11' }) }
         if ($unexpected.Count -eq 0) { continue }
@@ -1855,7 +1911,7 @@ function Write-LmTextReport {
     [void]$sb.AppendLine('What this is:')
     [void]$sb.AppendLine(' Every group membership edge in the domain was followed transitively along memberOf.')
     [void]$sb.AppendLine(' "I am memberOf X" means "I inherit the rights of X" - that is the direction an attacker')
-    [void]$sb.AppendLine(' uses and the direction ADUC hides (it shows one hop). Findings are grouped by rule LM01-LM21;')
+    [void]$sb.AppendLine(' uses and the direction ADUC hides (it shows one hop). Findings are grouped by rule LM01-LM23;')
     [void]$sb.AppendLine(' each rule is explained at the end of this file and in the HTML map (Rules & guidance).')
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('--- INVENTORY ---')
@@ -2174,7 +2230,7 @@ $script:LmHtmlBody = @'
     <label><input type="checkbox" class="scopef" value="DomainLocal" checked> Domain Local (resource)</label>
     <label><input type="checkbox" class="scopef" value="Universal" checked> Universal</label>
     <label><input type="checkbox" id="hideDist" checked> Hide distribution groups</label>
-    <label><input type="checkbox" id="hideEmpty"> Hide groups without members</label>
+    <label><input type="checkbox" id="hideEmpty" checked> Hide groups with no users / computers in them</label>
     <label><input type="checkbox" id="onlyT0"> Only groups that reach Tier 0</label>
     <label><input type="checkbox" id="onlyFind"> Only groups with findings</label>
     <h4>Tier</h4>
@@ -2231,7 +2287,7 @@ $script:LmHtmlBody = @'
   <div class="card"><h2>How to read this report</h2>
   <p>Active Directory has exactly one membership relation: the <code>member</code> attribute of a group. <code>memberOf</code> is the same edge seen from the other side. The direction that matters for security is memberOf: <b>"I am memberOf X" means "I inherit the rights of X"</b>. Rights sit in ACLs (local Administrators, SQL logins, shares) that name a group; everyone inside that group - directly or through any number of nested groups - gets the right when LSASS builds their token at logon.</p>
   <p>The AGDLP model keeps that readable: <b>A</b>ccounts go into <b>G</b>lobal role groups (who someone is), role groups go into <b>D</b>omain <b>L</b>ocal resource groups (what one may do on a named system), and the resource group stands in the ACL (<b>P</b>ermissions). One direction, two levels, every effective right readable in two steps. The rules below catch the ways that model breaks: role in role, resource in resource, users straight into resources, broad groups as building blocks, groups that are both role and resource, and - the expensive one - any chain that ends in a Tier 0 group.</p>
-  <p><b>Tier 0</b> = anything that controls Active Directory or the domain controllers: Domain/Enterprise/Schema Admins, Administrators, the Operators groups, DnsAdmins, Key Admins, Group Policy Creator Owners, Cert Publishers and a few more (see the catalog below). A group that is nested into a Tier 0 group <i>is</i> Tier 0, whatever its name says. Groups and accounts tagged T0/T1/T2 in their name (or via -Tier0Groups/-Tier1Groups/-Tier2Groups) are checked against the tier they actually reach.</p>
+  <p><b>Tier 0</b> = the classic set that controls Active Directory itself: Domain Admins, Enterprise Admins, Schema Admins, BUILTIN\Administrators, the AdminSDHolder operator groups (Account / Server / Backup Operators), Key Admins, the domain-controller accounts and the Exchange groups that hold rights on the domain (Organization Management, Exchange Trusted Subsystem, Exchange Windows Permissions). A group that is nested into a Tier 0 group <i>is</i> Tier 0, whatever its name says. Groups with rights on domain controllers or on a Tier 0 service but without AD control - DnsAdmins, Group Policy Creator Owners, Cert Publishers, Print Operators, Remote Desktop Users, Remote Management Users, Hyper-V Administrators and the like - are shown as <b>privileged</b> [priv] with their own severity; they are never counted as "reaches Tier 0". Groups and accounts tagged T0/T1/T2 in their name (or via -Tier0Groups/-Tier1Groups/-Tier2Groups) are checked against the tier they actually reach.</p>
   <p><b>Limitations.</b> This is the AD group graph only. Local Administrators groups on servers, GPO Restricted Groups, NTFS/share/SQL permissions and ACL-based attack paths (WriteDACL, GenericAll, ...) are outside it - the Dangerous ACL and Delegated-permissions reports and BloodHound cover those. "Admin-ish" and "resource" are estimated from group names and scopes; confirm against the systems where the groups are used.</p>
   </div>
   <div id="rulesList"></div>
@@ -2275,7 +2331,7 @@ function fmtInt(n){ return (n === null || n === undefined) ? '-' : String(n).rep
 // ---------- state
 var state = { mode: 'overview', selected: -1, focus: -1, hops: 3, dirOut: true, dirIn: true, showUsers: true, userCap: 80,
   sev: new Set(['Critical','High','Medium','Low','Information']), scopes: new Set(['Global','DomainLocal','Universal']), tiers: new Set(['0','1','2','none']),
-  hideDist: true, hideEmpty: false, onlyT0: false, onlyFind: false, ou: '', nameRe: null, highlightEdges: new Set(), highlightPath: [], manual: new Map(), manualKey: '' };
+  hideDist: true, hideEmpty: true, onlyT0: false, onlyFind: false, ou: '', nameRe: null, highlightEdges: new Set(), highlightPath: [], manual: new Map(), manualKey: '' };
 
 function readFilters(){
   state.sev = new Set(qa('.sevf').filter(function(c){ return c.checked; }).map(function(c){ return c.value; }));
@@ -2296,9 +2352,12 @@ function groupPasses(o, exemptSinks){
   if (!state.tiers.has(effTierKey(o))) return false;
   if (state.ou && o.ou !== state.ou) return false;
   if (state.nameRe && !state.nameRe.test(o.n) && !state.nameRe.test(o.s)) return false;
-  if (sink && exemptSinks) return true;
+  var empty = (o.tu === 0 && o.dc === 0);
+  // Tier 0 sinks are always drawn (an empty Schema Admins is the expected state); an
+  // empty privileged or ordinary group grants nothing to anyone and only clutters the map.
+  if (sink && exemptSinks) return isSink(o) || !state.hideEmpty || !empty;
   if (!state.sev.has(o.sev || 'Information')) return false;
-  if (state.hideEmpty && (o.du + o.dg + o.dc) === 0 && o.tu === 0) return false;
+  if (state.hideEmpty && empty) return false;
   if (state.onlyT0 && o.dist < 0) return false;
   if (state.onlyFind && !o.rules) return false;
   return true;
@@ -2678,7 +2737,7 @@ qa('.tab').forEach(function(t){ t.addEventListener('click', function(){ showView
   var rl = [];
   Object.keys(LM.rules).forEach(function(k){ var r = LM.rules[k]; rl.push('<div class="rule ' + (SEVCLS[r.max || r.severity] || 'info') + '"><h3>' + esc(k) + ' ' + esc(r.title) + ' ' + (r.count ? badge(r.max) + '<span class="badge badge-tag">' + r.count + ' finding(s)</span>' : '<span class="badge badge-low">no findings</span>') + '<span class="badge badge-tag">default ' + esc(r.severity) + '</span></h3><p><b>What:</b> ' + esc(r.what) + '</p><p><b>Why it matters:</b> ' + esc(r.why) + '</p><p><b>How to fix:</b> ' + esc(r.fix) + '</p></div>'); q('#fRule').insertAdjacentHTML('beforeend', '<option value="' + esc(k) + '">' + esc(k) + ' ' + esc(r.title) + (r.count ? ' (' + r.count + ')' : '') + '</option>'); });
   q('#rulesList').innerHTML = rl.join('');
-  q('#catTable tbody').innerHTML = LM.catalog.map(function(c){ return '<tr><td>' + esc(c.name) + '</td><td>' + (c.tier === '0' ? 'Tier 0' : c.tier === 'P' ? 'privileged' : c.tier === 'B' ? 'broad' : 'neutral') + '</td><td>' + badge(c.severity) + '</td><td>' + esc(c.tag) + '</td><td>' + esc(c.why) + '</td><td>' + esc(c.fix) + '</td></tr>'; }).join('');
+  q('#catTable tbody').innerHTML = LM.catalog.map(function(c){ return '<tr><td>' + esc(c.name) + '</td><td>' + (c.tier === '0' ? 'Tier 0' : c.tier === 'P' ? 'privileged (DC-level, not Tier 0)' : c.tier === 'B' ? 'broad' : 'neutral') + '</td><td>' + badge(c.severity) + '</td><td>' + esc(c.tag) + '</td><td>' + esc(c.why) + '</td><td>' + esc(c.fix) + '</td></tr>'; }).join('');
   // ou filter
   var ous = {}; GROUPS.forEach(function(g){ if (g.ou) ous[g.ou] = (ous[g.ou] || 0) + 1; });
   Object.keys(ous).sort().forEach(function(ou){ q('#ouFilter').insertAdjacentHTML('beforeend', '<option value="' + esc(ou) + '">' + esc(ou) + ' (' + ous[ou] + ')</option>'); });

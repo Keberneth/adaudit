@@ -6,12 +6,15 @@
     - Select audit checks (or run all)
     - Exclude specific checks when running all
     - Install dependencies online or offline
-    - Configure advanced options (DNS zone, delegated permissions)
+    - Configure advanced options (DNS zone, delegated permissions, lateral movement baseline)
     - Preview and execute the audit command
+    - Launch the Password Audit scripts (Password Audit\Invoke-*Check.ps1), which stay
+      separate from the audit run and from -all
 
   Requirements:
     - PowerShell 7 (pwsh.exe)
-    - AdAudit-PS7.ps1 in the same folder as this script
+    - The complete ADAudit folder next to this script: AdAudit-PS7.ps1, Library\, Checks\
+      and (for the password audit) Password Audit\
 #>
 
 [CmdletBinding()]
@@ -36,6 +39,16 @@ if (-not (Test-Path -LiteralPath $AuditScriptPath)) {
     Write-Error "AdAudit-PS7.ps1 not found in '$ScriptDir'. Place this GUI script in the same folder as AdAudit-PS7.ps1."
     exit 1
 }
+foreach ($required in @('Library\ADAudit.Common.ps1', 'Library\ADAudit.Report.ps1', 'Checks\Invoke-AccountsCheck.ps1')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ScriptDir $required))) {
+        Write-Error "'$required' not found under '$ScriptDir'. Copy the whole ADAudit folder (AdAudit-PS7.ps1, Library\, Checks\, Password Audit\), not only the scripts in the root."
+        exit 1
+    }
+}
+$PasswordAuditDir = Join-Path $ScriptDir 'Password Audit'
+$PwnedScriptPath  = Join-Path $PasswordAuditDir 'Invoke-PwnedPasswordCheck.ps1'
+$SameScriptPath   = Join-Path $PasswordAuditDir 'Invoke-SamePasswordCheck.ps1'
+$PasswordAuditOutDir = Join-Path (Join-Path $ScriptDir $env:COMPUTERNAME) 'Password Audit'
 
 # -------------------------
 # Load WinForms
@@ -292,6 +305,7 @@ $AuditChecks = [ordered]@{
     overlappinggroups    = "Check for overlapping group memberships"
     portconnectivity     = "Test DC TCP ports (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC) from this host and cross-DC via WinRM"
     adhealth             = "AD platform health check (replication, dcdiag, SYSVOL/DFSR, NTDS, time, services, events, sites, recycle bin, group hygiene)"
+    lateralmovement      = "Lateral movement map: group nesting, hidden Tier 0 paths, AGDLP violations, per-user / per-group risk (Invoke-LateralMovementCheck.ps1)"
 }
 
 # -------------------------
@@ -546,6 +560,74 @@ Add-Label "Delegated Output Root:" $y | Out-Null
 $txtDelegOutputRoot = Add-TextBox $y
 $y += $rowHeight + 8
 
+# Lateral movement options
+Add-LabelBold "Lateral Movement Options" $y 300 | Out-Null
+$y += 24
+
+Add-Label "Baseline edges CSV:" $y | Out-Null
+$txtLateralBaseline = Add-TextBox $y
+$y += $rowHeight
+$lblLateralBaselineDesc = Add-Label "lateral_movement_edges.csv from a previous run - new / removed group nestings are reported (LM19)" ($y - 6) $inputWidth $leftInput
+$lblLateralBaselineDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += 22
+
+Add-Label "Extra Tier 0 groups:" $y | Out-Null
+$txtLateralTier0 = Add-TextBox $y
+$y += $rowHeight
+$lblLateralTier0Desc = Add-Label "Comma-separated group names/SIDs to treat as Tier 0 (PAM groups, AD-Admins, backup infrastructure ...)" ($y - 6) $inputWidth $leftInput
+$lblLateralTier0Desc.ForeColor = [System.Drawing.Color]::DimGray
+$y += 22 + 8
+
+Add-Separator $y
+$y += 12
+
+# === PASSWORD AUDIT (separate from the audit run) ===
+Add-LabelBold "Password Audit (separate scripts - not part of 'Run All')" $y | Out-Null
+$y += $rowHeight
+
+$lblPwdHint = Add-Label "Reads NTLM hashes through DSInternals replication (Get-ADReplAccount rights needed). Results: <COMPUTERNAME>\Password Audit\" ($y - 4) $inputWidth $leftInput
+$lblPwdHint.ForeColor = [System.Drawing.Color]::Gray
+$y += 22
+
+$chkPwdPwned = Add-Check "Invoke-PwnedPasswordCheck.ps1" $y $true 280 $leftLabel
+$lblPwdPwnedDesc = Add-Label "Accounts whose NTLM hash appears in Have I Been Pwned (k-anonymity range query, hash never sent)" ($y + 1) 660 ($leftLabel + 286)
+$lblPwdPwnedDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += $rowHeight
+
+$chkPwdIncludeComputers = Add-Check "-IncludeComputers" $y $false 250 ($leftLabel + 30)
+$lblPwdIncDesc = Add-Label "Also check computer accounts" ($y + 1) 500 ($leftLabel + 286)
+$lblPwdIncDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += $rowHeight
+
+$chkPwdSame = Add-Check "Invoke-SamePasswordCheck.ps1" $y $true 280 $leftLabel
+$lblPwdSameDesc = Add-Label "Accounts that share the same password (identical NTLM hash), grouped" ($y + 1) 660 ($leftLabel + 286)
+$lblPwdSameDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += $rowHeight
+
+$chkPwdUsersOnly = Add-Check "-UsersOnly" $y $false 250 ($leftLabel + 30)
+$lblPwdUsersDesc = Add-Label "Skip computer accounts" ($y + 1) 500 ($leftLabel + 286)
+$lblPwdUsersDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += $rowHeight
+
+$chkPwdSamePwned = Add-Check "-Pwned" $y $false 250 ($leftLabel + 30)
+$lblPwdSamePwnedDesc = Add-Label "Also check each duplicate hash against Have I Been Pwned" ($y + 1) 500 ($leftLabel + 286)
+$lblPwdSamePwnedDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += $rowHeight
+
+Add-Label "Domain controller (-Server):" $y | Out-Null
+$txtPwdServer = Add-TextBox $y
+$y += $rowHeight + 4
+
+$txtPwdPreview = Add-TextBox $y -ReadOnly $true -Multiline $true -Height 48 -Width 930
+$txtPwdPreview.Location = New-Object System.Drawing.Point(16, ($y - 3))
+$txtPwdPreview.Size = New-Object System.Drawing.Size(940, 48)
+$txtPwdPreview.Font = New-Object System.Drawing.Font("Consolas", 9)
+$txtPwdPreview.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+$y += 56
+
+$btnRunPwd = Add-Button "Run Password Audit" $y 220 32 $leftLabel
+$y += 44
+
 Add-Separator $y
 $y += 12
 
@@ -615,8 +697,32 @@ function Update-Preview {
     if ($script:chkDelegInherited.Checked)   { $cmd += " -DelegIncludeInherited" }
     if ($script:txtDelegServer.Text.Trim().Trim('"'))  { $cmd += " -DelegServer '" + ($script:txtDelegServer.Text.Trim().Trim('"') -replace "'", "''") + "'" }
     if ($script:txtDelegOutputRoot.Text.Trim().Trim('"')) { $cmd += " -DelegatedOutputRoot '" + ($script:txtDelegOutputRoot.Text.Trim().Trim('"') -replace "'", "''") + "'" }
+    if ($script:txtLateralBaseline.Text.Trim().Trim('"')) { $cmd += " -LateralBaselinePath '" + ($script:txtLateralBaseline.Text.Trim().Trim('"') -replace "'", "''") + "'" }
+    $lateralTier0 = @($script:txtLateralTier0.Text -split '[,;]' | ForEach-Object { $_.Trim().Trim('"').Trim("'") } | Where-Object { $_ })
+    if ($lateralTier0.Count -gt 0) { $cmd += " -LateralTier0Groups " + (($lateralTier0 | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ',') }
 
     $script:txtPreview.Text = $cmd
+}
+
+function Update-PasswordPreview {
+    # Same quoting rules as Update-Preview: the command runs verbatim in a child pwsh.
+    $parts = @()
+    $server = $script:txtPwdServer.Text.Trim().Trim('"')
+    $serverArg = if ($server) { " -Server '" + ($server -replace "'", "''") + "'" } else { '' }
+    $outDir = $script:PasswordAuditOutDir
+    if ($script:chkPwdPwned.Checked) {
+        $p = "& '" + ($script:PwnedScriptPath -replace "'", "''") + "' -OutCsv '" + ((Join-Path $outDir 'PWNED_PASSWORD_HASH.csv') -replace "'", "''") + "'" + $serverArg
+        if ($script:chkPwdIncludeComputers.Checked) { $p += " -IncludeComputers" }
+        $parts += $p
+    }
+    if ($script:chkPwdSame.Checked) {
+        $p = "& '" + ($script:SameScriptPath -replace "'", "''") + "' -OutCsv '" + ((Join-Path $outDir 'DUPLICATE_PASSWORDS.csv') -replace "'", "''") + "'" + $serverArg
+        if ($script:chkPwdUsersOnly.Checked) { $p += " -UsersOnly" }
+        if ($script:chkPwdSamePwned.Checked) { $p += " -Pwned" }
+        $parts += $p
+    }
+    if ($parts.Count -eq 0) { $script:txtPwdPreview.Text = ''; return }
+    $script:txtPwdPreview.Text = "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; " + ($parts -join '; ')
 }
 
 # -------------------------
@@ -669,6 +775,31 @@ $chkDelegInherited.Add_CheckedChanged({ Update-Preview })
 $txtDnsOutputRoot.Add_TextChanged({ Update-Preview })
 $txtDelegServer.Add_TextChanged({ Update-Preview })
 $txtDelegOutputRoot.Add_TextChanged({ Update-Preview })
+$txtLateralBaseline.Add_TextChanged({ Update-Preview })
+$txtLateralTier0.Add_TextChanged({ Update-Preview })
+foreach ($c in @($chkPwdPwned, $chkPwdIncludeComputers, $chkPwdSame, $chkPwdUsersOnly, $chkPwdSamePwned)) { $c.Add_CheckedChanged({ Update-PasswordPreview }) }
+$txtPwdServer.Add_TextChanged({ Update-PasswordPreview })
+
+# Run Password Audit button - launches the selected Password Audit scripts in a new elevated
+# PowerShell 7 window. Kept apart from the audit run on purpose: it needs replication rights
+# and talks to api.pwnedpasswords.com, so it is never part of -all.
+$btnRunPwd.Add_Click({
+    $cmd = $script:txtPwdPreview.Text
+    if ([string]::IsNullOrWhiteSpace($cmd)) {
+        Msg-Error "Select at least one Password Audit script."
+        return
+    }
+    foreach ($p in @($script:PwnedScriptPath, $script:SameScriptPath)) {
+        if (-not (Test-Path -LiteralPath $p)) { Msg-Error "Password Audit script not found: $p`nCopy the whole ADAudit folder including 'Password Audit\'."; return }
+    }
+    try {
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cmd))
+        Start-Process pwsh.exe -ArgumentList '-NoExit','-EncodedCommand',$encoded -Verb RunAs
+        Msg-Info "Password Audit launched in a new PowerShell 7 window.`nResults are written to:`n$($script:PasswordAuditOutDir)"
+    } catch {
+        Msg-Error "Failed to launch the Password Audit: $($_.Exception.Message)"
+    }
+})
 
 # Install Online button
 $btnOnline.Add_Click({
@@ -755,6 +886,7 @@ $btnCancel.Add_Click({
 
 # Initial state
 Update-Preview
+Update-PasswordPreview
 
 # Trigger initial state for exclude section visibility
 foreach ($key in $excludeCheckboxes.Keys) {
