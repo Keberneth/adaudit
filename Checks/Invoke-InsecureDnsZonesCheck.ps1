@@ -86,7 +86,7 @@ Function Get-DNSZoneInsecure {
 
         # Try to query DNS zones; if DNS role is not installed, this will fail and we skip
         try {
-            $zones = @(Get-DnsServerZone -ComputerName $dnsServer -ErrorAction Stop)
+            $zones = @(Get-ADAuditDnsServerZones -ComputerName $dnsServer)
             $insecurezones = @($zones | Where-Object { $_.DynamicUpdate -like '*nonsecure*' })
             foreach ($zone in $zones) {
                 $zoneRows.Add([pscustomobject]@{Target=$dnsServer; Zone=$zone.ZoneName; DynamicUpdate=$zone.DynamicUpdate; Status=$(if ($zone.DynamicUpdate -like '*nonsecure*') {'Finding'} else {'NoInsecureUpdatesDetected'})})
@@ -128,6 +128,25 @@ Function Get-DNSZoneInsecure {
     $coverage | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'dns_security_coverage.csv')
     $zoneRows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'dns_zone_security.csv')
     Write-Both "    [*] DNS coverage: $assessed/$($dcList.Count) DC-hosted DNS candidates assessed. Non-DC DNS servers were not discovered by this check."
+}
+
+function Get-ADAuditDnsServerZones {
+    # Bounded zone enumeration. The DnsServer cmdlets use WSMan/CIM and cannot be
+    # cancelled reliably inside a runspace; remote servers are read in a child process
+    # that is killed when the deadline expires. Local zones are read in-process.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ComputerName)
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $ComputerName
+    $query = {
+        param($Server, $Local)
+        if (-not (Get-Command Get-DnsServerZone -ErrorAction SilentlyContinue)) { Import-Module DnsServer -ErrorAction Stop }
+        $zones = if ($Local) { Get-DnsServerZone -ErrorAction Stop } else { Get-DnsServerZone -ComputerName $Server -ErrorAction Stop }
+        ,@($zones | Select-Object ZoneName, ZoneType, DynamicUpdate, IsDsIntegrated, IsReverseLookupZone, IsAutoCreated)
+    }
+    if (Test-ADAuditLocalComputer $ComputerName) { $zones = & $query $ComputerName $true; return @($zones) }
+    $result = Invoke-ADAuditBoundedOperation -Target $ComputerName -Operation 'DNS zone enumeration' -Transport 'Wsman' -Isolation Process -Activity 'DNS zone security' -ScriptBlock $query -ArgumentList @($ComputerName, $false)
+    $zones = Receive-ADAuditOperationResult -Result $result
+    @($zones)
 }
 
 function Invoke-InsecureDnsZonesCheck {

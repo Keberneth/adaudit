@@ -6,7 +6,8 @@
     - Select audit checks (or run all)
     - Exclude specific checks when running all
     - Install dependencies online or offline
-    - Configure advanced options (DNS zone, delegated permissions, lateral movement baseline)
+    - Configure advanced options (isolated host, remote collection deadline / cache /
+      parallel workers, DNS zone, delegated permissions, lateral movement baseline)
     - Preview and execute the audit command
     - Launch the Password Audit scripts (Password Audit\Invoke-*Check.ps1), which stay
       separate from the audit run and from -all
@@ -510,12 +511,31 @@ $y += 12
 Add-LabelBold "Advanced Options" $y | Out-Null
 $y += $rowHeight
 
-$chkIsolatedClone = Add-Check "Isolated DC clone" $y $false 250 $leftLabel
-$lblCloneDesc = Add-Label "Local collection; copied directory is not current production posture" ($y + 1) 620 ($leftLabel + 256)
+$chkIsolateHost = Add-Check "Isolated host (-IsolateHost)" $y $false 250 $leftLabel
+$lblIsolateDesc = Add-Label "Audit an isolated copy of a DC: local collection only; the copied directory is not current production posture" ($y + 1) 680 ($leftLabel + 256)
+$lblIsolateDesc.ForeColor = [System.Drawing.Color]::DimGray
 $y += $rowHeight
 Add-Label "Snapshot date (YYYY-MM-DD):" $y 300 | Out-Null
 $txtSnapshotDate = Add-TextBox $y
 $txtSnapshotDate.Enabled = $false
+$y += $rowHeight + 4
+
+Add-LabelBold "Remote Collection" $y 300 | Out-Null
+$y += 24
+Add-Label "Target deadline (seconds):" $y | Out-Null
+$txtTargetTimeout = Add-TextBox $y -Width 120
+$lblTargetTimeoutDesc = Add-Label "-TargetTimeoutSec 5-3600; default 60 per remote target operation including transport fallback" ($y + 1) 540 ($leftInput + 130)
+$lblTargetTimeoutDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += $rowHeight
+Add-Label "Connection cache (seconds):" $y | Out-Null
+$txtConnectionCache = Add-TextBox $y -Width 120
+$lblConnectionCacheDesc = Add-Label "-ConnectionCacheSec 0-86400; default 300 before an unreachable target/protocol is retried" ($y + 1) 540 ($leftInput + 130)
+$lblConnectionCacheDesc.ForeColor = [System.Drawing.Color]::DimGray
+$y += $rowHeight
+Add-Label "Parallel target workers:" $y | Out-Null
+$txtMaxConcurrency = Add-TextBox $y -Width 120
+$lblMaxConcurrencyDesc = Add-Label "-MaxConcurrency 1-16; default 2 (1 = serial troubleshooting mode)" ($y + 1) 540 ($leftInput + 130)
+$lblMaxConcurrencyDesc.ForeColor = [System.Drawing.Color]::DimGray
 $y += $rowHeight + 4
 
 $chkKeepLegacy = Add-Check "-KeepLegacyArtifacts" $y $false 250 $leftLabel
@@ -696,9 +716,17 @@ function Update-Preview {
     }
 
     # Advanced options
-    if ($script:chkIsolatedClone.Checked) {
-        $cmd += " -IsolatedClone"
+    if ($script:chkIsolateHost.Checked) {
+        $cmd += " -IsolateHost"
         if ($script:txtSnapshotDate.Text.Trim()) { $cmd += " -SnapshotDate '" + ($script:txtSnapshotDate.Text.Trim() -replace "'", "''") + "'" }
+    }
+    foreach ($numeric in @(
+        @{ Box = $script:txtTargetTimeout; Switch = '-TargetTimeoutSec' },
+        @{ Box = $script:txtConnectionCache; Switch = '-ConnectionCacheSec' },
+        @{ Box = $script:txtMaxConcurrency; Switch = '-MaxConcurrency' }
+    )) {
+        $value = $numeric.Box.Text.Trim()
+        if ($value) { $cmd += " $($numeric.Switch) $value" }
     }
     if ($script:chkKeepLegacy.Checked)       { $cmd += " -KeepLegacyArtifacts" }
     if ($script:chkDnsRecordCounts.Checked)  { $cmd += " -DnsIncludeRecordCounts" }
@@ -779,8 +807,37 @@ foreach ($key in $excludeCheckboxes.Keys) {
     $excludeCheckboxes[$key].Add_CheckedChanged({ Update-Preview })
 }
 $chkKeepLegacy.Add_CheckedChanged({ Update-Preview })
-$chkIsolatedClone.Add_CheckedChanged({ $script:txtSnapshotDate.Enabled = $script:chkIsolatedClone.Checked; Update-Preview })
+$chkIsolateHost.Add_CheckedChanged({ $script:txtSnapshotDate.Enabled = $script:chkIsolateHost.Checked; if (-not $script:chkIsolateHost.Checked) { $script:txtSnapshotDate.Text = '' }; Update-Preview })
 $txtSnapshotDate.Add_TextChanged({ Update-Preview })
+$txtTargetTimeout.Add_TextChanged({ Update-Preview })
+$txtConnectionCache.Add_TextChanged({ Update-Preview })
+$txtMaxConcurrency.Add_TextChanged({ Update-Preview })
+
+function Test-AuditOptionInput {
+    # Validates the free-text options before launch so an invalid value is reported
+    # in the GUI instead of failing in the audit window. Returns $null when valid.
+    if ($script:chkIsolateHost.Checked -and $script:txtSnapshotDate.Text.Trim()) {
+        $date = $script:txtSnapshotDate.Text.Trim()
+        $parsed = [datetime]::MinValue
+        if ($date -notmatch '^\d{4}-\d{2}-\d{2}$' -or -not [datetime]::TryParseExact($date, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            return "Snapshot date '$date' is not a valid calendar date. Use YYYY-MM-DD."
+        }
+        if ($parsed.Date -gt (Get-Date).Date) { return "Snapshot date '$date' is in the future. The snapshot date describes when the copy was taken." }
+    }
+    foreach ($numeric in @(
+        @{ Box = $script:txtTargetTimeout; Name = 'Target deadline'; Min = 5; Max = 3600 },
+        @{ Box = $script:txtConnectionCache; Name = 'Connection cache'; Min = 0; Max = 86400 },
+        @{ Box = $script:txtMaxConcurrency; Name = 'Parallel target workers'; Min = 1; Max = 16 }
+    )) {
+        $value = $numeric.Box.Text.Trim()
+        if (-not $value) { continue }
+        $number = 0
+        if (-not [int]::TryParse($value, [ref]$number) -or $number -lt $numeric.Min -or $number -gt $numeric.Max) {
+            return "$($numeric.Name) must be a whole number between $($numeric.Min) and $($numeric.Max) (or empty for the default)."
+        }
+    }
+    $null
+}
 $chkDnsRecordCounts.Add_CheckedChanged({ Update-Preview })
 $chkDnsSystemZones.Add_CheckedChanged({ Update-Preview })
 $chkDelegSystem.Add_CheckedChanged({ Update-Preview })
@@ -881,9 +938,13 @@ $btnRun.Add_Click({
         }
     }
 
+    $inputProblem = Test-AuditOptionInput
+    if ($inputProblem) { Msg-Error $inputProblem; return }
+
     try {
         # Launch via EncodedCommand so paths containing spaces/quotes cannot be
         # corrupted by Start-Process argument joining or child-pwsh quote stripping.
+        # The launched command is exactly the preview text, so preview and arguments agree.
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cmd))
         Start-Process pwsh.exe -ArgumentList '-NoExit','-EncodedCommand',$encoded -Verb RunAs
         # Close the GUI and its PowerShell window after launching the audit

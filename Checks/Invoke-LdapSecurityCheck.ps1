@@ -21,11 +21,12 @@ function Get-ADAuditAnonymousReadOutcome {
 }
 
 function Test-ADAuditLdapsEndpoint {
-    param([string]$ComputerName)
+    # -Address: resolved address to connect to; the certificate is still validated against $ComputerName.
+    param([string]$ComputerName, [string]$Address = '')
     $tcp = $null; $tls = $null
     try {
         $tcp = [Net.Sockets.TcpClient]::new()
-        $connect = $tcp.ConnectAsync($ComputerName,636)
+        $connect = $tcp.ConnectAsync($(if ($Address) { $Address } else { $ComputerName }),636)
         if (-not $connect.Wait(5000)) { throw 'TCP connection timeout on 636.' }
         $connect.GetAwaiter().GetResult()
         $tcp.ReceiveTimeout = 5000; $tcp.SendTimeout = 5000
@@ -82,12 +83,21 @@ function Get-LDAPSecurity {
             }
         } elseif ($cb.Success) { $cbDetail='Channel-binding value is absent; effective OS/deployment default was not confirmed.' }
         $rows.Add([pscustomobject]@{Target=$dc; Control='LDAPChannelBinding'; Status=$cbStatus; Severity=$(if ($cbStatus -eq 'Finding') {'Medium'} else {'Info'}); Detail=$cbDetail})
-        $ldaps = Test-ADAuditLdapsEndpoint -ComputerName $dc
+        # One bounded resolution per DC; a name that does not resolve is recorded without
+        # paying the LDAPS and anonymous-bind timeouts, and probes use the resolved address.
+        $dcResolution = Resolve-ADAuditTargetAddresses -ComputerName $dc
+        if ($dcResolution.Status -eq 'Unresolvable') {
+            $rows.Add([pscustomobject]@{Target=$dc; Control='LDAPSEndpoint'; Status='NotAssessed'; Severity='Info'; Detail="LDAPS endpoint not probed: $($dcResolution.Detail) This does not prove a missing certificate or plaintext LDAP."})
+            $rows.Add([pscustomobject]@{Target=$dc; Control='AnonymousDomainRead'; Status='NotAssessed'; Severity='Info'; Detail="Anonymous LDAP test not run: $($dcResolution.Detail)"})
+            continue
+        }
+        $dcAddress = if ($dcResolution.Status -eq 'Resolved') { [string]@($dcResolution.Addresses)[0] } else { $dc }
+        $ldaps = Test-ADAuditLdapsEndpoint -ComputerName $dc -Address $dcAddress
         $rows.Add([pscustomobject]@{Target=$dc; Control='LDAPSEndpoint'; Status=$ldaps.Status; Severity='Info'; Detail=$ldaps.Detail})
         $connection = $null
         $anonymousStatus = 'NotAssessed'; $anonymousDetail = ''
         try {
-            $connection = [System.DirectoryServices.Protocols.LdapConnection]::new("${dc}:389")
+            $connection = [System.DirectoryServices.Protocols.LdapConnection]::new("${dcAddress}:389")
             $connection.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
             $connection.SessionOptions.ProtocolVersion = 3
             $connection.Timeout = [TimeSpan]::FromSeconds(5)

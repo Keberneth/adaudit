@@ -2490,7 +2490,7 @@ $js
         try { $runMetadata = Get-Content -LiteralPath $runMetadataPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
         catch { Add-ReportIssue $runMetadataPath $_.Exception.Message }
     }
-    $reportIsClone = $runMetadata -and $runMetadata.PSObject.Properties['AssessmentMode'] -and $runMetadata.AssessmentMode -eq 'IsolatedClone'
+    $reportIsClone = $runMetadata -and $runMetadata.PSObject.Properties['AssessmentMode'] -and (Test-ADAuditIsolatedAssessmentMode $runMetadata.AssessmentMode)
 
     # Structured password evidence is authoritative, including empty or unreadable results.
     $passwordEvidencePath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'password_quality_findings.csv')
@@ -3501,19 +3501,33 @@ $js
     foreach ($row in $failureRows) { $coverageDetails.Add("$($row.CheckName): $($row.ErrorMessage)") | Out-Null }
     foreach ($row in $ReportIssues) { $coverageDetails.Add("$($row.CheckName) / $([System.IO.Path]::GetFileName($row.Target)): $($row.Reason)") | Out-Null }
     $coverageDetailHtml = ($coverageDetails | ForEach-Object { '<li>' + (HtmlEncode $_) + '</li>' }) -join "`n"
+    # Collection outcomes (timeout, unreachable, access denied, unsupported, excluded) stay
+    # distinct so a deadline expiry is never read as an access problem or vice versa.
+    $outcomeBreakdown = ''
+    $outcomeGroups = @($notAssessedRows | Where-Object { $_.PSObject.Properties['Outcome'] -and $_.Outcome } | Group-Object Outcome | Sort-Object Name)
+    if ($outcomeGroups.Count -gt 0) { $outcomeBreakdown = ' By collection outcome: ' + (($outcomeGroups | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', ') + '.' }
+    $collectionNote = ''
+    if ($runMetadata -and $runMetadata.PSObject.Properties['Collection'] -and $runMetadata.Collection) {
+        $collectionSettings = $runMetadata.Collection
+        $collectionNote = "Remote collection: $($collectionSettings.TargetTimeoutSec) s deadline per target operation including transport fallback; connection failures cached for $($collectionSettings.ConnectionCacheSec) s; up to $($collectionSettings.MaxConcurrency) parallel target worker(s)."
+        if ($collectionSettings.Workers -and [int]$collectionSettings.Workers.OrphansRemaining -gt 0) { $collectionNote += " $($collectionSettings.Workers.OrphansRemaining) collection worker(s) could not be stopped at the deadline and were abandoned; their targets are recorded as not assessed." }
+        $transportFailures = @($collectionSettings.TransportFailures)
+        if ($transportFailures.Count -gt 0) { $collectionNote += ' Transport failures recorded: ' + (($transportFailures | ForEach-Object { "$($_.Target)/$($_.Protocol) $($_.Outcome)" }) -join ', ') + '.' }
+    }
     $statusTableHtml = if ($selectedStatuses.Count -gt 0) { New-PreviewTableHtml -Rows $selectedStatuses -Columns @('CheckName','Status','Reason','NotAssessedCount','FailureCount') -MaxRows 250 } else { '<p>No execution manifest was available. Missing evidence cannot be treated as a pass.</p>' }
     $scopeDomain = if ($runMetadata -and $runMetadata.Domain) { [string]$runMetadata.Domain } else { 'Not recorded' }
     $scopeForest = if ($runMetadata -and $runMetadata.Forest) { [string]$runMetadata.Forest } else { 'Not recorded' }
     $scopeSelected = if ($runMetadata) { @($runMetadata.SelectedChecks) -join ', ' } else { 'Not recorded' }
     $scopeExcluded = if ($runMetadata) { @($runMetadata.ExcludedChecks) -join ', ' } else { 'Not recorded' }
-    $cloneNotice = Get-ADAuditCloneNotice -IsolatedClone ($runMetadata -and $runMetadata.PSObject.Properties['AssessmentMode'] -and $runMetadata.AssessmentMode -eq 'IsolatedClone') -SnapshotDate $(if ($runMetadata -and $runMetadata.PSObject.Properties['SnapshotDate']) { [string]$runMetadata.SnapshotDate } else { '' })
+    $cloneNotice = Get-ADAuditCloneNotice -IsolatedClone ($runMetadata -and $runMetadata.PSObject.Properties['AssessmentMode'] -and (Test-ADAuditIsolatedAssessmentMode $runMetadata.AssessmentMode)) -SnapshotDate $(if ($runMetadata -and $runMetadata.PSObject.Properties['SnapshotDate']) { [string]$runMetadata.SnapshotDate } else { '' })
     $coverageHtml = @"
 <section class="section hero" id="assessment-coverage">
   $cloneNotice
   <h2>Assessment scope and coverage</h2>
   <p><b>$coverageLabel</b>. Selected checks: $($selectedStatuses.Count); completed without recorded gaps: $completedChecks; partial: $partialChecks; failed: $failedChecks; not run: $notRunChecks.</p>
   <p>Domain: <span class="mono">$(HtmlEncode $scopeDomain)</span> | Forest: <span class="mono">$(HtmlEncode $scopeForest)</span><br>Selected: $(HtmlEncode $scopeSelected)<br>Excluded: $(HtmlEncode $scopeExcluded)</p>
-  <p>Not assessed observations: $($notAssessedRows.Count); recorded failures: $($failureRows.Count); report evidence issues: $($ReportIssues.Count). Completion describes collection, not a pass on every control. Unselected checks and unqueried targets are outside this assessment.</p>
+  <p>Not assessed observations: $($notAssessedRows.Count); recorded failures: $($failureRows.Count); report evidence issues: $($ReportIssues.Count).$(HtmlEncode $outcomeBreakdown) Completion describes collection, not a pass on every control. Unselected checks and unqueried targets are outside this assessment.</p>
+  $(if ($collectionNote) { "<p>$(HtmlEncode $collectionNote)</p>" })
   <p>Each finding group represents one reported condition and can contain multiple affected objects. Information entries and disabled-account hygiene with score 0 do not add active-exposure points. A score of 0 is not a certification that the environment is secure.</p>
   <details><summary>Check execution and coverage details</summary>$statusTableHtml<ul>$coverageDetailHtml</ul></details>
 </section>
@@ -4270,7 +4284,7 @@ function Update-CompanionHtmlReports {
         if (-not (Test-Path -LiteralPath $metadataPath)) { continue }
         try {
             $metadata = Get-Content -LiteralPath $metadataPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            if ($metadata.PSObject.Properties['AssessmentMode'] -and $metadata.AssessmentMode -eq 'IsolatedClone') {
+            if ($metadata.PSObject.Properties['AssessmentMode'] -and (Test-ADAuditIsolatedAssessmentMode $metadata.AssessmentMode)) {
                 $snapshot = if ($metadata.PSObject.Properties['SnapshotDate']) { [string]$metadata.SnapshotDate } else { '' }
                 $wrapperCloneNotice = Get-ADAuditCloneNotice -IsolatedClone $true -SnapshotDate $snapshot
             }

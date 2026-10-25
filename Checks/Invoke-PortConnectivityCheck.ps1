@@ -36,8 +36,25 @@ function Test-ADAuditPortTargetResolution {
     param([string]$Target)
     if (Test-ADAuditLocalComputer $Target) { return $true }
     Assert-ADAuditRemoteTargetAllowed -ComputerName $Target
-    try { $null = [System.Net.Dns]::GetHostAddresses($Target); return $true } catch { return $false }
+    # Only a resolved name is probed: thirteen probes of a name the resolver cannot answer
+    # would each wait for resolution and report nothing but timeouts.
+    (Test-ADAuditTargetResolvable -ComputerName $Target) -eq $true
 }
+
+function Get-ADAuditPortResolutionDetail {
+    param([string]$Target)
+    $resolution = Resolve-ADAuditTargetAddresses -ComputerName $Target
+    if ($resolution.Status -eq 'NoAnswer') { return $resolution.Detail }
+    "Name '$Target' did not resolve via DNS from this host."
+}
+
+function Get-ADAuditPortProbeAddress {
+    param([string]$Target)
+    if (Test-ADAuditLocalComputer $Target) { return $Target }
+    Get-ADAuditProbeAddress -ComputerName $Target
+}
+# The probe helpers run inside bounded worker runspaces.
+$script:ADAuditWorkerFunctionNames += @('Test-ADAuditPortEndpoint','Test-ADAuditPortTargetResolution','Get-ADAuditPortResolutionDetail','Get-ADAuditPortProbeAddress')
 
 Function Test-DCPortConnectivity {
     <#
@@ -130,16 +147,14 @@ Function Test-DCPortConnectivity {
     Write-Both ("    [+] Probing {0} DC(s) from this host on {1} TCP endpoints..." -f $dcs.Count, $portCatalog.Count)
     $rows           = New-Object System.Collections.Generic.List[object]
     $unresolvedDcs  = New-Object System.Collections.Generic.List[string]
-    $probeIndex = 0
-    $probeTotal = $dcs.Count * $portCatalog.Count
-    foreach ($dc in $dcs) {
-        $tgt = if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name }
-        Write-ADAuditProgress -Activity 'DC port connectivity' -Status "Resolving $tgt" -PercentComplete ([int](70 * $probeIndex / $probeTotal))
+    # One bounded worker per DC (bounded concurrency); the coordinator merges rows in DC order.
+    $probeResults = Invoke-ADAuditParallelTargets -Targets $dcs -Operation 'TCP endpoint probes' -Activity 'DC port connectivity' -UnitName 'DC' -WorkDescription "$($portCatalog.Count) TCP endpoints" -PercentSpan 70 -TargetLabel { param($dc) if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name } } -Context @{ Catalog = $portCatalog; Source = $env:COMPUTERNAME } -ScriptBlock {
+        param($Target, $Context)
+        $tgt = if ($Target.HostName) { [string]$Target.HostName } else { [string]$Target.Name }
+        $probeRows = New-Object System.Collections.Generic.List[object]
         if (-not (Test-ADAuditPortTargetResolution -Target $tgt)) {
-            $probeIndex += $portCatalog.Count
-            $unresolvedDcs.Add($tgt) | Out-Null
-            $rows.Add([pscustomobject]@{
-                Source     = $env:COMPUTERNAME
+            $probeRows.Add([pscustomobject]@{
+                Source     = $Context.Source
                 Target     = $tgt
                 Port       = 0
                 Proto      = '-'
@@ -147,18 +162,17 @@ Function Test-DCPortConnectivity {
                 Severity   = 'Critical'
                 Required   = $true
                 Open       = $false
-                Error      = "Name '$tgt' did not resolve via DNS from this host."
-                Why        = 'Before any port test we resolve the DC FQDN. If resolution fails the DC cannot be queried at all - usually one of: the DNS server cannot be reached from this host, the DC is decommissioned but still listed in AD, or split-DNS is missing the record.'
+                Error      = (Get-ADAuditPortResolutionDetail -Target $tgt)
+                Why        = 'Before any port test we resolve the DC FQDN. If resolution fails or the resolver does not answer, the DC cannot be queried at all - usually one of: the DNS server cannot be reached from this host, the DC is decommissioned but still listed in AD, or split-DNS is missing the record.'
                 ProbeFrom  = 'this host'
             }) | Out-Null
-            continue
+            return [pscustomobject]@{ Unresolved = $true; Rows = $probeRows.ToArray() }
         }
-        foreach ($p in $portCatalog) {
-            Write-ADAuditProgress -Activity 'DC port connectivity' -Status "$tgt TCP $($p.Port) ($($p.Name))" -PercentComplete ([int](70 * $probeIndex / $probeTotal))
-            $r = Test-ADAuditPortEndpoint -Target $tgt -Port $p.Port
-            $probeIndex++
-            $rows.Add([pscustomobject]@{
-                Source     = $env:COMPUTERNAME
+        $probeAddress = Get-ADAuditPortProbeAddress -Target $tgt
+        foreach ($p in $Context.Catalog) {
+            $r = Test-ADAuditPortEndpoint -Target $probeAddress -Port $p.Port
+            $probeRows.Add([pscustomobject]@{
+                Source     = $Context.Source
                 Target     = $tgt
                 Port       = $p.Port
                 Proto      = $p.Proto
@@ -171,6 +185,16 @@ Function Test-DCPortConnectivity {
                 ProbeFrom  = 'this host'
             }) | Out-Null
         }
+        [pscustomobject]@{ Unresolved = $false; Rows = $probeRows.ToArray() }
+    }
+    foreach ($probeResult in $probeResults) {
+        if ($probeResult.Outcome -ne 'Success') {
+            Register-ADAuditNotAssessed -Name 'DC port connectivity' -Switch 'portconnectivity' -Target $probeResult.Target -Reason "Endpoint probes did not complete: $($probeResult.Error)" -Outcome (Get-ADAuditCoverageOutcome $probeResult.Outcome)
+            continue
+        }
+        $probe = $probeResult.Result
+        if ($probe.Unresolved) { $unresolvedDcs.Add($probeResult.Target) | Out-Null }
+        foreach ($row in @($probe.Rows)) { $rows.Add($row) | Out-Null }
     }
     if ($unresolvedDcs.Count -gt 0) {
         Write-Both ("    [!] {0} DC(s) could not be resolved via DNS - per-port checks skipped: {1}" -f $unresolvedDcs.Count, ($unresolvedDcs -join ', '))
@@ -217,8 +241,10 @@ Function Test-DCPortConnectivity {
             Write-ADAuditProgress -Activity 'DC port connectivity' -Status "Cross-DC source $srcDc" -PercentComplete 75
             try {
                 Assert-ADAuditRemoteTargetAllowed -ComputerName $srcDc
-                $transport = @{ UseSSL = [bool]$winrmSsl[$srcDc] }
-                $remoteResults = Invoke-Command -ComputerName $srcDc @transport -ErrorAction Stop -ArgumentList $allTargets,$portCatalog -ScriptBlock {
+                # Remote execution runs inside a bounded worker so a hung WinRM session is stopped at the deadline.
+                $crossRun = Invoke-ADAuditBoundedOperation -Target $srcDc -Operation 'cross-DC port probes (WinRM)' -Transport 'PSRemoting' -Activity 'DC port connectivity' -PercentComplete 75 -ArgumentList @($srcDc, [bool]$winrmSsl[$srcDc], $allTargets, $portCatalog) -ScriptBlock {
+                  param($SourceDc, $UseSsl, $Targets, $Catalog)
+                  Invoke-Command -ComputerName $SourceDc -UseSSL:$UseSsl -ErrorAction Stop -ArgumentList $Targets,$Catalog -ScriptBlock {
                     param($Targets, $Catalog)
                     $local = $env:COMPUTERNAME
                     $out = New-Object System.Collections.Generic.List[object]
@@ -256,8 +282,10 @@ Function Test-DCPortConnectivity {
                         }
                     }
                     ,$out.ToArray()
+                  }
                 }
-                if ($remoteResults) { foreach ($rr in $remoteResults) { $crossRows.Add($rr) | Out-Null } }
+                $remoteResults = Receive-ADAuditOperationResult -Result $crossRun
+                if ($remoteResults) { foreach ($rr in @($remoteResults)) { $crossRows.Add($rr) | Out-Null } }
             } catch {
                 Write-Both ("    [!] Cross-DC probe from {0} failed: {1}" -f $srcDc, $_.Exception.Message)
                 Register-ADAuditNotAssessed -Name 'Cross-DC port connectivity' -Switch 'portconnectivity' -Target $srcDc -Reason $_.Exception.Message

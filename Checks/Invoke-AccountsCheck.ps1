@@ -1313,11 +1313,12 @@ Function Get-RC4OnlyAccounts {
             continue
         }
         try {
-            $events = @(Get-WinEvent -ComputerName $dc -FilterHashtable @{
+            # Bounded, cancellable read; the local DC's log is read in-process.
+            $events = @(Invoke-ADAuditEventLogQuery -ComputerName $dc -FilterHashtable @{
                 LogName   = 'Security'
                 Id        = @(4768,4769)
                 StartTime = $startTime
-            } -MaxEvents $perDcCap -ErrorAction Stop)
+            } -MaxEvents $perDcCap -Activity 'Kerberos: DC Security event sample' -PercentComplete (($eventDcIndex - 1) / [math]::Max(1,$dcs.Count) * 100))
             $oldestEvent = $events | Sort-Object TimeCreated | Select-Object -First 1
             $eventCoverage.Add([pscustomobject]@{ DomainController=$dc; EventsRead=$events.Count; RequestedStartUTC=$startTime.ToUniversalTime().ToString('o'); OldestReturnedUTC=$(if ($oldestEvent) { $oldestEvent.TimeCreated.ToUniversalTime().ToString('o') } else { '' }); Truncated=($events.Count -ge $perDcCap) })
             if ($events.Count -ge $perDcCap) {

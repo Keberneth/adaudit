@@ -7,8 +7,10 @@
         runner's script scope. Holds the output-folder helpers, console logging, the per-check
         failure wrapper (Invoke-AuditCheck / Invoke-AuditStep), "could not assess" tracking
         (Register-ADAuditNotAssessed), the Nessus export, the shared report CSS / navigation,
-        module import, CIM / registry helpers, the DSInternals replication cache and the
-        optional-dependency installer (-installdeps).
+        module import, CIM / registry helpers, the DSInternals replication cache, the
+        bounded remote-collection layer (transport cache, session reuse, cancellable
+        workers with deadlines, bounded parallel targets, native command isolation)
+        and the optional-dependency installer (-installdeps).
 
         State lives in $script: variables of the runner (CheckFailures, NotAssessed, output
         directories ...). Check files must call these helpers instead of reaching for the
@@ -77,6 +79,7 @@ function Import-ADAuditModule {
 function Get-ADAuditLocalComputerNames {
     # These are local configuration reads, not DNS lookups. Do not treat every
     # FQDN sharing our short name as local: another domain can reuse that name.
+    if ($script:ADAuditLocalComputerNameSnapshot) { return @($script:ADAuditLocalComputerNameSnapshot) }
     $names = @('.', 'localhost', '127.0.0.1', '::1', $env:COMPUTERNAME, [Environment]::MachineName)
     try {
         $ip = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
@@ -96,8 +99,1007 @@ function Test-ADAuditLocalComputer {
 function Assert-ADAuditRemoteTargetAllowed {
     param([string]$ComputerName)
     if ($script:ADAuditIsolatedClone -and -not (Test-ADAuditLocalComputer $ComputerName)) {
-        throw "Isolated-clone mode: remote target '$ComputerName' was intentionally not contacted. Snapshot data cannot establish current production state."
+        throw "Isolated-host mode: remote target '$ComputerName' was intentionally not contacted. Snapshot data cannot establish current production state."
     }
+}
+
+# ---------------------------------------------------------------------------
+# Bounded remote collection (v9.3)
+#
+# Every remote operation against one target runs as a cancellable worker with
+# an end-to-end deadline that covers name resolution, connection setup, the
+# operation itself and any transport fallback. The coordinator (the runner's
+# main runspace) owns the waiting loop, so progress keeps updating while a
+# remote call blocks, and it alone writes coverage records and evidence files.
+#
+# Shared state lives in thread-safe collections that are handed to worker
+# runspaces by reference:
+#   ADAuditTransportCache  - run-scoped, expiring reachability results keyed by
+#                            target|protocol|identity. Only genuine connection
+#                            failures (Unreachable, Timeout) block a retry.
+#   ADAuditCimSessionPool  - reusable CIM sessions keyed by target|protocol.
+#
+# Isolation modes:
+#   Runspace - in-process worker runspace from a small pool (CIM, remoting,
+#              event logs). Stop() cancels the cmdlet; a worker that does not
+#              stop within the grace period is recorded as orphaned.
+#   Process  - out-of-process runspace (pwsh child) for calls that cannot be
+#              cancelled in a runspace (UNC access, directory metadata). The
+#              child process is killed on deadline expiry.
+#   Native tools (dcdiag, repadmin, w32tm) run as separate processes through
+#   Invoke-ADAuditNativeCommand and are killed on deadline expiry.
+#
+# Offline tests set ADAuditWorkerMode = 'InProcess' so command seams and
+# Pester mocks apply; deadlines are then not enforced (documented test seam).
+# ---------------------------------------------------------------------------
+$script:ADAuditTargetTimeoutSec = 60
+$script:ADAuditConnectionCacheSec = 300
+$script:ADAuditCimOperationTimeoutSec = 15
+$script:ADAuditMaxConcurrency = 2
+$script:ADAuditHeartbeatSeconds = 5
+$script:ADAuditHeartbeatLogSeconds = 30
+$script:ADAuditWorkerStopGraceSec = 5
+$script:ADAuditWorkerMode = 'Runspace'
+$script:ADAuditInWorker = $false
+$script:ADAuditLocalComputerNameSnapshot = $null
+$script:ADAuditTargetDnsSuffix = ''
+$script:ADAuditPreflightTimeoutMs = 3000
+# TCP port each transport needs before any session or RPC call can succeed. A closed port is
+# recorded as Unreachable after a short probe instead of waiting for the protocol timeout.
+# PS remoting is absent: the port check chooses HTTP or HTTPS per DC from its own probes.
+$script:ADAuditTransportPorts = @{ Dcom = 135; Rpc = 135; EventLog = 135; Wsman = 5985; Smb = 445; Adws = 9389; Ldap = 389 }
+$script:ADAuditResolutionTimeoutMs = 5000
+# Run-scoped name resolution results (Resolved with addresses, Unresolvable, or NoAnswer when the
+# resolver did not answer in time). Every collector resolves a target once; probes use the address.
+$script:ADAuditResolutionCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:ADAuditTransportIdentity = "$env:USERDOMAIN\$env:USERNAME"
+$script:ADAuditTransportCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:ADAuditCimSessionPool = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:ADAuditWorkerRunspaces = [System.Collections.Generic.List[object]]::new()
+$script:ADAuditProcessRunspaces = [System.Collections.Generic.List[object]]::new()
+$script:ADAuditActiveWorkers = [System.Collections.Generic.List[object]]::new()
+$script:ADAuditOrphanedWorkers = [System.Collections.Generic.List[object]]::new()
+$script:ADAuditWorkerSessionState = $null
+$script:ADAuditWorkerCounter = 0
+$script:ADAuditWorkerStats = @{ RunspacesCreated = 0; ProcessesCreated = 0; Timeouts = 0; Orphaned = 0; ProcessesKilled = 0 }
+# Functions copied into worker runspaces. Checks may append their own worker-safe
+# collectors. Coordinator-only functions (progress, coverage, console, Nessus)
+# are deliberately replaced by guards inside workers.
+$script:ADAuditWorkerFunctionNames = @(
+    'Get-ADAuditTargetKey','Get-ADAuditShortMessage','Test-ADAuditTcpPort','Test-ADAuditTransportPreflight','Test-ADAuditTargetResolvable','Get-ADAuditDnsAddresses','Resolve-ADAuditTargetAddresses','Get-ADAuditProbeAddress','Get-ADAuditLocalComputerNames','Test-ADAuditLocalComputer',
+    'Assert-ADAuditRemoteTargetAllowed','Get-ADAuditOperationOutcome','Get-ADAuditTransportKey','Test-ADAuditTransportBlocked',
+    'Set-ADAuditTransportResult','Get-ADAuditCimSessionLease','Add-ADAuditCimSession','Complete-ADAuditCimSessionLease',
+    'Remove-ADAuditCimSession','Invoke-ADAuditCimRequest','Get-ADAuditCimInstance','Invoke-ADAuditCimMethod',
+    'Get-ADAuditRemoteRegistryValue','Get-ADAuditRemoteRegistryDword','New-ADAuditOperationResult','ConvertTo-ADAuditWorkerOutput',
+    'Invoke-ADAuditInlineOperation','Invoke-ADAuditBoundedOperation','Receive-ADAuditOperationResult','Convert-ADAuditFileTime'
+)
+$script:ADAuditWorkerGuardedFunctions = @('Write-Both','Write-ADAuditProgress','Register-ADAuditNotAssessed','Write-Nessus-Finding','Register-AuditFailure')
+
+function Get-ADAuditTargetKey {
+    # Cache identity of a target. A bare short name is qualified with the audited domain's
+    # DNS suffix (set by Get-Variables) so 'DC2' and 'dc2.example.test' share one entry.
+    param([AllowNull()][AllowEmptyString()][string]$ComputerName)
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) { return '' }
+    $key = $ComputerName.Trim().TrimEnd('.').ToLowerInvariant()
+    if ($key -notmatch '[.:]' -and $key -notin @('localhost') -and $script:ADAuditTargetDnsSuffix) {
+        $key = "$key.$($script:ADAuditTargetDnsSuffix.Trim().TrimEnd('.').ToLowerInvariant())"
+    }
+    $key
+}
+
+function Get-ADAuditShortMessage {
+    param([AllowNull()][AllowEmptyString()][string]$Text, [int]$MaxLength = 140)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $flat = ($Text -replace '\s+', ' ').Trim()
+    if ($flat.Length -le $MaxLength) { return $flat }
+    $flat.Substring(0, $MaxLength - 1).TrimEnd() + '…'
+}
+
+function Test-ADAuditTcpPort {
+    # Bounded TCP connect used as a transport preflight. Resolves through the run cache and
+    # connects to the address, so a slow resolver is paid once per target. Never throws.
+    param([Parameter(Mandatory)][string]$ComputerName, [Parameter(Mandatory)][int]$Port, [int]$TimeoutMs = $script:ADAuditPreflightTimeoutMs)
+    $resolution = Resolve-ADAuditTargetAddresses -ComputerName $ComputerName
+    if ($resolution.Status -eq 'Unresolvable') { return [pscustomobject]@{ Open = $false; Error = $resolution.Detail } }
+    $target = if ($resolution.Status -eq 'Resolved') { [string]@($resolution.Addresses)[0] } else { $ComputerName }
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $async = $client.BeginConnect($target, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return [pscustomobject]@{ Open = $false; Error = "no answer within $TimeoutMs ms" } }
+        $client.EndConnect($async)
+        [pscustomobject]@{ Open = $true; Error = $null }
+    } catch {
+        [pscustomobject]@{ Open = $false; Error = $_.Exception.Message }
+    } finally {
+        if ($client) { try { $client.Close() } catch { } }
+    }
+}
+
+function Test-ADAuditTransportPreflight {
+    # Returns $null when the transport may be attempted. When the transport's TCP port does not
+    # answer within the preflight window the failure is recorded for the cache lifetime and the
+    # entry is returned, so no protocol timeout is paid for a host that is down.
+    param([Parameter(Mandatory)][string]$ComputerName, [Parameter(Mandatory)][string]$Protocol)
+    if (-not $script:ADAuditTransportPorts.ContainsKey($Protocol)) { return $null }
+    if (Test-ADAuditLocalComputer $ComputerName) { return $null }
+    $port = [int]$script:ADAuditTransportPorts[$Protocol]
+    $probe = Test-ADAuditTcpPort -ComputerName $ComputerName -Port $port
+    if ($probe.Open) { return $null }
+    Set-ADAuditTransportResult -ComputerName $ComputerName -Protocol $Protocol -Outcome 'Unreachable' -Message "TCP $port required by $Protocol did not accept a connection ($($probe.Error)); the $Protocol attempt was not made"
+}
+
+function Get-ADAuditDnsAddresses {
+    # Single bounded resolver call (OS resolver: hosts file, cache, DNS). Never throws.
+    param([Parameter(Mandatory)][string]$ComputerName, [int]$TimeoutMs = $script:ADAuditResolutionTimeoutMs)
+    try {
+        $task = [System.Net.Dns]::GetHostAddressesAsync($ComputerName)
+        if (-not $task.Wait($TimeoutMs)) { return [pscustomobject]@{ Status = 'NoAnswer'; Addresses = @(); Detail = "Name resolution for '$ComputerName' did not answer within $([int]($TimeoutMs / 1000)) s from this host." } }
+        $addresses = @($task.Result | Sort-Object { if ($_.AddressFamily -eq 'InterNetwork') { 0 } else { 1 } } | ForEach-Object { $_.IPAddressToString })
+        if ($addresses.Count -eq 0) { return [pscustomobject]@{ Status = 'Unresolvable'; Addresses = @(); Detail = "Name '$ComputerName' did not resolve from this host (no addresses returned)." } }
+        [pscustomobject]@{ Status = 'Resolved'; Addresses = $addresses; Detail = "Resolved to $($addresses -join ', ')." }
+    } catch {
+        $message = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+        [pscustomobject]@{ Status = 'Unresolvable'; Addresses = @(); Detail = "Name '$ComputerName' did not resolve from this host ($message)." }
+    }
+}
+
+function Resolve-ADAuditTargetAddresses {
+    # Cached resolution for the run. Resolved entries live for the run, an unresolvable name for
+    # the connection-cache lifetime and a resolver that did not answer for at most 60 s, so a
+    # slow resolver costs one bounded wait per target instead of one per probe.
+    param([Parameter(Mandatory)][string]$ComputerName)
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($ComputerName.Trim(), [ref]$ip)) { return [pscustomobject]@{ Status = 'Resolved'; Addresses = @($ip.ToString()); Detail = 'Address literal.' } }
+    $key = Get-ADAuditTargetKey $ComputerName
+    $entry = $null
+    if ($script:ADAuditResolutionCache.TryGetValue($key, [ref]$entry) -and $entry.ExpiresUtc -gt [datetime]::UtcNow) { return $entry }
+    $result = Get-ADAuditDnsAddresses -ComputerName $ComputerName
+    $ttl = switch ($result.Status) { 'Resolved' { 3600 } 'NoAnswer' { [Math]::Min(60, [Math]::Max(1, [int]$script:ADAuditConnectionCacheSec)) } default { [Math]::Max(1, [int]$script:ADAuditConnectionCacheSec) } }
+    $entry = [pscustomobject]@{ Target = $key; Status = $result.Status; Addresses = @($result.Addresses); Detail = $result.Detail; RecordedUtc = [datetime]::UtcNow; ExpiresUtc = [datetime]::UtcNow.AddSeconds($ttl) }
+    $script:ADAuditResolutionCache[$key] = $entry
+    $entry
+}
+
+function Test-ADAuditTargetResolvable {
+    # Returns $true (resolved), $false (does not resolve) or $null (resolver did not answer).
+    param([Parameter(Mandatory)][string]$ComputerName, [int]$TimeoutMs = 0)
+    switch ((Resolve-ADAuditTargetAddresses -ComputerName $ComputerName).Status) {
+        'Resolved' { return $true }
+        'Unresolvable' { return $false }
+        default { return $null }
+    }
+}
+
+function Get-ADAuditProbeAddress {
+    # Address to open sockets against: the first resolved address, else the name itself.
+    param([Parameter(Mandatory)][string]$ComputerName)
+    $resolution = Resolve-ADAuditTargetAddresses -ComputerName $ComputerName
+    if ($resolution.Status -eq 'Resolved' -and @($resolution.Addresses).Count -gt 0) { return [string]@($resolution.Addresses)[0] }
+    $ComputerName
+}
+
+function Get-ADAuditOperationOutcome {
+    # Separates collection outcomes: Success means the collection succeeded, not
+    # that a control passed. Only Unreachable and Timeout are cached as
+    # connection failures; AccessDenied and Unsupported never mark a host down.
+    [CmdletBinding()]
+    param([AllowNull()]$ErrorRecord, [string]$Message, [string]$ErrorType)
+    $exception = $null
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $exception = $ErrorRecord.Exception }
+    elseif ($ErrorRecord -is [System.Exception]) { $exception = $ErrorRecord }
+    if ($exception) {
+        if (-not $Message) { $Message = [string]$exception.Message }
+        if (-not $ErrorType) { $ErrorType = $exception.GetType().FullName }
+        $inner = $exception.InnerException
+        $depth = 0
+        while ($inner -and $depth -lt 5) {
+            $Message += ' | ' + $inner.Message
+            $ErrorType += '/' + $inner.GetType().Name
+            if ($inner -is [System.TimeoutException]) { return 'Timeout' }
+            $inner = $inner.InnerException
+            $depth++
+        }
+        if ($exception -is [System.TimeoutException]) { return 'Timeout' }
+        if ($exception -is [System.OperationCanceledException] -or $exception -is [System.Management.Automation.PipelineStoppedException]) { return 'Timeout' }
+        if ($exception -is [System.UnauthorizedAccessException] -or $exception -is [System.Security.SecurityException]) { return 'AccessDenied' }
+    }
+    if ($Message -match '(?i)intentionally not contacted|isolated-host mode|outside isolated-host scope') { return 'Excluded' }
+    if ($Message -match '(?i)\b(timed out|time-?out|deadline)\b') { return 'Timeout' }
+    if ($Message -match '(?i)access (is )?denied|0x80070005|0x80041003|unauthori[sz]ed|E_ACCESSDENIED|logon failure|user name or password is incorrect|not authorized|0x8007052E|0x80070522|credentials (are|were) rejected|authentication (failed|scheme)|TrustedHosts') { return 'AccessDenied' }
+    if ($Message -match '(?i)invalid namespace|invalid class|invalid method|not supported|0x80041010|0x80041002|0x8004100E|0x80041011|provider (load failure|not found)|is not recognized as|unsupported') { return 'Unsupported' }
+    if ($Message -match '(?i)RPC server is unavailable|0x800706BA|server name cannot be resolved|No such host|name resolution|did not resolve|could not contact|server is not operational|cannot connect|connection (refused|reset|failed|was forcibly)|network path was not found|0x80070035|unreachable|WinRM cannot complete the operation|WS-Management service|0x800706BF|0x80070079|host is down|endpoint mapper|semaphore timeout|no logon servers|ServerDown|LDAP server is unavailable|Unable to contact the server|0x8007274C|actively refused|0x80072EFD|unable to resolve') { return 'Unreachable' }
+    if ($ErrorType -match '(?i)SocketException|EndpointNotFound|DirectoryServerDown|ActiveDirectoryServerDown|PSRemotingTransportException|HostNotFound|RpcException') { return 'Unreachable' }
+    'Failed'
+}
+
+function Get-ADAuditTransportKey {
+    param([Parameter(Mandatory)][string]$ComputerName, [Parameter(Mandatory)][string]$Protocol)
+    "$(Get-ADAuditTargetKey $ComputerName)|$($Protocol.ToLowerInvariant())|$($script:ADAuditTransportIdentity.ToLowerInvariant())"
+}
+
+function Test-ADAuditTransportBlocked {
+    # Returns the unexpired connection-failure entry for target+protocol, else $null.
+    param([Parameter(Mandatory)][string]$ComputerName, [Parameter(Mandatory)][string]$Protocol)
+    $key = Get-ADAuditTransportKey -ComputerName $ComputerName -Protocol $Protocol
+    $entry = $null
+    if (-not $script:ADAuditTransportCache.TryGetValue($key, [ref]$entry)) { return $null }
+    if ($entry.ExpiresUtc -le [datetime]::UtcNow) {
+        $removed = $null
+        [void]$script:ADAuditTransportCache.TryRemove($key, [ref]$removed)
+        return $null
+    }
+    if ($entry.Outcome -in @('Unreachable','Timeout')) { return $entry }
+    $null
+}
+
+function Set-ADAuditTransportResult {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$Protocol,
+        [Parameter(Mandatory)][ValidateSet('Reachable','Unreachable','Timeout')][string]$Outcome,
+        [string]$Message = ''
+    )
+    $now = [datetime]::UtcNow
+    $ttl = if ($Outcome -eq 'Reachable') { 3600 } else { [Math]::Max(1, [int]$script:ADAuditConnectionCacheSec) }
+    $entry = [pscustomobject]@{
+        Target = Get-ADAuditTargetKey $ComputerName; Protocol = $Protocol; Identity = $script:ADAuditTransportIdentity
+        Outcome = $Outcome; Message = [string]$Message; RecordedUtc = $now; ExpiresUtc = $now.AddSeconds($ttl)
+    }
+    $script:ADAuditTransportCache[(Get-ADAuditTransportKey -ComputerName $ComputerName -Protocol $Protocol)] = $entry
+    $entry
+}
+
+function Get-ADAuditTransportSummary {
+    # Diagnostic rows for run metadata: transport outcomes only, never query content.
+    @($script:ADAuditTransportCache.Values | Sort-Object Target, Protocol | ForEach-Object {
+        [pscustomobject]@{ Target=$_.Target; Protocol=$_.Protocol; Outcome=$_.Outcome; Message=$_.Message; RecordedUtc=$_.RecordedUtc.ToString('o'); ExpiresUtc=$_.ExpiresUtc.ToString('o') }
+    })
+}
+
+function Get-ADAuditCimSessionLease {
+    # Hands out a pooled session for exclusive use; $null when none is free.
+    param([Parameter(Mandatory)][string]$ComputerName, [Parameter(Mandatory)][string]$Protocol)
+    $key = "$(Get-ADAuditTargetKey $ComputerName)|$($Protocol.ToLowerInvariant())"
+    $entry = $null
+    if (-not $script:ADAuditCimSessionPool.TryGetValue($key, [ref]$entry)) { return $null }
+    if ([System.Threading.Monitor]::TryEnter($entry)) {
+        try {
+            if (-not $entry.InUse) { $entry.InUse = $true; return $entry }
+        } finally { [System.Threading.Monitor]::Exit($entry) }
+    }
+    $null
+}
+
+function Add-ADAuditCimSession {
+    # Registers a new session as in-use; returns the lease. A concurrent worker that
+    # already registered a session for the same key keeps its entry and this session
+    # becomes a transient lease that is disposed on completion.
+    param([Parameter(Mandatory)][string]$ComputerName, [Parameter(Mandatory)][string]$Protocol, [Parameter(Mandatory)]$Session)
+    $key = "$(Get-ADAuditTargetKey $ComputerName)|$($Protocol.ToLowerInvariant())"
+    $entry = [pscustomobject]@{ Key=$key; Target=$ComputerName; Protocol=$Protocol; Session=$Session; InUse=$true; Pooled=$true; CreatedUtc=[datetime]::UtcNow }
+    if (-not $script:ADAuditCimSessionPool.TryAdd($key, $entry)) { $entry.Pooled = $false }
+    $entry
+}
+
+function Complete-ADAuditCimSessionLease {
+    param([Parameter(Mandatory)]$Lease)
+    if ($Lease.Pooled) { $Lease.InUse = $false } else { Remove-ADAuditCimSession -Lease $Lease }
+}
+
+function Remove-ADAuditCimSession {
+    # Evicts a lease from the pool and disposes its session.
+    param([Parameter(Mandatory)]$Lease)
+    if ($Lease.Pooled) {
+        $removed = $null
+        [void]$script:ADAuditCimSessionPool.TryRemove($Lease.Key, [ref]$removed)
+    }
+    $session = $Lease.Session
+    if ($null -eq $session) { return }
+    try {
+        if ($session.PSObject.Methods['Dispose']) { $session.Dispose() }
+        else { $session | Remove-CimSession -ErrorAction SilentlyContinue }
+    } catch { }
+}
+
+function Clear-ADAuditTransportState {
+    # Resets reachability results and disposes pooled sessions. Called at the start
+    # and end of a run so target/protocol results never leak into another run.
+    foreach ($lease in @($script:ADAuditCimSessionPool.Values)) {
+        try { Remove-ADAuditCimSession -Lease $lease } catch { }
+    }
+    $script:ADAuditCimSessionPool.Clear()
+    $script:ADAuditTransportCache.Clear()
+    $script:ADAuditResolutionCache.Clear()
+}
+
+function New-ADAuditOperationResult {
+    param(
+        [string]$Target, [string]$Operation, [Parameter(Mandatory)][string]$Outcome, [string]$Transport = '',
+        [datetime]$StartedUtc = [datetime]::UtcNow, [datetime]$FinishedUtc = [datetime]::UtcNow,
+        [AllowNull()]$Result = $null, [string]$Error = '', [string]$ErrorType = '', [AllowNull()]$ErrorRecord = $null,
+        [string]$Isolation = 'Inline', [int]$TimeoutSec = 0
+    )
+    [pscustomobject]@{
+        PSTypeName = 'ADAudit.OperationResult'
+        Target = $Target; Operation = $Operation; Outcome = $Outcome; Transport = $Transport
+        StartedUtc = $StartedUtc; FinishedUtc = $FinishedUtc; ElapsedSeconds = [Math]::Round(($FinishedUtc - $StartedUtc).TotalSeconds, 3)
+        Result = $Result; Error = $Error; ErrorType = $ErrorType; ErrorRecord = $ErrorRecord; Isolation = $Isolation; TimeoutSec = $TimeoutSec
+    }
+}
+
+function ConvertTo-ADAuditWorkerOutput {
+    param([AllowNull()]$Output)
+    if ($null -eq $Output) { return $null }
+    $items = @($Output)
+    if ($items.Count -eq 0) { return $null }
+    if ($items.Count -eq 1) { return $items[0] }
+    return ,$items
+}
+
+function Invoke-ADAuditInlineOperation {
+    # Synchronous execution with the same typed result as a worker. Used inside
+    # workers (already isolated) and in the InProcess offline test mode.
+    param([Parameter(Mandatory)][scriptblock]$ScriptBlock, [object[]]$ArgumentList = @(), [string]$Target = '', [string]$Operation = '', [int]$TimeoutSec = 0, [string]$Isolation = 'Inline')
+    $started = [datetime]::UtcNow
+    # Non-terminating collection errors must fail the operation, never return empty data.
+    $ErrorActionPreference = 'Stop'
+    try {
+        $output = @(& $ScriptBlock @ArgumentList)
+        New-ADAuditOperationResult -Target $Target -Operation $Operation -Outcome 'Success' -StartedUtc $started -Result (ConvertTo-ADAuditWorkerOutput $output) -Isolation $Isolation -TimeoutSec $TimeoutSec
+    } catch {
+        $outcome = Get-ADAuditOperationOutcome -ErrorRecord $_
+        New-ADAuditOperationResult -Target $Target -Operation $Operation -Outcome $outcome -StartedUtc $started -Error $_.Exception.Message -ErrorType $_.Exception.GetType().FullName -ErrorRecord $_ -Isolation $Isolation -TimeoutSec $TimeoutSec
+    }
+}
+
+function Get-ADAuditWorkerSessionState {
+    if ($script:ADAuditWorkerSessionState) { return $script:ADAuditWorkerSessionState }
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+    foreach ($name in @($script:ADAuditWorkerFunctionNames | Select-Object -Unique)) {
+        $command = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($command) { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, $command.Definition)) }
+    }
+    foreach ($name in $script:ADAuditWorkerGuardedFunctions) {
+        $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, "throw 'ADAudit worker: $name is coordinator-only. Return data from the worker instead.'"))
+    }
+    $variables = @{
+        ADAuditInWorker = $true; ADAuditWorkerMode = 'Runspace'; ADAuditIsWindows = $script:ADAuditIsWindows
+        ADAuditIsolatedClone = [bool]$script:ADAuditIsolatedClone; ADAuditTransportCache = $script:ADAuditTransportCache
+        ADAuditCimSessionPool = $script:ADAuditCimSessionPool; ADAuditConnectionCacheSec = $script:ADAuditConnectionCacheSec
+        ADAuditTargetTimeoutSec = $script:ADAuditTargetTimeoutSec; ADAuditCimOperationTimeoutSec = $script:ADAuditCimOperationTimeoutSec
+        ADAuditTransportIdentity = $script:ADAuditTransportIdentity; ADAuditLocalComputerNameSnapshot = @(Get-ADAuditLocalComputerNames)
+        ADAuditTargetDnsSuffix = [string]$script:ADAuditTargetDnsSuffix; ADAuditPreflightTimeoutMs = $script:ADAuditPreflightTimeoutMs; ADAuditTransportPorts = $script:ADAuditTransportPorts
+        ADAuditResolutionCache = $script:ADAuditResolutionCache; ADAuditResolutionTimeoutMs = $script:ADAuditResolutionTimeoutMs
+        ErrorActionPreference = 'Stop'; ProgressPreference = 'SilentlyContinue'
+    }
+    foreach ($entry in $variables.GetEnumerator()) {
+        $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($entry.Key, $entry.Value, 'ADAudit worker state'))
+    }
+    $script:ADAuditWorkerSessionState = $iss
+    $iss
+}
+
+function Get-ADAuditWorkerRunspace {
+    param([ValidateSet('Runspace','Process')][string]$Isolation = 'Runspace')
+    # Assign inside the branches: an if-expression would enumerate the list into the pipeline.
+    if ($Isolation -eq 'Process') { $pool = $script:ADAuditProcessRunspaces } else { $pool = $script:ADAuditWorkerRunspaces }
+    while ($pool.Count -gt 0) {
+        $candidate = $pool[0]
+        $pool.RemoveAt(0)
+        if ($candidate.Runspace.RunspaceStateInfo.State -eq 'Opened' -and $candidate.Runspace.RunspaceAvailability -eq 'Available') { return $candidate }
+        try { $candidate.Runspace.Dispose() } catch { }
+    }
+    $script:ADAuditWorkerCounter++
+    if ($Isolation -eq 'Process') {
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null)
+        $runspace.Name = "ADAudit-ProcessWorker-$($script:ADAuditWorkerCounter)"
+        $runspace.Open()
+        $processId = $null
+        $probe = [powershell]::Create()
+        try {
+            $probe.Runspace = $runspace
+            $processId = [int](@($probe.AddScript('$PID').Invoke())[0])
+        } finally { $probe.Dispose() }
+        $script:ADAuditWorkerStats.ProcessesCreated++
+        return [pscustomobject]@{ Runspace = $runspace; Isolation = 'Process'; ProcessId = $processId }
+    }
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace((Get-ADAuditWorkerSessionState))
+    $runspace.Name = "ADAudit-Worker-$($script:ADAuditWorkerCounter)"
+    $runspace.ThreadOptions = 'ReuseThread'
+    $runspace.Open()
+    $script:ADAuditWorkerStats.RunspacesCreated++
+    [pscustomobject]@{ Runspace = $runspace; Isolation = 'Runspace'; ProcessId = $null }
+}
+
+function Push-ADAuditWorkerRunspace {
+    param([Parameter(Mandatory)]$Slot)
+    if ($Slot.Runspace.RunspaceStateInfo.State -ne 'Opened') { try { $Slot.Runspace.Dispose() } catch { }; return }
+    if ($Slot.Isolation -eq 'Process') { $script:ADAuditProcessRunspaces.Add($Slot) } else { $script:ADAuditWorkerRunspaces.Add($Slot) }
+}
+
+function Start-ADAuditWorker {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock, [object[]]$ArgumentList = @(), [string]$Target = '', [string]$Operation = '',
+        [int]$TimeoutSec = $script:ADAuditTargetTimeoutSec, [ValidateSet('Runspace','Process')][string]$Isolation = 'Runspace'
+    )
+    $slot = Get-ADAuditWorkerRunspace -Isolation $Isolation
+    $powershell = [powershell]::Create()
+    $powershell.Runspace = $slot.Runspace
+    # One script, no AddStatement: a second pipeline statement never completed under PS 7.6
+    # in testing. ErrorActionPreference is forced inside the script so non-terminating
+    # collection errors become failures instead of empty successful results.
+    $script = "`$ErrorActionPreference = 'Stop'`n& { $($ScriptBlock.ToString()) } @args"
+    [void]$powershell.AddScript($script)
+    foreach ($argument in @($ArgumentList)) { [void]$powershell.AddArgument($argument) }
+    $started = [datetime]::UtcNow
+    $handle = [pscustomobject]@{
+        Target = $Target; Operation = $Operation; Isolation = $Isolation; Slot = $slot; PowerShell = $powershell
+        Async = $null; StartedUtc = $started; DeadlineUtc = $started.AddSeconds([Math]::Max(1, $TimeoutSec)); TimeoutSec = $TimeoutSec; State = 'Running'
+    }
+    $handle.Async = $powershell.BeginInvoke()
+    $script:ADAuditActiveWorkers.Add($handle)
+    $handle
+}
+
+function Resolve-ADAuditWorkerException {
+    # EndInvoke surfaces a worker failure wrapped in RuntimeException/MethodInvocationException,
+    # and a cmdlet error stopped by ErrorActionPreference arrives as ActionPreferenceStopException.
+    # Unwrap to the original exception (CimException, SocketException, ItemNotFound ...) and keep
+    # the original error record (with its FullyQualifiedErrorId) when one is available.
+    param([Parameter(Mandatory)][System.Exception]$Exception, [string]$Target = '')
+    $record = $null
+    for ($depth = 0; $depth -lt 8; $depth++) {
+        if ($Exception -is [System.Management.Automation.ActionPreferenceStopException] -and $Exception.ErrorRecord -and $Exception.ErrorRecord.Exception) {
+            $record = $Exception.ErrorRecord
+            $Exception = $record.Exception
+            continue
+        }
+        $wrapper = $Exception -is [System.Management.Automation.MethodInvocationException] -or $Exception.GetType() -eq [System.Management.Automation.RuntimeException]
+        if ($wrapper -and $Exception.InnerException) {
+            $Exception = $Exception.InnerException
+            $record = $null
+            continue
+        }
+        break
+    }
+    if (-not $record) { $record = [System.Management.Automation.ErrorRecord]::new($Exception, 'ADAuditWorkerFailure', [System.Management.Automation.ErrorCategory]::NotSpecified, $Target) }
+    [pscustomobject]@{ Exception = $Exception; Record = $record }
+}
+
+function Complete-ADAuditWorker {
+    # Collects a finished worker and returns its runspace to the pool.
+    param([Parameter(Mandatory)]$Handle)
+    $result = $null
+    try {
+        $output = $Handle.PowerShell.EndInvoke($Handle.Async)
+        if ($Handle.PowerShell.Streams.Error.Count -gt 0) {
+            $record = $Handle.PowerShell.Streams.Error[0]
+            $result = New-ADAuditOperationResult -Target $Handle.Target -Operation $Handle.Operation -Outcome (Get-ADAuditOperationOutcome -ErrorRecord $record) -StartedUtc $Handle.StartedUtc -Error $record.Exception.Message -ErrorType $record.Exception.GetType().FullName -ErrorRecord $record -Isolation $Handle.Isolation -TimeoutSec $Handle.TimeoutSec
+        } else {
+            $result = New-ADAuditOperationResult -Target $Handle.Target -Operation $Handle.Operation -Outcome 'Success' -StartedUtc $Handle.StartedUtc -Result (ConvertTo-ADAuditWorkerOutput @($output)) -Isolation $Handle.Isolation -TimeoutSec $Handle.TimeoutSec
+        }
+    } catch {
+        $resolved = Resolve-ADAuditWorkerException -Exception $_.Exception -Target $Handle.Target
+        $exception = $resolved.Exception
+        $result = New-ADAuditOperationResult -Target $Handle.Target -Operation $Handle.Operation -Outcome (Get-ADAuditOperationOutcome -ErrorRecord $resolved.Record) -StartedUtc $Handle.StartedUtc -Error $exception.Message -ErrorType $exception.GetType().FullName -ErrorRecord $resolved.Record -Isolation $Handle.Isolation -TimeoutSec $Handle.TimeoutSec
+    } finally {
+        $Handle.State = 'Completed'
+        try { $Handle.PowerShell.Dispose() } catch { }
+        [void]$script:ADAuditActiveWorkers.Remove($Handle)
+        Push-ADAuditWorkerRunspace -Slot $Handle.Slot
+    }
+    $result
+}
+
+function Stop-ADAuditWorker {
+    # Cancels a running worker. Returns a Timeout result; the runspace is never
+    # reused. A worker that ignores Stop within the grace period is tracked as an
+    # orphan and reported in run metadata; a process worker is killed.
+    param([Parameter(Mandatory)]$Handle, [string]$Reason = 'Deadline expired', [int]$GraceSec = $script:ADAuditWorkerStopGraceSec)
+    $Handle.State = 'Stopping'
+    $script:ADAuditWorkerStats.Timeouts++
+    try { [void]$Handle.PowerShell.BeginStop($null, $null) } catch { }
+    $graceEnd = [datetime]::UtcNow.AddSeconds([Math]::Max(0, $GraceSec))
+    while ([datetime]::UtcNow -lt $graceEnd -and $Handle.PowerShell.InvocationStateInfo.State -in @('Running','Stopping')) { Start-Sleep -Milliseconds 50 }
+    $stopped = $Handle.PowerShell.InvocationStateInfo.State -notin @('Running','Stopping')
+    if ($Handle.Isolation -eq 'Process' -and $Handle.Slot.ProcessId) {
+        try { Stop-Process -Id $Handle.Slot.ProcessId -Force -ErrorAction Stop; $script:ADAuditWorkerStats.ProcessesKilled++ } catch { }
+        $stopped = $true
+    }
+    if ($stopped) {
+        try { $Handle.PowerShell.Dispose() } catch { }
+        try { $Handle.Slot.Runspace.Dispose() } catch { }
+        $Handle.State = 'Stopped'
+    } else {
+        $script:ADAuditWorkerStats.Orphaned++
+        $Handle.State = 'Orphaned'
+        $script:ADAuditOrphanedWorkers.Add([pscustomobject]@{ Target=$Handle.Target; Operation=$Handle.Operation; Reason=$Reason; Handle=$Handle; RecordedUtc=[datetime]::UtcNow })
+        try { $Handle.Slot.Runspace.CloseAsync() } catch { }
+    }
+    [void]$script:ADAuditActiveWorkers.Remove($Handle)
+    $elapsed = [Math]::Round(([datetime]::UtcNow - $Handle.StartedUtc).TotalSeconds, 1)
+    $message = "Deadline of $($Handle.TimeoutSec) s expired for $($Handle.Operation) on '$($Handle.Target)' after $elapsed s ($Reason). The worker was $(if ($Handle.State -eq 'Stopped') { 'stopped' } else { 'abandoned and recorded as orphaned' }); completed results for other targets are retained."
+    New-ADAuditOperationResult -Target $Handle.Target -Operation $Handle.Operation -Outcome 'Timeout' -StartedUtc $Handle.StartedUtc -Error $message -ErrorType 'System.TimeoutException' -Isolation $Handle.Isolation -TimeoutSec $Handle.TimeoutSec
+}
+
+function Write-ADAuditWaitHeartbeat {
+    param([string]$Activity, [object[]]$Handles, [string]$Summary = '', [double]$PercentComplete = -1)
+    $now = [datetime]::UtcNow
+    $waits = @($Handles | ForEach-Object { "$($_.Target) $([int]($now - $_.StartedUtc).TotalSeconds)/$($_.TimeoutSec) s" })
+    $status = if ($Summary) { "$Summary; waiting for response: $($waits -join ', ')" } else { "Waiting for response: $($waits -join ', ')" }
+    if (-not $Activity) { $Activity = if ($script:ADAuditProgressLastActivity) { $script:ADAuditProgressLastActivity } else { 'Remote collection' } }
+    Write-ADAuditProgress -Activity $Activity -Status $status -PercentComplete $PercentComplete -Heartbeat
+}
+
+function Invoke-ADAuditBoundedOperation {
+    <#
+    .SYNOPSIS
+        Runs one cancellable collection operation against one target with an end-to-end
+        deadline, emitting waiting heartbeats while the call blocks.
+    .OUTPUTS
+        ADAudit.OperationResult with Outcome Success | Timeout | Unreachable | AccessDenied |
+        Unsupported | Excluded | Failed. Use Receive-ADAuditOperationResult to unwrap or throw.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList = @(),
+        [string]$Target = '',
+        [string]$Operation = 'remote collection',
+        [int]$TimeoutSec = 0,
+        [string]$Activity = '',
+        [double]$PercentComplete = -1,
+        [ValidateSet('Runspace','Process')][string]$Isolation = 'Runspace',
+        [string]$Transport = '',
+        [switch]$Quiet
+    )
+    if ($TimeoutSec -le 0) { $TimeoutSec = $script:ADAuditTargetTimeoutSec }
+    if ($Transport -and $Target) {
+        $blocked = Test-ADAuditTransportBlocked -ComputerName $Target -Protocol $Transport
+        if ($blocked) {
+            $age = [int]([datetime]::UtcNow - $blocked.RecordedUtc).TotalSeconds
+            $message = "$Operation on '$Target' was not attempted: a $Transport connection failure ($($blocked.Outcome)) was recorded $age s ago ($(Get-ADAuditShortMessage $blocked.Message)). Another attempt is allowed after $($blocked.ExpiresUtc.ToLocalTime().ToString('HH:mm:ss'))."
+            return New-ADAuditOperationResult -Target $Target -Operation $Operation -Outcome $blocked.Outcome -Transport $Transport -Error $message -ErrorType 'ADAudit.CachedTransportFailure' -Isolation 'Skipped' -TimeoutSec $TimeoutSec
+        }
+        $preflight = Test-ADAuditTransportPreflight -ComputerName $Target -Protocol $Transport
+        if ($preflight) {
+            return New-ADAuditOperationResult -Target $Target -Operation $Operation -Outcome 'Unreachable' -Transport $Transport -Error "$Operation on '$Target' was not attempted: $($preflight.Message)." -ErrorType 'ADAudit.TransportPreflightFailure' -Isolation 'Skipped' -TimeoutSec $TimeoutSec
+        }
+    }
+    if ($script:ADAuditInWorker -or $script:ADAuditWorkerMode -eq 'InProcess') {
+        $result = Invoke-ADAuditInlineOperation -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -Target $Target -Operation $Operation -TimeoutSec $TimeoutSec
+    } else {
+        $handle = Start-ADAuditWorker -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -Target $Target -Operation $Operation -TimeoutSec $TimeoutSec -Isolation $Isolation
+        $result = $null
+        try {
+            $nextBeat = [datetime]::UtcNow.AddSeconds($script:ADAuditHeartbeatSeconds)
+            while (-not $handle.Async.IsCompleted) {
+                [void]$handle.Async.AsyncWaitHandle.WaitOne(250)
+                if ($handle.Async.IsCompleted) { break }
+                $now = [datetime]::UtcNow
+                if ($now -ge $handle.DeadlineUtc) {
+                    $result = Stop-ADAuditWorker -Handle $handle
+                    break
+                }
+                if (-not $Quiet -and $now -ge $nextBeat) {
+                    Write-ADAuditWaitHeartbeat -Activity $Activity -Handles @($handle) -PercentComplete $PercentComplete
+                    $nextBeat = $now.AddSeconds($script:ADAuditHeartbeatSeconds)
+                }
+            }
+            if (-not $result) { $result = Complete-ADAuditWorker -Handle $handle }
+        } catch {
+            if ($handle.State -eq 'Running') { [void](Stop-ADAuditWorker -Handle $handle -Reason 'Coordinator interrupted') }
+            throw
+        }
+    }
+    if ($Transport -and $Target) {
+        if ($result.Outcome -eq 'Success') { [void](Set-ADAuditTransportResult -ComputerName $Target -Protocol $Transport -Outcome 'Reachable') }
+        elseif ($result.Outcome -in @('Unreachable','Timeout')) { [void](Set-ADAuditTransportResult -ComputerName $Target -Protocol $Transport -Outcome $result.Outcome -Message $result.Error) }
+        $result.Transport = $Transport
+    }
+    $result
+}
+
+function Receive-ADAuditOperationResult {
+    # Unwraps a successful result or throws the preserved error so callers keep their
+    # existing catch/Register-ADAuditNotAssessed handling.
+    param([Parameter(Mandatory)]$Result)
+    switch ($Result.Outcome) {
+        'Success' { return $Result.Result }
+        'Timeout' { throw [System.TimeoutException]::new($Result.Error) }
+        default {
+            if ($Result.ErrorRecord -is [System.Management.Automation.ErrorRecord]) { throw $Result.ErrorRecord }
+            throw $Result.Error
+        }
+    }
+}
+
+function Get-ADAuditCoverageOutcome {
+    # Maps an operation outcome onto the coverage-record outcome set.
+    param([string]$OperationOutcome)
+    if ($OperationOutcome -in @('Timeout','Unreachable','AccessDenied','Unsupported','Excluded')) { return $OperationOutcome }
+    'Unavailable'
+}
+
+function Invoke-ADAuditEventLogQuery {
+    # Bounded event-log read. Returns an array of live records (empty when no event
+    # matched) and throws on transport or access failure, so an unreadable log never
+    # becomes an empty successful result. Local logs are read inline.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][hashtable]$FilterHashtable,
+        [int]$MaxEvents = 0,
+        [string]$Activity = '',
+        [double]$PercentComplete = -1
+    )
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $ComputerName
+    $parameters = @{ FilterHashtable = $FilterHashtable; ErrorAction = 'Stop' }
+    if ($MaxEvents -gt 0) { $parameters.MaxEvents = $MaxEvents }
+    $local = Test-ADAuditLocalComputer $ComputerName
+    if (-not $local) { $parameters.ComputerName = $ComputerName }
+    $query = {
+        param($Parameters)
+        try { ,@(Get-WinEvent @Parameters) }
+        catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { ,@() } else { throw } }
+    }
+    # Workers return the record set as one array object; emit the records here so a
+    # caller's @(...) receives the rows (zero, one or many), never a nested array.
+    if ($local) { $records = & $query $parameters; return @($records) }
+    $logNames = @($FilterHashtable['LogName']) -join ', '
+    $result = Invoke-ADAuditBoundedOperation -Target $ComputerName -Operation "event log $logNames" -Transport 'EventLog' -Activity $Activity -PercentComplete $PercentComplete -ScriptBlock $query -ArgumentList @(,$parameters)
+    $records = Receive-ADAuditOperationResult -Result $result
+    @($records)
+}
+
+function Invoke-ADAuditParallelTargets {
+    <#
+    .SYNOPSIS
+        Runs one worker per target with bounded concurrency and per-target deadlines.
+        Workers receive ($Target, $Context) and return data; this coordinator merges the
+        typed results in input order and owns all progress output. Callers register
+        coverage and write evidence from the returned results. MaxConcurrency 1 is the
+        serial troubleshooting mode and produces identical results. In isolated-host
+        mode nonlocal targets are recorded as Excluded before any worker starts.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Targets = @(),
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [hashtable]$Context = @{},
+        [string]$Operation = 'collection',
+        [string]$Activity = 'Remote collection',
+        [string]$UnitName = 'DC',
+        [string]$WorkDescription = '',
+        [scriptblock]$TargetLabel = { param($t) [string]$t },
+        [scriptblock]$TargetHost = $null,
+        [int]$MaxConcurrency = $script:ADAuditMaxConcurrency,
+        [int]$TimeoutSec = 0,
+        [double]$PercentBase = 0,
+        [double]$PercentSpan = 100,
+        [ValidateSet('Runspace','Process')][string]$Isolation = 'Runspace'
+    )
+    $total = $Targets.Count
+    if ($total -eq 0) { return @() }
+    if ($TimeoutSec -le 0) { $TimeoutSec = $script:ADAuditTargetTimeoutSec }
+    if ($MaxConcurrency -lt 1) { $MaxConcurrency = 1 }
+    $results = New-Object object[] $total
+    $labels = New-Object string[] $total
+    $pending = [System.Collections.Generic.List[int]]::new()
+    $excluded = 0
+    for ($i = 0; $i -lt $total; $i++) {
+        $labels[$i] = [string](& $TargetLabel $Targets[$i])
+        $hostName = if ($TargetHost) { [string](& $TargetHost $Targets[$i]) } else { $labels[$i] }
+        if ($script:ADAuditIsolatedClone -and $hostName -and -not (Test-ADAuditLocalComputer $hostName)) {
+            $results[$i] = New-ADAuditOperationResult -Target $labels[$i] -Operation $Operation -Outcome 'Excluded' -Error "Isolated-host mode: remote target '$hostName' was intentionally not contacted. Snapshot data cannot establish current production state." -ErrorType 'ADAudit.IsolatedHostExclusion' -Isolation 'Skipped' -TimeoutSec $TimeoutSec
+            $excluded++
+        } else { $pending.Add($i) }
+    }
+    $completed = $excluded
+    $work = if ($WorkDescription) { " ($WorkDescription)" } else { '' }
+    $excludedNote = if ($excluded) { "; $excluded excluded" } else { '' }
+    $percentOf = { param($done) [int]($PercentBase + $PercentSpan * $done / [Math]::Max(1, $total)) }
+    $outcomeLabel = {
+        param($r)
+        switch ($r.Outcome) { 'Success' { 'queried' } 'Timeout' { 'not assessed (deadline expired)' } default { 'not assessed' } }
+    }
+    if ($script:ADAuditInWorker -or $script:ADAuditWorkerMode -eq 'InProcess') {
+        foreach ($i in $pending) {
+            Write-ADAuditProgress -Activity $Activity -Status "$UnitName $($i + 1)/${total}: querying $($labels[$i])$work; $completed ${UnitName}s completed$excludedNote" -PercentComplete (& $percentOf $completed) -Force
+            $results[$i] = Invoke-ADAuditInlineOperation -ScriptBlock $ScriptBlock -ArgumentList @($Targets[$i], $Context) -Target $labels[$i] -Operation $Operation -TimeoutSec $TimeoutSec
+            $completed++
+            Write-ADAuditProgress -Activity $Activity -Status "$UnitName $completed/${total}: $($labels[$i]) $(& $outcomeLabel $results[$i])" -PercentComplete (& $percentOf $completed)
+        }
+        return ,$results
+    }
+    $running = @{}
+    $next = 0
+    $nextBeat = [datetime]::UtcNow.AddSeconds($script:ADAuditHeartbeatSeconds)
+    try {
+        while ($true) {
+            while ($running.Count -lt $MaxConcurrency -and $next -lt $pending.Count) {
+                $i = $pending[$next]
+                Write-ADAuditProgress -Activity $Activity -Status "$UnitName $($i + 1)/${total}: querying $($labels[$i])$work; $completed ${UnitName}s completed$excludedNote" -PercentComplete (& $percentOf $completed) -Force
+                $running[$i] = Start-ADAuditWorker -ScriptBlock $ScriptBlock -ArgumentList @($Targets[$i], $Context) -Target $labels[$i] -Operation $Operation -TimeoutSec $TimeoutSec -Isolation $Isolation
+                $next++
+            }
+            if ($running.Count -eq 0) { break }
+            $handles = @($running.Values)
+            $waitHandles = [System.Threading.WaitHandle[]]@($handles | ForEach-Object { $_.Async.AsyncWaitHandle })
+            [void][System.Threading.WaitHandle]::WaitAny($waitHandles, 250)
+            $now = [datetime]::UtcNow
+            foreach ($index in @($running.Keys)) {
+                $handle = $running[$index]
+                $result = $null
+                if ($handle.Async.IsCompleted) { $result = Complete-ADAuditWorker -Handle $handle }
+                elseif ($now -ge $handle.DeadlineUtc) { $result = Stop-ADAuditWorker -Handle $handle }
+                if ($result) {
+                    $results[$index] = $result
+                    $running.Remove($index)
+                    $completed++
+                    Write-ADAuditProgress -Activity $Activity -Status "$UnitName $completed/${total}: $($handle.Target) $(& $outcomeLabel $result)" -PercentComplete (& $percentOf $completed)
+                }
+            }
+            if ($running.Count -gt 0 -and $now -ge $nextBeat) {
+                Write-ADAuditWaitHeartbeat -Activity $Activity -Handles @($running.Values) -Summary "$completed/$total ${UnitName}s completed" -PercentComplete (& $percentOf $completed)
+                $nextBeat = $now.AddSeconds($script:ADAuditHeartbeatSeconds)
+            }
+        }
+    } catch {
+        foreach ($handle in @($running.Values)) { if ($handle.State -eq 'Running') { [void](Stop-ADAuditWorker -Handle $handle -Reason 'Coordinator interrupted') } }
+        throw
+    }
+    ,$results
+}
+function Invoke-ADAuditNativeCommand {
+    <#
+    .SYNOPSIS
+        Runs a native diagnostic tool (dcdiag, repadmin, w32tm) as a separate process with
+        an enforceable deadline. Output is captured; the process is killed on expiry.
+        A PowerShell function with the tool's name is used as an offline command seam.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [int]$TimeoutSec = 0,
+        [string]$Target = '',
+        [string]$Operation = '',
+        [string]$Activity = '',
+        [double]$PercentComplete = -1,
+        [string]$Transport = ''
+    )
+    if (-not $Operation) { $Operation = "$FilePath $($ArgumentList -join ' ')".Trim() }
+    if ($TimeoutSec -le 0) { $TimeoutSec = $script:ADAuditTargetTimeoutSec }
+    $started = [datetime]::UtcNow
+    $finish = {
+        param($Outcome, $ExitCode, $Output, $Error, $Record = $true)
+        $r = New-ADAuditOperationResult -Target $Target -Operation $Operation -Outcome $Outcome -Transport $Transport -StartedUtc $started -Result $Output -Error $Error -Isolation $(if ($Record) { 'Process' } else { 'Skipped' }) -TimeoutSec $TimeoutSec
+        $r | Add-Member -NotePropertyName ExitCode -NotePropertyValue $ExitCode
+        $r | Add-Member -NotePropertyName Output -NotePropertyValue ([string]$Output)
+        # A cached skip or a preflight failure is already recorded; recording it again would
+        # nest the skip text into the cache message and extend the expiry on every hit.
+        if ($Record -and $Transport -and $Target) {
+            if ($Outcome -eq 'Success') { [void](Set-ADAuditTransportResult -ComputerName $Target -Protocol $Transport -Outcome 'Reachable') }
+            elseif ($Outcome -in @('Unreachable','Timeout')) { [void](Set-ADAuditTransportResult -ComputerName $Target -Protocol $Transport -Outcome $Outcome -Message $Error) }
+        }
+        $r
+    }
+    if ($Transport -and $Target) {
+        $blocked = Test-ADAuditTransportBlocked -ComputerName $Target -Protocol $Transport
+        if ($blocked) {
+            $age = [int]([datetime]::UtcNow - $blocked.RecordedUtc).TotalSeconds
+            return (& $finish $blocked.Outcome $null '' "$Operation on '$Target' was not attempted: a $Transport connection failure ($($blocked.Outcome)) was recorded $age s ago ($(Get-ADAuditShortMessage $blocked.Message)). Another attempt is allowed after $($blocked.ExpiresUtc.ToLocalTime().ToString('HH:mm:ss'))." $false)
+        }
+        $preflight = Test-ADAuditTransportPreflight -ComputerName $Target -Protocol $Transport
+        if ($preflight) {
+            return (& $finish 'Unreachable' $null '' "$Operation on '$Target' was not attempted: $($preflight.Message)." $false)
+        }
+    }
+    $seam = Get-Command -Name $FilePath -CommandType Function -ErrorAction SilentlyContinue
+    if ($seam) {
+        try {
+            $global:LASTEXITCODE = 0
+            $text = (& $seam @ArgumentList 2>&1 | Out-String)
+            return (& $finish 'Success' $global:LASTEXITCODE $text '')
+        } catch {
+            return (& $finish (Get-ADAuditOperationOutcome -ErrorRecord $_) $null '' $_.Exception.Message)
+        }
+    }
+    $executable = if ([System.IO.Path]::GetExtension($FilePath)) { $FilePath } else { "$FilePath.exe" }
+    $application = Get-Command -Name $executable -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $application) { return (& $finish 'Unsupported' $null '' "$executable was not found on this host.") }
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new($application.Source)
+    $startInfo.Arguments = (@($ArgumentList | ForEach-Object { if ($_ -match '\s|"') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    try { $startInfo.StandardOutputEncoding = [Console]::OutputEncoding; $startInfo.StandardErrorEncoding = [Console]::OutputEncoding } catch { }
+    $process = $null
+    try {
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+    } catch {
+        return (& $finish 'Failed' $null '' "Could not start ${executable}: $($_.Exception.Message)")
+    }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $deadline = $started.AddSeconds($TimeoutSec)
+    $nextBeat = [datetime]::UtcNow.AddSeconds($script:ADAuditHeartbeatSeconds)
+    $timedOut = $false
+    try {
+        while (-not $process.WaitForExit(250)) {
+            $now = [datetime]::UtcNow
+            if ($now -ge $deadline) {
+                $timedOut = $true
+                try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
+                [void]$process.WaitForExit(5000)
+                break
+            }
+            if ($now -ge $nextBeat) {
+                $elapsed = [int]($now - $started).TotalSeconds
+                $heartbeatActivity = if ($Activity) { $Activity } elseif ($script:ADAuditProgressLastActivity) { $script:ADAuditProgressLastActivity } else { 'Native diagnostics' }
+                Write-ADAuditProgress -Activity $heartbeatActivity -Status "$Operation$(if ($Target) { " on $Target" }); waiting for the process to finish ($elapsed/$TimeoutSec s)" -PercentComplete $PercentComplete -Heartbeat
+                $nextBeat = $now.AddSeconds($script:ADAuditHeartbeatSeconds)
+            }
+        }
+        if (-not $timedOut) { $process.WaitForExit() }
+    } catch {
+        try { if (-not $process.HasExited) { $process.Kill($true) } } catch { }
+        throw
+    }
+    $outText = ''; $errText = ''
+    try { if ($stdout.Wait(3000)) { $outText = [string]$stdout.Result } } catch { }
+    try { if ($stderr.Wait(3000)) { $errText = [string]$stderr.Result } } catch { }
+    $combined = $outText
+    if ($errText) { $combined = if ($combined) { $combined.TrimEnd() + "`n" + $errText } else { $errText } }
+    $exitCode = $null
+    try { if ($process.HasExited) { $exitCode = $process.ExitCode } } catch { }
+    try { $process.Dispose() } catch { }
+    if ($timedOut) {
+        $script:ADAuditWorkerStats.Timeouts++
+        $script:ADAuditWorkerStats.ProcessesKilled++
+        return (& $finish 'Timeout' $exitCode $combined "Deadline of $TimeoutSec s expired for $Operation$(if ($Target) { " on '$Target'" }); the process was terminated. Partial output is retained as evidence only.")
+    }
+    & $finish 'Success' $exitCode $combined ''
+}
+
+function Stop-ADAuditWorkers {
+    # End-of-run cleanup: stops anything still active, retries orphans, disposes pooled
+    # runspaces and child processes. Returns counts for run metadata.
+    param([switch]$KeepPools)
+    foreach ($handle in @($script:ADAuditActiveWorkers)) {
+        try { [void](Stop-ADAuditWorker -Handle $handle -Reason 'Run ended' -GraceSec 2) } catch { }
+    }
+    foreach ($orphan in @($script:ADAuditOrphanedWorkers)) {
+        try {
+            $handle = $orphan.Handle
+            if ($handle.PowerShell.InvocationStateInfo.State -notin @('Running','Stopping')) {
+                try { $handle.PowerShell.Dispose() } catch { }
+                try { $handle.Slot.Runspace.Dispose() } catch { }
+                [void]$script:ADAuditOrphanedWorkers.Remove($orphan)
+            } elseif ($handle.Slot.ProcessId) {
+                try { Stop-Process -Id $handle.Slot.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        } catch { }
+    }
+    if (-not $KeepPools) {
+        foreach ($slot in @($script:ADAuditWorkerRunspaces) + @($script:ADAuditProcessRunspaces)) {
+            try { $slot.Runspace.Dispose() } catch { }
+            if ($slot.ProcessId) { try { Stop-Process -Id $slot.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+        }
+        $script:ADAuditWorkerRunspaces.Clear()
+        $script:ADAuditProcessRunspaces.Clear()
+        $script:ADAuditWorkerSessionState = $null
+    }
+    [pscustomobject]@{
+        RunspacesCreated = $script:ADAuditWorkerStats.RunspacesCreated; ProcessesCreated = $script:ADAuditWorkerStats.ProcessesCreated
+        Timeouts = $script:ADAuditWorkerStats.Timeouts; ProcessesKilled = $script:ADAuditWorkerStats.ProcessesKilled
+        Orphaned = $script:ADAuditWorkerStats.Orphaned; OrphansRemaining = $script:ADAuditOrphanedWorkers.Count
+        OrphanDetails = @($script:ADAuditOrphanedWorkers | ForEach-Object { "$($_.Operation) on $($_.Target): $($_.Reason)" })
+    }
+}
+
+function Reset-ADAuditWorkerState {
+    # Full reset between runs or offline test cases.
+    [void](Stop-ADAuditWorkers)
+    Clear-ADAuditTransportState
+    $script:ADAuditActiveWorkers.Clear()
+    $script:ADAuditOrphanedWorkers.Clear()
+    $script:ADAuditWorkerStats = @{ RunspacesCreated = 0; ProcessesCreated = 0; Timeouts = 0; Orphaned = 0; ProcessesKilled = 0 }
+}
+
+function Get-ADAuditActiveWorkerCount {
+    @($script:ADAuditActiveWorkers).Count + @($script:ADAuditOrphanedWorkers).Count
+}
+
+function Invoke-ADAuditCimRequest {
+    # Transport policy for one remote CIM request, executed inside the bounded worker:
+    # resolution check, DCOM first, optional WSMan fallback, per-protocol reachability
+    # cache, pooled session reuse with one fresh-session retry. Never contacts a
+    # protocol whose connection failure was recorded within the cache lifetime.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Instance','Method')][string]$Kind,
+        [Parameter(Mandatory)][hashtable]$Parameters,
+        [Parameter(Mandatory)][string]$ComputerName,
+        [bool]$UseWsmanFallback = $false,
+        [int]$OperationTimeoutSec = $script:ADAuditCimOperationTimeoutSec,
+        [string]$Label = 'CIM request'
+    )
+    $protocols = @('Dcom')
+    if ($UseWsmanFallback) { $protocols += 'Wsman' }
+    $skipped = [System.Collections.Generic.List[string]]::new()
+    $lastError = $null
+    $attempted = $false
+    $resolvable = $null
+    foreach ($protocol in $protocols) {
+        $blocked = Test-ADAuditTransportBlocked -ComputerName $ComputerName -Protocol $protocol
+        if ($blocked) {
+            $age = [int]([datetime]::UtcNow - $blocked.RecordedUtc).TotalSeconds
+            $skipped.Add("$protocol not retried ($($blocked.Outcome) recorded $age s ago: $(Get-ADAuditShortMessage $blocked.Message); next attempt allowed after $($blocked.ExpiresUtc.ToLocalTime().ToString('HH:mm:ss')))")
+            continue
+        }
+        if ($null -eq $resolvable) {
+            $resolvable = Test-ADAuditTargetResolvable -ComputerName $ComputerName
+            if ($resolvable -eq $false) {
+                $message = "Name '$ComputerName' did not resolve from this host; no transport was attempted."
+                foreach ($p in $protocols) { [void](Set-ADAuditTransportResult -ComputerName $ComputerName -Protocol $p -Outcome 'Unreachable' -Message $message) }
+                throw [System.Net.Sockets.SocketException]::new(11001)
+            }
+        }
+        $pooledLease = Get-ADAuditCimSessionLease -ComputerName $ComputerName -Protocol $protocol
+        if ($pooledLease) { Complete-ADAuditCimSessionLease -Lease $pooledLease }
+        else {
+            # No pooled session: a short TCP preflight replaces the protocol timeout for a host that is down.
+            $preflight = Test-ADAuditTransportPreflight -ComputerName $ComputerName -Protocol $protocol
+            if ($preflight) {
+                $lastError = [System.Management.Automation.ErrorRecord]::new([System.Net.Sockets.SocketException]::new(10060), 'ADAuditTransportPreflight', [System.Management.Automation.ErrorCategory]::ConnectionError, $ComputerName)
+                $lastError.ErrorDetails = [System.Management.Automation.ErrorDetails]::new($preflight.Message)
+                $skipped.Add("$protocol not attempted: $($preflight.Message)")
+                $attempted = $true
+                continue
+            }
+        }
+        $attempted = $true
+        $attempt = 0
+        $moveToNextProtocol = $false
+        while (-not $moveToNextProtocol -and $attempt -lt 2) {
+            $attempt++
+            $lease = Get-ADAuditCimSessionLease -ComputerName $ComputerName -Protocol $protocol
+            $pooled = $null -ne $lease
+            $session = $null
+            try {
+                if ($pooled) { $session = $lease.Session }
+                else {
+                    $option = New-CimSessionOption -Protocol $protocol
+                    $session = New-CimSession -ComputerName $ComputerName -SessionOption $option -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop
+                    $lease = Add-ADAuditCimSession -ComputerName $ComputerName -Protocol $protocol -Session $session
+                }
+                $output = if ($Kind -eq 'Instance') { Get-CimInstance @Parameters -CimSession $session } else { Invoke-CimMethod @Parameters -CimSession $session }
+                [void](Set-ADAuditTransportResult -ComputerName $ComputerName -Protocol $protocol -Outcome 'Reachable')
+                Complete-ADAuditCimSessionLease -Lease $lease
+                return $output
+            } catch {
+                $lastError = $_
+                $outcome = Get-ADAuditOperationOutcome -ErrorRecord $_
+                if ($lease) { Remove-ADAuditCimSession -Lease $lease }
+                elseif ($session) { try { $session | Remove-CimSession -ErrorAction SilentlyContinue } catch { } }
+                if ($pooled -and $outcome -notin @('AccessDenied','Unsupported')) { continue }
+                if ($outcome -in @('Unreachable','Timeout')) { [void](Set-ADAuditTransportResult -ComputerName $ComputerName -Protocol $protocol -Outcome $outcome -Message $_.Exception.Message) }
+                $moveToNextProtocol = $true
+            }
+        }
+    }
+    if (-not $attempted) {
+        throw "No transport was attempted for '$ComputerName' ($Label): $($skipped -join '; '). A recent connection failure prevented another attempt within the $($script:ADAuditConnectionCacheSec) s cache lifetime."
+    }
+    if ($lastError -and $lastError.FullyQualifiedErrorId -like 'ADAuditTransportPreflight*') {
+        throw "$Label against '$ComputerName' was not attempted: $($skipped -join '; ')."
+    }
+    if ($lastError) { throw $lastError }
+    throw "CIM request '$Label' against '$ComputerName' produced no result."
 }
 
 function Get-ADAuditCimInstance {
@@ -119,7 +1121,11 @@ function Get-ADAuditCimInstance {
 
         [switch]$UseWsmanFallback,
 
-        [ValidateRange(1,300)][int]$OperationTimeoutSec = 15
+        [ValidateRange(1,300)][int]$OperationTimeoutSec = $script:ADAuditCimOperationTimeoutSec,
+
+        [int]$TimeoutSec = 0,
+
+        [switch]$Inline
     )
 
     if (-not $script:ADAuditIsWindows) {
@@ -143,37 +1149,11 @@ function Get-ADAuditCimInstance {
         return Get-CimInstance @baseParams
     }
 
-    $session = $null
-    try {
-        $sessionOption = New-CimSessionOption -Protocol Dcom
-        $session = New-CimSession -ComputerName $ComputerName -SessionOption $sessionOption -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop
-        $baseParams.CimSession = $session
-        return Get-CimInstance @baseParams
-    }
-    catch {
-        if ($UseWsmanFallback) {
-            try {
-                $fallbackParams = @{}
-                foreach ($entry in $baseParams.GetEnumerator()) {
-                    if ($entry.Key -ne 'CimSession') {
-                        $fallbackParams[$entry.Key] = $entry.Value
-                    }
-                }
-                $fallbackParams.ComputerName = $ComputerName
-                return Get-CimInstance @fallbackParams
-            }
-            catch {
-                throw
-            }
-        }
-
-        throw
-    }
-    finally {
-        if ($session) {
-            $session | Remove-CimSession -ErrorAction SilentlyContinue
-        }
-    }
+    $label = if ($ClassName) { "CIM $ClassName" } else { 'CIM query' }
+    $request = @{ Kind = 'Instance'; Parameters = $baseParams; ComputerName = $ComputerName; UseWsmanFallback = [bool]$UseWsmanFallback; OperationTimeoutSec = $OperationTimeoutSec; Label = $label }
+    if ($Inline -or $script:ADAuditInWorker) { return Invoke-ADAuditCimRequest @request }
+    $result = Invoke-ADAuditBoundedOperation -Target $ComputerName -Operation $label -TimeoutSec $TimeoutSec -ScriptBlock { param($Request) Invoke-ADAuditCimRequest @Request } -ArgumentList @(,$request)
+    Receive-ADAuditOperationResult -Result $result
 }
 
 function Invoke-ADAuditCimMethod {
@@ -186,25 +1166,18 @@ function Invoke-ADAuditCimMethod {
         [string]$Namespace = 'root/cimv2',
         [hashtable]$Arguments = @{},
         [switch]$UseWsmanFallback,
-        [ValidateRange(1,300)][int]$OperationTimeoutSec = 15
+        [ValidateRange(1,300)][int]$OperationTimeoutSec = $script:ADAuditCimOperationTimeoutSec,
+        [int]$TimeoutSec = 0,
+        [switch]$Inline
     )
     Assert-ADAuditRemoteTargetAllowed -ComputerName $ComputerName
     $params = @{Namespace=$Namespace; ClassName=$ClassName; MethodName=$MethodName; Arguments=$Arguments; OperationTimeoutSec=$OperationTimeoutSec; ErrorAction='Stop'}
     if (Test-ADAuditLocalComputer $ComputerName) { return Invoke-CimMethod @params }
-    $protocols = @('Dcom')
-    if ($UseWsmanFallback) { $protocols += 'Wsman' }
-    foreach ($protocol in $protocols) {
-        $session = $null
-        try {
-            $option = New-CimSessionOption -Protocol $protocol
-            $session = New-CimSession -ComputerName $ComputerName -SessionOption $option -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop
-            return Invoke-CimMethod @params -CimSession $session
-        } catch {
-            if ($protocol -eq $protocols[-1]) { throw }
-        } finally {
-            if ($session) { $session | Remove-CimSession -ErrorAction SilentlyContinue }
-        }
-    }
+    $label = "CIM $ClassName.$MethodName"
+    $request = @{ Kind = 'Method'; Parameters = $params; ComputerName = $ComputerName; UseWsmanFallback = [bool]$UseWsmanFallback; OperationTimeoutSec = $OperationTimeoutSec; Label = $label }
+    if ($Inline -or $script:ADAuditInWorker) { return Invoke-ADAuditCimRequest @request }
+    $result = Invoke-ADAuditBoundedOperation -Target $ComputerName -Operation $label -TimeoutSec $TimeoutSec -ScriptBlock { param($Request) Invoke-ADAuditCimRequest @Request } -ArgumentList @(,$request)
+    Receive-ADAuditOperationResult -Result $result
 }
 
 function Convert-ADAuditFileTime {
@@ -370,7 +1343,10 @@ Function Get-Variables() {
     $script:OSVersion = (Get-Itemproperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name ProductName).ProductName
     $script:Administrators = (Get-ADGroup -Identity S-1-5-32-544).SamAccountName
     $script:Users = (Get-ADGroup -Identity S-1-5-32-545).SamAccountName
-    $domainSidValue = (Get-ADDomain -Current LoggedOnUser).domainsid.value
+    $currentDomain = Get-ADDomain -Current LoggedOnUser
+    $domainSidValue = $currentDomain.domainsid.value
+    # Cache identity: short DC names and their FQDNs must share one reachability entry.
+    $script:ADAuditTargetDnsSuffix = [string]$currentDomain.DNSRoot
     $script:DomainAdminsSID = $domainSidValue + "-512"
     $script:DomainUsersSID = $domainSidValue + "-513"
     $script:DomainControllersSID = $domainSidValue + "-516"
@@ -589,11 +1565,27 @@ ul.link-list li::before{content:'\1F4C4';font-size:1rem}
 '@
 }
 
+function Test-ADAuditIsolatedAssessmentMode {
+    # Saved run metadata may carry the current 'IsolatedHost' value or the earlier
+    # 'IsolatedClone' value; both identify an isolated-copy assessment.
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $Value.Trim() -in @('IsolatedHost','IsolatedClone')
+}
+
+function Test-ADAuditIsolatedAssessmentMode {
+    # Saved run metadata may carry the current 'IsolatedHost' value or the earlier
+    # 'IsolatedClone' value; both identify an isolated-copy assessment.
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $Value.Trim() -in @('IsolatedHost','IsolatedClone')
+}
+
 function Get-ADAuditCloneNotice {
     param([bool]$IsolatedClone = $script:ADAuditIsolatedClone, [string]$SnapshotDate = $script:ADAuditSnapshotDate)
     if (-not $IsolatedClone) { return '' }
     $date = if ($SnapshotDate) { [System.Net.WebUtility]::HtmlEncode($SnapshotDate) } else { 'not supplied' }
-    return "<aside class='clone-notice' style='border:2px solid #b45309;border-radius:10px;padding:16px;margin:16px 0;background:var(--panel);color:var(--text)'><strong>ISOLATED CLONE — snapshot date: $date</strong><p>This assessment describes a copied directory and this clone's local state. It does not establish current production security or operational health. Password ages, activity timestamps, certificates and replication evidence may reflect the age of the copy. Verify time-based findings in the current environment before remediation. Unreachable production systems are outside this assessment.</p></aside>"
+    return "<aside class='clone-notice' style='border:2px solid #b45309;border-radius:10px;padding:16px;margin:16px 0;background:var(--panel);color:var(--text)'><strong>ISOLATED HOST ASSESSMENT (copied directory) — snapshot date: $date</strong><p>This assessment describes an isolated copy of a domain controller and that host's local state. It does not establish current production security or operational health. Password ages, activity timestamps, certificates and replication evidence may reflect the age of the copy. Verify time-based findings in the current environment before remediation. Unreachable production systems are outside this assessment.</p></aside>"
 }
 
 function Get-ADAuditThemeMarkup {
@@ -748,7 +1740,8 @@ function Write-ADAuditProgress {
         [string]$Status = 'Working',
         [ValidateRange(-1,100)][double]$PercentComplete = -1,
         [switch]$Completed,
-        [switch]$Force
+        [switch]$Force,
+        [switch]$Heartbeat
     )
     $now = [datetime]::UtcNow
     $context = $script:ADAuditProgressContext
@@ -756,7 +1749,12 @@ function Write-ADAuditProgress {
     $elapsed = if ($context) { ' | elapsed {0:hh\:mm\:ss}' -f ($now - $context.Started) } else { '' }
     $percentLabel = if ($PercentComplete -ge 0) { '{0:0}% of phase' -f $PercentComplete } else { 'total not available' }
     $changed = $Activity -ne $script:ADAuditProgressLastActivity
-    if ($Force -or $Completed -or $changed -or ($now - $script:ADAuditProgressLastUi).TotalMilliseconds -ge 250) {
+    # Heartbeats repeat the current operation while a remote call blocks: the bars are
+    # refreshed every time, the console only every ADAuditHeartbeatLogSeconds, and the
+    # percentage stays whatever the caller measured - elapsed time never advances it.
+    $uiDue = $Force -or $Completed -or $changed -or $Heartbeat -or ($now - $script:ADAuditProgressLastUi).TotalMilliseconds -ge 250
+    $logDue = if ($Heartbeat) { $changed -or ($now - $script:ADAuditProgressLastLog).TotalSeconds -ge $script:ADAuditHeartbeatLogSeconds } else { $Force -or $Completed -or $changed -or ($now - $script:ADAuditProgressLastLog).TotalSeconds -ge 10 }
+    if ($uiDue) {
         $parameters = @{ Id=1; Activity="$prefix - $Activity"; Status="$Status | $percentLabel$elapsed"; PercentComplete=[int]$PercentComplete }
         if ($context) {
             $parameters.ParentId = 0
@@ -769,14 +1767,13 @@ function Write-ADAuditProgress {
         Write-Progress @parameters
         $script:ADAuditProgressLastUi = $now
     }
-    if ($Force -or $Completed -or $changed -or ($now - $script:ADAuditProgressLastLog).TotalSeconds -ge 10) {
+    if ($logDue) {
         $state = if ($Completed) { 'phase finished' } else { $percentLabel }
         Write-Both "    [$prefix] $Activity - $Status ($state$elapsed)"
         $script:ADAuditProgressLastLog = $now
     }
     $script:ADAuditProgressLastActivity = if ($Completed) { '' } else { $Activity }
 }
-
 function Initialize-ADAuditCheckStatus {
     param([object[]]$Checks, [string[]]$SelectedSwitches)
     $script:ADAuditCheckStatus.Clear()
@@ -1107,15 +2104,24 @@ Function Register-ADAuditNotAssessed {
         [Parameter(Mandatory)][string]$Reason,
         [string]$Switch,
         [string]$Target,
-        [switch]$RequiresRemotePS
+        [switch]$RequiresRemotePS,
+        [ValidateSet('','Timeout','Unreachable','AccessDenied','Unsupported','Excluded','Unavailable')][string]$Outcome = ''
     )
     if (-not $Switch) { $Switch = $script:ADAuditCurrentCheckSwitch }
+    # Outcome separates deadline expiry, unreachable transport, denied access, unsupported
+    # operations and intentional exclusion from generic unavailability. Derived from the
+    # reason text when the caller does not state it.
+    if (-not $Outcome) {
+        $derived = Get-ADAuditOperationOutcome -Message $Reason
+        $Outcome = if ($derived -in @('Timeout','Unreachable','AccessDenied','Unsupported','Excluded')) { $derived } else { 'Unavailable' }
+    }
     $script:NotAssessed.Add([pscustomobject]@{
         Time             = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         CheckName        = $Name
         Switch           = $Switch
         Target           = $Target
         Reason           = $Reason
+        Outcome          = $Outcome
         RequiresRemotePS = [bool]$RequiresRemotePS
     }) | Out-Null
     $tgt = if ($Target) { " [$Target]" } else { "" }
@@ -1206,6 +2212,7 @@ Function Write-NotAssessedReport {
         [void]$sb.AppendLine("[$i] $($n.CheckName)  ($($n.Time))")
         if ($n.Switch) { [void]$sb.AppendLine("    Switch          : -$($n.Switch)") }
         if ($n.Target) { [void]$sb.AppendLine("    Target          : $($n.Target)") }
+        [void]$sb.AppendLine("    Outcome         : $($n.Outcome)")
         [void]$sb.AppendLine("    Requires remote : $(if($n.RequiresRemotePS){'YES (remote PowerShell/CIM to a DC)'}else{'no'})")
         [void]$sb.AppendLine("    Reason          : $($n.Reason)")
         [void]$sb.AppendLine('')

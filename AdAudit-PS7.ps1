@@ -18,6 +18,18 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
+            [X] Version 9.3.0 - 25/10/2026
+                Renamed the isolation option to -IsolateHost (alias -IsolatedClone kept).
+                Bounded remote collection: every remote operation runs as a cancellable
+                    worker with an end-to-end deadline (-TargetTimeoutSec), live waiting
+                    heartbeats in both progress bars, process isolation for dcdiag/repadmin/
+                    w32tm and separate outcomes (timeout, unreachable, access denied,
+                    unsupported, excluded) in the coverage records.
+                Run-scoped connection-failure cache per target and protocol
+                    (-ConnectionCacheSec) and CIM session reuse: an unavailable DC costs one
+                    wait per transport instead of one per operation.
+                Bounded parallel target collection (-MaxConcurrency, default 2; 1 = serial)
+                    for Domain Audit per-DC collectors and the DC port probes.
             [X] Version 9.2.1 - 25/10/2026
                 Kept current operation/target in the parent progress bar and batched
                     Domain Audit service collection into one query per DC.
@@ -515,6 +527,14 @@
         PS> ADAudit.ps1 -hostdetails -domainaudit
         Retrieves hostname and other useful audit info
         Retrieves information about the AD such as functional level
+    .EXAMPLE
+        PS> ADAudit.ps1 -all -IsolateHost -SnapshotDate 2026-10-01
+        Audits an isolated copy of a domain controller: local collection only, reports
+        identify the snapshot and remote DC operational probes are recorded as excluded
+    .EXAMPLE
+        PS> ADAudit.ps1 -all -TargetTimeoutSec 90 -MaxConcurrency 1
+        Runs every check with a 90 second deadline per remote target operation in serial
+        (troubleshooting) mode
 #>
 [CmdletBinding()]
 Param (
@@ -558,8 +578,11 @@ Param (
     [switch]$all = $false,
     [string[]]$exclude = @(),
     [string]$select,
-    [switch]$IsolatedClone = $false,
+    [Alias('IsolatedClone')][switch]$IsolateHost = $false,
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$SnapshotDate,
+    [ValidateRange(5,3600)][int]$TargetTimeoutSec = 60,
+    [ValidateRange(0,86400)][int]$ConnectionCacheSec = 300,
+    [ValidateRange(1,16)][int]$MaxConcurrency = 2,
     [switch]$KeepLegacyArtifacts = $false
 )
 
@@ -573,7 +596,7 @@ if ($select) { $selectedChecks = @($select -split '[,\s]+' | ForEach-Object { $_
 # defeats the match (e.g. ' dnszone' -notin the check names).
 $exclude = @($exclude | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-$versionnum = "v9.2.1"
+$versionnum = "v9.3.0"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 $script:ADAuditIsWindows = ($env:OS -eq 'Windows_NT')
@@ -674,13 +697,23 @@ $knownChecks = @($script:ADAuditChecks.Switch)
 $invalidChecks = @($selectedChecks + $exclude | Where-Object { $_ -notin $knownChecks })
 if ($invalidChecks.Count -gt 0) { throw "Unknown check name(s): $($invalidChecks -join ', '). Use the switch names listed in README.md." }
 if ($SnapshotDate) {
-    if (-not $IsolatedClone) { throw '-SnapshotDate describes a copied directory and requires -IsolatedClone.' }
-    $snapshotValue = [datetime]::ParseExact($SnapshotDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture)
+    if (-not $IsolateHost) { throw '-SnapshotDate describes a copied directory and requires -IsolateHost.' }
+    $snapshotValue = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($SnapshotDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$snapshotValue)) {
+        throw "-SnapshotDate '$SnapshotDate' is not a valid calendar date; use yyyy-MM-dd."
+    }
     if ($snapshotValue.Date -gt (Get-Date).Date) { throw '-SnapshotDate cannot be in the future.' }
 }
-$script:ADAuditIsolatedClone = [bool]$IsolatedClone
+# -IsolateHost (alias -IsolatedClone) maps to the internal isolation state used by the
+# checks and the shared library. Validation above runs before any output folder or
+# remote connection exists.
+$script:ADAuditIsolatedClone = [bool]$IsolateHost
 $script:ADAuditSnapshotDate = $SnapshotDate
-if ($IsolatedClone) {
+$script:ADAuditTargetTimeoutSec = $TargetTimeoutSec
+$script:ADAuditConnectionCacheSec = $ConnectionCacheSec
+$script:ADAuditMaxConcurrency = $MaxConcurrency
+Reset-ADAuditWorkerState
+if ($IsolateHost) {
     # Keep implicit AD/GPO reads on the copy rather than rediscovering a peer.
     # Copy the preference table so the caller's hashtable is not mutated.
     $PSDefaultParameterValues = @{} + $PSDefaultParameterValues
@@ -727,9 +760,10 @@ $script:ADAuditSelectedChecks = @($script:ADAuditChecks | Where-Object { Test-AD
 Initialize-ADAuditCheckStatus -Checks $script:ADAuditChecks -SelectedSwitches @($script:ADAuditSelectedChecks.Switch)
 Write-Both "[*] Audit selection: running $($script:ADAuditSelectedChecks.Count) of $($script:ADAuditChecks.Count) checks; skipping $($script:ADAuditChecks.Count - $script:ADAuditSelectedChecks.Count)."
 Write-Both '[*] Overall progress counts finished checks, not elapsed time. Phase percentages are shown where a work-item total is known.'
-if ($IsolatedClone) {
-    Write-Both "[~] ISOLATED CLONE: snapshot date $(if ($SnapshotDate) { $SnapshotDate } else { 'not supplied' }). Results describe the copy, not current production. Remote DC operational probes will be skipped."
+if ($IsolateHost) {
+    Write-Both "[~] ISOLATED HOST: snapshot date $(if ($SnapshotDate) { $SnapshotDate } else { 'not supplied' }). Results describe the isolated copy, not current production. Remote DC operational probes will be recorded as excluded."
 }
+Write-Both "[*] Remote collection: $TargetTimeoutSec s deadline per target operation (including transport fallback), connection failures cached for $ConnectionCacheSec s, up to $MaxConcurrency parallel target worker(s)$(if ($MaxConcurrency -eq 1) { ' (serial mode)' })."
 $needsActiveDirectory = [bool]@($script:ADAuditSelectedChecks | Where-Object { 'ActiveDirectory' -in $_.Modules }).Count
 $needsGroupPolicy     = [bool]@($script:ADAuditSelectedChecks | Where-Object { 'GroupPolicy'     -in $_.Modules }).Count
 $needsDnsServer       = [bool]@($script:ADAuditSelectedChecks | Where-Object { 'DnsServer'       -in $_.Modules }).Count
@@ -799,10 +833,20 @@ if ($installdeps) {
     Invoke-AuditCheck -Name 'InstallDependencies' -Switch 'installdeps' -Description 'Installing optional features' -Body { Install-Dependencies }
 }
 $checkNumber = 0
-foreach ($__chk in $script:ADAuditSelectedChecks) {
-    $running = $true
-    $checkNumber++
-    Invoke-AuditCheck -Name $__chk.Name -Switch $__chk.Switch -Description $__chk.Description -Body $__chk.Run -Modules $__chk.Modules -CheckIndex $checkNumber -SelectedCount $script:ADAuditSelectedChecks.Count -AvailableCount $script:ADAuditChecks.Count
+$script:ADAuditWorkerSummary = $null
+try {
+    foreach ($__chk in $script:ADAuditSelectedChecks) {
+        $running = $true
+        $checkNumber++
+        Invoke-AuditCheck -Name $__chk.Name -Switch $__chk.Switch -Description $__chk.Description -Body $__chk.Run -Modules $__chk.Modules -CheckIndex $checkNumber -SelectedCount $script:ADAuditSelectedChecks.Count -AvailableCount $script:ADAuditChecks.Count
+    }
+} finally {
+    # No worker runspace, child process or CIM session survives the collection phase,
+    # whether it ended normally, by failure or by Ctrl+C.
+    $script:ADAuditWorkerSummary = Stop-ADAuditWorkers
+    if ($script:ADAuditWorkerSummary.OrphansRemaining -gt 0) {
+        Write-Both "[!] $($script:ADAuditWorkerSummary.OrphansRemaining) collection worker(s) did not stop within the grace period and were abandoned: $($script:ADAuditWorkerSummary.OrphanDetails -join '; ')"
+    }
 }
 if (!$running) {
     Write-Both "[!] No arguments selected"
@@ -838,17 +882,29 @@ if (!$running) {
     Write-Both "    -exclude <check[,check...]> skips the named checks when running -all, e.g. $scriptname -all -exclude gpo,dnszone"
     Write-Both "    -select <check[,check...]> runs only the named checks (comma-separated), e.g. $scriptname -select accounts,spn"
     Write-Both "    -KeepLegacyArtifacts retains legacy evidence layout within the current isolated run."
+    Write-Both "    -IsolateHost audits an isolated copy of a DC: local collection only, remote DC probes recorded as excluded, reports identify the snapshot (alias: -IsolatedClone)"
+    Write-Both "        Optional: -SnapshotDate yyyy-MM-dd (known copy date; requires -IsolateHost; cannot be in the future)"
+    Write-Both "    -TargetTimeoutSec <5-3600> deadline per remote target operation including transport fallback (default 60)"
+    Write-Both "    -ConnectionCacheSec <0-86400> how long a target/protocol connection failure suppresses another attempt (default 300)"
+    Write-Both "    -MaxConcurrency <1-16> parallel target workers inside a check (default 2; 1 = serial troubleshooting mode)"
 }
 Write-CheckFailuresReport -BaseRoot $outputdir
 Write-NotAssessedReport -BaseRoot $outputdir
 $runMetadata = @{
     RunId = $script:ADAuditRunId; ToolVersion = $versionnum; ScoringVersion = 'v2.1'
     RunFolder = Split-Path $outputdir -Leaf; StartedLocal = $runStarted.ToString('o'); TimeZone = [TimeZoneInfo]::Local.Id
-    AssessmentMode = $(if ($IsolatedClone) { 'IsolatedClone' } else { 'Connected' }); SnapshotDate = $SnapshotDate
+    AssessmentMode = $(if ($IsolateHost) { 'IsolatedHost' } else { 'Connected' }); SnapshotDate = $SnapshotDate
     StartedUtc = $starttime.ToUniversalTime().ToString('o'); FinishedUtc = [datetime]::UtcNow.ToString('o')
     ComputerName = $env:COMPUTERNAME; Domain = $null; DomainSid = $null; Forest = $null
     SelectedChecks = @($script:ADAuditSelectedChecks.Switch); ExcludedChecks = @($exclude)
     PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+    Collection = @{
+        TargetTimeoutSec = $TargetTimeoutSec; ConnectionCacheSec = $ConnectionCacheSec; MaxConcurrency = $MaxConcurrency
+        WorkerMode = $script:ADAuditWorkerMode
+        Workers = $(if ($script:ADAuditWorkerSummary) { @{ RunspacesCreated = $script:ADAuditWorkerSummary.RunspacesCreated; ProcessesCreated = $script:ADAuditWorkerSummary.ProcessesCreated; Timeouts = $script:ADAuditWorkerSummary.Timeouts; ProcessesKilled = $script:ADAuditWorkerSummary.ProcessesKilled; Orphaned = $script:ADAuditWorkerSummary.Orphaned; OrphansRemaining = $script:ADAuditWorkerSummary.OrphansRemaining; OrphanDetails = @($script:ADAuditWorkerSummary.OrphanDetails) } } else { $null })
+        # Transport outcomes only (target, protocol, outcome, error text); never query content.
+        TransportFailures = @(Get-ADAuditTransportSummary | Where-Object Outcome -ne 'Reachable')
+    }
 }
 if ($needsActiveDirectory) {
     try {
@@ -859,6 +915,7 @@ if ($needsActiveDirectory) {
     } catch { Write-Both "[~] Run metadata: domain identity unavailable ($($_.Exception.Message))." }
 }
 Write-ADAuditRunMetadata -Metadata $runMetadata
+Clear-ADAuditTransportState
 Write-Nessus-Footer
 # Note: .nessus content is XML-escaped at write time inside Write-Nessus-Finding
 # (and the header/footer are static), so no post-hoc character sanitisation is
@@ -879,5 +936,6 @@ try {
 finally {
     Write-Progress -Id 1 -Activity 'Report assembly' -Completed
     Write-Progress -Id 0 -Activity 'AD audit' -Completed
+    [void](Stop-ADAuditWorkers)
     $ErrorActionPreference = $oldEap
 }

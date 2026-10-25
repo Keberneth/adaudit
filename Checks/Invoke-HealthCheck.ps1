@@ -54,6 +54,21 @@ function Get-ADAuditNtdsStorage {
     [pscustomobject]@{DatabasePath=$ditPath; LogPath=$logPath; DatabaseBytes=[long]$size; LogFreeBytes=[long]$free}
 }
 
+function Get-ADAuditReplicationPartnerMetadata {
+    # Bounded replication-partner read. ADWS calls cannot be cancelled reliably inside a
+    # runspace, so remote targets are read in a child process that is killed on expiry.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Target, [string]$Activity = 'AD Health', [double]$PercentComplete = -1)
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $Target
+    $result = Invoke-ADAuditBoundedOperation -Target $Target -Operation 'replication partner metadata' -Transport 'Adws' -Isolation Process -Activity $Activity -PercentComplete $PercentComplete -ScriptBlock {
+        param($Target)
+        if (-not (Get-Command Get-ADReplicationPartnerMetadata -ErrorAction SilentlyContinue)) { Import-Module ActiveDirectory -ErrorAction Stop }
+        ,@(Get-ADReplicationPartnerMetadata -Target $Target -Scope Server -ErrorAction Stop | Select-Object Partner, LastReplicationSuccess, LastReplicationAttempt, LastReplicationResult)
+    } -ArgumentList @($Target)
+    $records = Receive-ADAuditOperationResult -Result $result
+    @($records)
+}
+
 Function Get-ADHealth {
     <#
     .SYNOPSIS
@@ -171,8 +186,10 @@ Function Get-ADHealth {
     } else {
     [void]$replSb.AppendLine('=== repadmin /replsummary ===')
     try {
-        $replSummary = (repadmin /replsummary 2>&1) | Out-String
-        if ($LASTEXITCODE -ne 0) { _HUnknown $replPath 'repadmin /replsummary' "Command exited with $LASTEXITCODE; see evidence." }
+        $replRun = Invoke-ADAuditNativeCommand -FilePath 'repadmin' -ArgumentList '/replsummary' -Operation 'repadmin /replsummary' -Activity 'AD Health' -PercentComplete 0
+        if ($replRun.Outcome -ne 'Success') { if ($replRun.Output) { [void]$replSb.AppendLine($replRun.Output) }; throw $replRun.Error }
+        $replSummary = [string]$replRun.Output
+        if ($replRun.ExitCode -ne 0) { _HUnknown $replPath 'repadmin /replsummary' "Command exited with $($replRun.ExitCode); see evidence." }
         [void]$replSb.AppendLine($replSummary)
         # repadmin /replsummary table format:
         #     Source DSA          largest delta    fails/total %%   error
@@ -204,8 +221,10 @@ Function Get-ADHealth {
     [void]$replSb.AppendLine('')
     [void]$replSb.AppendLine('=== repadmin /showrepl /csv (per-DC, may be truncated) ===')
     try {
-        $showrepl = (repadmin /showrepl /csv 2>&1) | Out-String
-        if ($LASTEXITCODE -ne 0) { _HUnknown $replPath 'repadmin /showrepl' "Command exited with $LASTEXITCODE." }
+        $showreplRun = Invoke-ADAuditNativeCommand -FilePath 'repadmin' -ArgumentList '/showrepl','/csv' -Operation 'repadmin /showrepl /csv' -Activity 'AD Health' -PercentComplete 2
+        if ($showreplRun.Outcome -ne 'Success') { if ($showreplRun.Output) { [void]$replSb.AppendLine($showreplRun.Output) }; throw $showreplRun.Error }
+        $showrepl = [string]$showreplRun.Output
+        if ($showreplRun.ExitCode -ne 0) { _HUnknown $replPath 'repadmin /showrepl' "Command exited with $($showreplRun.ExitCode)." }
         if ($showrepl.Length -gt 32000) { $showrepl = $showrepl.Substring(0,32000) + "`n... (truncated) ..." }
         [void]$replSb.AppendLine($showrepl)
     } catch { _HUnknown $replPath 'repadmin /showrepl' $_.Exception.Message; [void]$replSb.AppendLine("repadmin /showrepl failed: $($_.Exception.Message)") }
@@ -214,8 +233,11 @@ Function Get-ADHealth {
     [void]$replSb.AppendLine('=== repadmin /queue (per-DC) ===')
     foreach ($dc in $dcs) {
         try {
-            $q = (repadmin /queue $dc.HostName 2>&1) | Out-String
-            if ($LASTEXITCODE -ne 0) { _HUnknown $replPath $dc.HostName "repadmin /queue exited with $LASTEXITCODE." }
+            $queueTransport = if (Test-ADAuditLocalComputer $dc.HostName) { '' } else { 'Rpc' }
+            $queueRun = Invoke-ADAuditNativeCommand -FilePath 'repadmin' -ArgumentList '/queue',$dc.HostName -Target $dc.HostName -Operation 'repadmin /queue' -Activity 'AD Health' -PercentComplete 4 -Transport $queueTransport
+            if ($queueRun.Outcome -ne 'Success') { if ($queueRun.Output) { [void]$replSb.AppendLine($queueRun.Output) }; throw $queueRun.Error }
+            $q = [string]$queueRun.Output
+            if ($queueRun.ExitCode -ne 0) { _HUnknown $replPath $dc.HostName "repadmin /queue exited with $($queueRun.ExitCode)." }
             [void]$replSb.AppendLine("--- $($dc.HostName) ---")
             [void]$replSb.AppendLine($q)
         } catch { _HUnknown $replPath $dc.HostName $_.Exception.Message; [void]$replSb.AppendLine("$($dc.HostName): $($_.Exception.Message)") }
@@ -227,9 +249,11 @@ Function Get-ADHealth {
         # Advisory-only per-DC replication error scan. This is NOT /removelingeringobjects
         # (which requires a configured clean reference DC and would make changes); it lists
         # replication errors so lingering-object symptoms surface without modifying anything.
-        $linger = (repadmin /showrepl /errorsonly 2>&1) | Out-String
+        $lingerRun = Invoke-ADAuditNativeCommand -FilePath 'repadmin' -ArgumentList '/showrepl','/errorsonly' -Operation 'repadmin /showrepl /errorsonly' -Activity 'AD Health' -PercentComplete 6
+        $linger = [string]$lingerRun.Output
         [void]$replSb.AppendLine($linger)
-        if ($LASTEXITCODE -ne 0) { $replLingeringErr = $true }
+        if ($lingerRun.Outcome -ne 'Success') { [void]$replSb.AppendLine($lingerRun.Error) }
+        if ($lingerRun.Outcome -ne 'Success' -or $lingerRun.ExitCode -ne 0) { $replLingeringErr = $true }
     } catch { $replLingeringErr = $true; [void]$replSb.AppendLine($_.Exception.Message) }
 
     }
@@ -263,9 +287,13 @@ Function Get-ADHealth {
     # ============================================================
     function _Test-DCTcp {
         param([string]$Target, [int]$Port, [int]$TimeoutMs = 1500)
+        # Connect to the cached address so a slow resolver is paid once per DC, not per port.
+        $resolution = Resolve-ADAuditTargetAddresses -ComputerName $Target
+        if ($resolution.Status -eq 'Unresolvable') { return $false }
+        $address = if ($resolution.Status -eq 'Resolved') { [string]@($resolution.Addresses)[0] } else { $Target }
         $tcp = New-Object System.Net.Sockets.TcpClient
         try {
-            $async = $tcp.BeginConnect($Target, $Port, $null, $null)
+            $async = $tcp.BeginConnect($address, $Port, $null, $null)
             if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
             try { $tcp.EndConnect($async); return $true } catch { return $false }
         } catch { return $false } finally { try { $tcp.Close() } catch {} }
@@ -291,7 +319,7 @@ Function Get-ADHealth {
         $isLocalDC = Test-ADAuditLocalComputer $dcHost
 
         $dnsOk = $false
-        try { if (Resolve-DnsName -Name $dcHost -Type A -ErrorAction Stop) { $dnsOk = $true } } catch { }
+        $dnsOk = ((Resolve-ADAuditTargetAddresses -ComputerName $dcHost).Status -eq 'Resolved')
 
         $ldapOk = $false; $smbOk = $false
         if ($dnsOk -or $isLocalDC) {
@@ -303,7 +331,7 @@ Function Get-ADHealth {
         $lastRepl = $null
         try {
             if ($script:ADAuditIsolatedClone) { throw 'Replication freshness is not assessed from an isolated snapshot.' }
-            $partners = Get-ADReplicationPartnerMetadata -Target $dcHost -Scope Server -ErrorAction Stop
+            $partners = @(Get-ADAuditReplicationPartnerMetadata -Target $dcHost -Activity 'AD Health' -PercentComplete 8)
             if ($partners) {
                 $stale = $false
                 foreach ($p in $partners) {
@@ -385,13 +413,17 @@ Function Get-ADHealth {
                 continue
             }
             try {
-                $out = (dcdiag /s:$dcHost /test:$t 2>&1) | Out-String
+                # dcdiag needs LDAP to the target; one 389 probe gates all ten tests for a DC that is down.
+                $dcdiagTransport = if (Test-ADAuditLocalComputer $dcHost) { '' } else { 'Ldap' }
+                $dcdiagRun = Invoke-ADAuditNativeCommand -FilePath 'dcdiag' -ArgumentList "/s:$dcHost","/test:$t" -Target $dcHost -Operation "dcdiag /test:$t" -Activity 'AD Health' -PercentComplete 16 -Transport $dcdiagTransport
+                $out = [string]$dcdiagRun.Output
                 [void]$dcdiagSb.AppendLine($out)
+                if ($dcdiagRun.Outcome -ne 'Success') { throw $dcdiagRun.Error }
                 if ($out -match '(?im)^\s*\.+\s+\S+\s+failed\s+test\s+') {
                     $dcdiagFailedTests++
                     if (-not $dcdiagBreakdown.ContainsKey($dcHost)) { $dcdiagBreakdown[$dcHost] = 0 }
                     $dcdiagBreakdown[$dcHost] = $dcdiagBreakdown[$dcHost] + 1
-                } elseif ($LASTEXITCODE -ne 0 -or $out -notmatch ('(?im)\bpassed\s+test\s+' + [regex]::Escape($t) + '\b')) {
+                } elseif ($dcdiagRun.ExitCode -ne 0 -or $out -notmatch ('(?im)\bpassed\s+test\s+' + [regex]::Escape($t) + '\b')) {
                     _HUnknown $dcdiagPath "$dcHost/$t" 'No successful test result could be interpreted (command failure, missing or localized output).'
                 }
             } catch {
@@ -427,7 +459,12 @@ Function Get-ADHealth {
                 if (-not $localShare.Path) { throw 'Local SYSVOL share path was not returned by the share provider.' }
                 $share = [string]$localShare.Path
             }
-            if (Test-Path -LiteralPath $share -ErrorAction Stop) {
+            $shareReachable = if (Test-ADAuditLocalComputer $dcHost) { Test-Path -LiteralPath $share -ErrorAction Stop } else {
+                # UNC access cannot be cancelled inside a runspace; a child process makes the deadline enforceable.
+                $shareProbe = Invoke-ADAuditBoundedOperation -Target $dcHost -Operation 'SYSVOL share access' -Transport 'Smb' -Isolation Process -Activity 'AD Health' -PercentComplete 25 -ScriptBlock { param($Path) Test-Path -LiteralPath $Path -ErrorAction Stop } -ArgumentList @($share)
+                [bool](Receive-ADAuditOperationResult -Result $shareProbe)
+            }
+            if ($shareReachable) {
                 [void]$sysvolSb.AppendLine("SYSVOL share reachable: $share")
             } else {
                 [void]$sysvolSb.AppendLine("SYSVOL share NOT reachable: $share")
@@ -531,7 +568,8 @@ Function Get-ADHealth {
                 } catch { _HUnknown $fsmoPath $h ("DC object lookup failed: " + $_.Exception.Message) }
             }
             $dnsOk = $false
-            try { if (Resolve-DnsName -Name $h -ErrorAction Stop) { $dnsOk = $true } } catch { _HUnknown $fsmoPath $h ("DNS lookup failed from the audit host: " + $_.Exception.Message) }
+            $holderResolution = Resolve-ADAuditTargetAddresses -ComputerName $h
+            if ($holderResolution.Status -eq 'Resolved') { $dnsOk = $true } else { _HUnknown $fsmoPath $h ("DNS lookup failed from the audit host: " + $holderResolution.Detail) }
             $ldapOk = $false; $adwsOk = $false
             if ($dnsOk -or $found) {
                 $ldapOk = _Test-DCTcp -Target $h -Port 389
@@ -545,7 +583,7 @@ Function Get-ADHealth {
             # simply cannot reach for metadata is never falsely flagged.
             $replOk = $null; $lastRepl = $null
             try {
-                $rp = Get-ADReplicationPartnerMetadata -Target $h -Scope Server -ErrorAction Stop
+                $rp = @(Get-ADAuditReplicationPartnerMetadata -Target $h -Activity 'AD Health' -PercentComplete 33)
                 if ($rp) {
                     $stale = $false
                     foreach ($p in $rp) { $lastRepl = $p.LastReplicationSuccess; if (-not $lastRepl -or $lastRepl -lt (Get-Date).AddDays(-1)) { $stale = $true } }
@@ -629,9 +667,12 @@ Function Get-ADHealth {
             [void]$fsmoSb.AppendLine('--- Forest-root PDC emulator time source ---')
             [void]$fsmoSb.AppendLine("  Forest-root PDC: $forestRootPdc")
             try {
-                $pdcSource = (w32tm /query /source /computer:$forestRootPdc 2>&1 | Out-String).Trim()
+                $pdcTransport = if (Test-ADAuditLocalComputer $forestRootPdc) { '' } else { 'Rpc' }
+                $pdcRun = Invoke-ADAuditNativeCommand -FilePath 'w32tm' -ArgumentList '/query','/source',"/computer:$forestRootPdc" -Target $forestRootPdc -Operation 'w32tm /query /source' -Activity 'AD Health' -PercentComplete 33 -Transport $pdcTransport
+                if ($pdcRun.Outcome -ne 'Success') { throw $pdcRun.Error }
+                $pdcSource = ([string]$pdcRun.Output).Trim()
                 [void]$fsmoSb.AppendLine("  w32tm source   : $pdcSource")
-                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($pdcSource) -or $pdcSource -match '(?i)0x800706BA|error|RPC server is unavailable') {
+                if ($pdcRun.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($pdcSource) -or $pdcSource -match '(?i)0x800706BA|error|RPC server is unavailable') {
                     _HUnknown $fsmoPath $forestRootPdc ("Time source query failed: " + $pdcSource)
                 } elseif ($pdcSource -match '(?i)Local CMOS Clock|Free-running System Clock') {
                     _Add-HFinding -Category 'FSMO' -Severity 'High' -Title 'Forest-root PDC has no authoritative external time source' -Evidence "The forest-root PDC emulator '$forestRootPdc' is syncing from '$pdcSource' rather than an external/hardware NTP source. Every clock in the forest chains to this PDC; with no real upstream source the whole forest can drift and break Kerberos (auth fails at >5 min skew)." -Source $fsmoPath
@@ -759,13 +800,24 @@ Function Get-ADHealth {
     $svcAllNames = $svcCritical + $svcOptional
     $svcCriticalIssues = 0
     $svcInfoIssues     = 0
+    # One batched query per DC: an unavailable DC incurs one bounded attempt, not eight.
+    $svcFilter = ($svcAllNames | ForEach-Object { "Name='$_'" }) -join ' OR '
     foreach ($dc in $dcs) {
         $dcHost = $dc.HostName
         [void]$svcSb.AppendLine("--- $dcHost ---")
+        Write-ADAuditProgress -Activity 'AD Health' -Status "Services on $dcHost ($($svcAllNames.Count) services in one query)" -PercentComplete 58 -Force
+        $svcRows = @()
+        try { $svcRows = @(Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $dcHost -Filter $svcFilter -Property Name,State,StartMode -ErrorAction Stop) }
+        catch {
+            [void]$svcSb.AppendLine("  service query failed - $($_.Exception.Message)")
+            foreach ($s in $svcAllNames) { _HUnknown $svcPath "$dcHost/$s" $_.Exception.Message }
+            continue
+        }
+        $svcByName = @{}
+        foreach ($row in $svcRows) { if ($row.Name) { $svcByName[([string]$row.Name).ToLowerInvariant()] = $row } }
         foreach ($s in $svcAllNames) {
-            Write-ADAuditProgress -Activity 'AD Health' -Status "Service $s on $dcHost" -PercentComplete 58
             try {
-                $svc = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $dcHost -Filter "Name='$s'" -ErrorAction Stop
+                $svc = $svcByName[$s.ToLowerInvariant()]
                 if (-not $svc) {
                     [void]$svcSb.AppendLine("  $s : NOT INSTALLED")
                     if ($s -in $svcCritical) {
@@ -825,10 +877,8 @@ Function Get-ADHealth {
             Write-ADAuditProgress -Activity 'AD Health' -Status "Event log $logName on $dcHost" -PercentComplete 67
             $ids = $badIds[$logName]
             try {
-                $eventParams = @{FilterHashtable=@{ LogName = $logName; Id = $ids; StartTime = $cutoff }; ErrorAction='Stop'}
-                if (-not (Test-ADAuditLocalComputer $dcHost)) { $eventParams.ComputerName = $dcHost }
-                $hits = Get-WinEvent @eventParams
-                if ($hits) {
+                $hits = @(Invoke-ADAuditEventLogQuery -ComputerName $dcHost -FilterHashtable @{ LogName = $logName; Id = $ids; StartTime = $cutoff } -Activity 'AD Health' -PercentComplete 67)
+                if ($hits.Count -gt 0) {
                     [void]$evtSb.AppendLine("  ${logName}: $($hits.Count) bad event(s)")
                     $evtIssues += $hits.Count
                     foreach ($h in ($hits | Select-Object -First 5)) {
@@ -836,13 +886,11 @@ Function Get-ADHealth {
                     }
                 }
             } catch {
-                # 'No events were found' is benign; anything else is a failed query,
-                # which must not be reported as a clean Pass.
-                if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
-                    [void]$evtSb.AppendLine("  ${logName}: query failed - $($_.Exception.Message)")
-                    $evtQueryFailures++
-                    _HUnknown $evtPath "$dcHost/$logName" $_.Exception.Message
-                }
+                # 'No events were found' is handled inside the bounded query; anything else
+                # is a failed query, which must not be reported as a clean Pass.
+                [void]$evtSb.AppendLine("  ${logName}: query failed - $($_.Exception.Message)")
+                $evtQueryFailures++
+                _HUnknown $evtPath "$dcHost/$logName" $_.Exception.Message
             }
         }
     }

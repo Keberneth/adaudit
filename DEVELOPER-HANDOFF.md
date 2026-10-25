@@ -6,6 +6,8 @@ Finish the audit's progress visibility, bounded remote collection and performanc
 
 This is an implementation handoff. The tasks below are pending unless explicitly listed as completed. In particular, the requested public parameter **`-IsolateHost` is not yet implemented**; the current source still uses `-IsolatedClone`.
 
+> **Status 25 October 2026, v9.3.0 (see RELEASE-NOTES.md):** Tasks 1 to 4 are implemented and covered by offline tests (`-IsolateHost` with alias; bounded workers with heartbeats and hard deadlines; run-scoped connection cache with session reuse; bounded parallel target collection, default two workers, `-MaxConcurrency 1` for serial). Task 5 (authorized pilot on a connected AD and an isolated host, report review with an AD specialist) remains to be executed; the pilot checklist and known limits are in the release notes.
+
 ## Starting point and constraints
 
 Repository: `C:\Users\Niclas Skarnes\Github\adaudit`.

@@ -91,15 +91,26 @@ function Get-ADCSVulns {
             $endpointRows.Add([pscustomobject]@{CA=$ca.Name; Endpoint=$server; Status='NotAssessed'; HttpStatus=$null; Authentication=''; Detail='Not probed: remote endpoint outside isolated-clone scope.'})
             continue
         }
+        # One bounded resolution and one TCP probe per endpoint replace two 10 s web timeouts
+        # when the CA host is down; the HTTP request is only sent to a listening port.
+        $caResolution = Resolve-ADAuditTargetAddresses -ComputerName $server
         foreach ($scheme in @('http','https')) {
             $url = "${scheme}://$server/certsrv/"
             $status = $null; $auth = ''; $failure = ''
-            try {
-                # Never send audit credentials or follow redirects to undiscovered hosts.
-                $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 0 -TimeoutSec 10 -SkipHttpErrorCheck -ErrorAction Stop
-                $status = [int]$response.StatusCode
-                $auth = [string]($response.Headers['WWW-Authenticate'] -join ', ')
-            } catch { $failure = $_.Exception.Message }
+            $endpointPort = if ($scheme -eq 'https') { 443 } else { 80 }
+            if ($caResolution.Status -eq 'Unresolvable') { $failure = $caResolution.Detail }
+            else {
+                $probe = Test-ADAuditTcpPort -ComputerName $server -Port $endpointPort
+                if (-not $probe.Open) { $failure = "TCP $endpointPort on $server did not accept a connection from this host ($($probe.Error)); no HTTP request was sent." }
+            }
+            if (-not $failure) {
+                try {
+                    # Never send audit credentials or follow redirects to undiscovered hosts.
+                    $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 0 -TimeoutSec 10 -SkipHttpErrorCheck -ErrorAction Stop
+                    $status = [int]$response.StatusCode
+                    $auth = [string]($response.Headers['WWW-Authenticate'] -join ', ')
+                } catch { $failure = $_.Exception.Message }
+            }
             $assessment = Get-ADAuditAdcsEndpointAssessment -HttpStatus $status -Authentication $auth -ErrorText $failure
             $endpointRows.Add([pscustomobject]@{CA=$ca.Name; Endpoint=$url; Status=$assessment.Status; HttpStatus=$status; Authentication=$auth; Detail=$assessment.Detail})
             if ($assessment.Status -eq 'NotAssessed') { Register-ADAuditNotAssessed -Name 'AD CS enrollment endpoint' -Switch 'adcs' -Target $url -Reason $assessment.Detail }

@@ -47,18 +47,34 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 This runs every available audit check and produces a full security report. It is the recommended way to use this tool.
 
-The console shows how many checks were selected out of the available checks, how many were skipped, and the current check number. Overall progress counts completed checks; it is not an estimate of remaining time. Within a check, phases with known totals show counts and percentages. Directory requests and other operations without a known total show their current stage instead of a made-up percentage. Progress is cleared on success or failure, and report generation has its own stages. A blocking external command may not emit updates until it returns.
+The console shows how many checks were selected out of the available checks, how many were skipped, and the current check number. Overall progress counts completed checks; it is not an estimate of remaining time. Within a check, phases with known totals show counts and percentages. Directory requests and other operations without a known total show their current stage instead of a made-up percentage. While a remote call is waiting for an answer, both progress bars repeat the check number, phase, target and elapsed time about every five seconds (console lines are throttled); the percentage shown is the measured completed work and never advances just because time passes. Progress is cleared on success, failure or cancellation, and report generation has its own stages.
 
-### Auditing an isolated DC clone
+### Remote collection: deadlines, connection cache and parallel targets
 
-For an isolated copy of a domain controller, select **Isolated DC clone** in the GUI or run:
+Every remote operation against a domain controller (CIM over DCOM with optional WinRM fallback, remote event logs, remote PowerShell, SYSVOL access, replication metadata and the native `dcdiag`, `repadmin` and `w32tm` tools) runs as a cancellable worker with an end-to-end deadline that includes name resolution, connection setup, the operation and any transport fallback:
+
+| Option | Default | Effect |
+|---|---|---|
+| `-TargetTimeoutSec <5-3600>` | 60 | Deadline per remote target operation. On expiry the worker is stopped (native tools and child processes are killed), the target is recorded as **not assessed (Timeout)**, results already collected are kept and the audit continues. |
+| `-ConnectionCacheSec <0-86400>` | 300 | How long a target/protocol **connection** failure (unreachable or timeout) suppresses another attempt in the same run. Access denied and unsupported operations are never cached, and a DCOM failure does not prevent a permitted WinRM attempt. Every skipped operation is recorded with the reason and the time of the next allowed attempt. |
+| `-MaxConcurrency <1-16>` | 2 | Parallel target workers inside a check (Domain Audit per-DC collectors and the DC port probes). `1` is the serial troubleshooting mode and produces the same findings and coverage. |
+
+Every target is resolved once per run (5 s bound; the answer, a missing record, or "resolver did not answer" is cached) and probes connect to the resolved address. Before the first attempt on a transport, a 3-second TCP probe of the port that transport needs (135 for DCOM, RPC and event logs, 389 for dcdiag, 5985 for WinRM, 445 for SYSVOL, 9389 for replication metadata, 80/443 for AD CS web enrollment) replaces the protocol's own timeout: a host that is down is recorded as unreachable within seconds instead of after 15 to 40 s, and a DC whose LDAP port does not answer skips all ten dcdiag tests with one recorded reason. Short DC names and their domain FQDNs share one cache entry.
+
+Coverage records (`not_assessed.csv`, the report's *Assessment scope and coverage* section) carry a collection outcome: `Timeout`, `Unreachable`, `AccessDenied`, `Unsupported`, `Excluded` (isolated-host scope) or `Unavailable`. Success means the collection succeeded, not that a control passed. CIM sessions are reused within a run and disposed at the end; the connection cache is reset between runs. `audit_run.json` records the settings, worker counts and transport failures of the run.
+
+Known limits: the DNS zone posture report (`-dnszone`) still uses the DnsServer module's own timeouts; a worker that ignores cancellation (rare, native RPC blocked inside a cmdlet) is abandoned after a five-second grace period, reported in the run metadata and console, and never reused.
+
+### Auditing an isolated host (copy of a domain controller)
+
+For an isolated copy of a domain controller, select **Isolated host (-IsolateHost)** in the GUI or run:
 
 ```powershell
-.\AdAudit-PS7.ps1 -all -IsolatedClone
-# If the actual clone date is known, also supply -SnapshotDate yyyy-MM-dd.
+.\AdAudit-PS7.ps1 -all -IsolateHost
+# If the actual copy date is known, also supply -SnapshotDate yyyy-MM-dd.
 ```
 
-This mode identifies the reports as an assessment of an isolated copy. It skips remote DC operational probes and production replication validation, retains local and directory-based checks, and records excluded coverage. It is not a network-disconnection mechanism: directory access and any separately selected password breach lookup still need their normal connectivity. `-SnapshotDate` is optional context; it does not rewind the audit clock. On an old clone, inactivity, password age, recent changes, and other time-based observations may reflect the age of the copy. Verify them against production before remediation. These reports do not establish the current production environment's health or risk.
+`-IsolatedClone` remains accepted as an alias and behaves identically. This mode identifies the reports as an assessment of an isolated copy. It records remote DC operational probes as excluded before any connection is opened, skips production replication validation, retains local and directory-based checks, and records excluded coverage. It is not a network-disconnection mechanism: directory access and any separately selected password breach lookup still need their normal connectivity. `-SnapshotDate` is optional context (it must be a valid past or current date and requires `-IsolateHost`); it does not rewind the audit clock. On an old copy, inactivity, password age, recent changes, and other time-based observations may reflect the age of the copy. Verify them against production before remediation. These reports do not establish the current production environment's health or risk. Reports and metadata written by earlier versions (`AssessmentMode = IsolatedClone`) remain readable.
 
 **Run a single check** either through the runner or by starting its file; both give the same output folders and reports:
 
@@ -175,8 +191,11 @@ Other output:
 | Switch | Description |
 |---|---|
 | `-KeepLegacyArtifacts` | Retain legacy evidence layout inside this run's folder; never reuse earlier-run evidence |
-| `-IsolatedClone` | Assess an isolated DC copy, skip remote DC operational probes, and identify snapshot limitations in reports |
-| `-SnapshotDate yyyy-MM-dd` | Optional known clone date; requires `-IsolatedClone` and cannot be in the future |
+| `-IsolateHost` | Assess an isolated copy of a DC: local collection only, remote DC operational probes recorded as excluded, snapshot limitations identified in reports (alias: `-IsolatedClone`) |
+| `-SnapshotDate yyyy-MM-dd` | Optional known copy date; requires `-IsolateHost`, must be a valid date and cannot be in the future |
+| `-TargetTimeoutSec <5-3600>` | Deadline per remote target operation including transport fallback (default 60) |
+| `-ConnectionCacheSec <0-86400>` | Lifetime of a cached target/protocol connection failure before another attempt (default 300) |
+| `-MaxConcurrency <1-16>` | Parallel target workers inside a check; `1` = serial troubleshooting mode (default 2) |
 | `-DnsZoneOutputRoot <path>` | Custom output directory for DNS zone reports |
 | `-DnsIncludeRecordCounts` | Include record counts in DNS zone report |
 | `-DnsIncludeSystemZones` | Include system DNS zones in the report |
@@ -272,7 +291,7 @@ Computer activity is assessed using multiple AD timestamps. A recent machine-pas
 Regression fixtures exercise account classification, ACL and AD CS interpretation, coverage handling, and generated reports without contacting a domain or replicating credentials. From PowerShell 7 with Pester installed:
 
 ```powershell
-$testFiles = Get-ChildItem .\Tests\*.Tests.ps1 | Where-Object Name -notin @('Report.Tests.ps1','PasswordLookup.Tests.ps1','ProgressChecks.Tests.ps1','LateralSeverity.Tests.ps1')
+$testFiles = Get-ChildItem .\Tests\*.Tests.ps1 | Where-Object Name -notin @('Report.Tests.ps1','PasswordLookup.Tests.ps1','ProgressChecks.Tests.ps1','LateralSeverity.Tests.ps1','WorkerRuntime.Tests.ps1')
 $result = Invoke-Pester -Script $testFiles.FullName -PassThru
 if ($result.FailedCount -gt 0) { throw 'Offline regression tests failed.' }
 pwsh -NoProfile -File .\Tests\Report.Tests.ps1
@@ -283,9 +302,13 @@ pwsh -NoProfile -File .\Tests\ProgressChecks.Tests.ps1
 if ($LASTEXITCODE -ne 0) { throw 'Check progress tests failed.' }
 pwsh -NoProfile -File .\Tests\LateralSeverity.Tests.ps1
 if ($LASTEXITCODE -ne 0) { throw 'Lateral severity tests failed.' }
+pwsh -NoProfile -File .\Tests\WorkerRuntime.Tests.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Worker runtime tests failed.' }
 ```
 
-These tests do not replace a pilot audit in a representative AD environment.
+The Pester suites use the in-process seam (`ADAuditWorkerMode = 'InProcess'`) so command mocks apply; `WorkerRuntime.Tests.ps1` exercises real worker runspaces, child processes, deadlines, cancellation cleanup and the runner's pre-collection validation without any AD or network call. Validated with Pester 3.4.0 under PowerShell 7. These tests do not replace a pilot audit in a representative AD environment.
+
+The `Tests\` folder, the packaging script `Build-ADAuditRelease.ps1` and its `dist\` output are developer tooling and are excluded from the synced repository (`.gitignore`); they live only in the development working copy. Run output folders (`<COMPUTERNAME>\<yyyy-MM-dd_HH-mm-ss>\`) are excluded as well.
 
 
 ### IMPORTANT

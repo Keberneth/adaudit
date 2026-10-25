@@ -1,0 +1,10 @@
+# Developer-only files kept out of the synced repository: offline test suites,
+# the release packaging script and its output. The audit itself needs only the
+# runner, the GUI, Library\, Checks\ and Password Audit\.
+Tests/
+Build-ADAuditRelease.ps1
+dist/
+*.zip
+
+# Run output written next to the runner (<COMPUTERNAME>\<yyyy-MM-dd_HH-mm-ss>\...)
+**/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*/
