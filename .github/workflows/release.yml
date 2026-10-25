@@ -1,0 +1,113 @@
+name: Release
+
+# Cut a release by tagging the commit with the version that AdAudit-PS7.ps1 declares:
+#   git tag v9.3.0 && git push origin v9.3.0
+# The workflow verifies the tag against $versionnum, checks that every script parses,
+# assembles the deployment folder (runner, GUI, Library\, Checks\, Password Audit\,
+# README, release notes), writes a SHA-256 manifest and publishes a GitHub Release with
+# the zip attached. A manual run (workflow_dispatch) only uploads the zip as an artifact.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Read the version declared by the runner
+        id: version
+        shell: pwsh
+        run: |
+          $line = Select-String -LiteralPath 'AdAudit-PS7.ps1' -Pattern '^\s*\$versionnum\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $line) { throw 'Could not read $versionnum from AdAudit-PS7.ps1.' }
+          $version = $line.Matches[0].Groups[1].Value
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne $version) {
+            throw "Tag '$env:GITHUB_REF_NAME' does not match the runner version '$version'. Update `$versionnum or retag."
+          }
+          Write-Host "Packaging ADAudit $version"
+
+      - name: Verify every script parses
+        shell: pwsh
+        run: |
+          $failures = @()
+          foreach ($file in (Get-ChildItem -Recurse -Include *.ps1,*.psm1 -File)) {
+            $tokens = $null; $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors) { $failures += "$($file.FullName): $($errors[0].Message)" }
+          }
+          if ($failures) { $failures | ForEach-Object { Write-Host "::error::$_" }; throw "$($failures.Count) script(s) do not parse." }
+          Write-Host "All scripts parse."
+
+      - name: Assemble the deployment folder
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $name = "ADAudit-$env:VERSION"
+          $stage = Join-Path 'dist' $name
+          $required = @(
+            'AdAudit-PS7.ps1', 'ADAudit-GUI.ps1', 'README.md', 'RELEASE-NOTES.md',
+            'Library\ADAudit.Common.ps1', 'Library\ADAudit.Report.ps1',
+            'Password Audit\Invoke-PwnedPasswordCheck.ps1', 'Password Audit\Invoke-SamePasswordCheck.ps1',
+            'Password Audit\PasswordAuditCommon.psm1', 'Password Audit\README.md'
+          )
+          $required += @(Get-ChildItem -LiteralPath 'Checks' -Filter 'Invoke-*Check.ps1' -File | ForEach-Object { "Checks\$($_.Name)" })
+          if (Test-Path -LiteralPath 'LICENSE') { $required += 'LICENSE' }
+          foreach ($relative in $required) {
+            if (-not (Test-Path -LiteralPath $relative)) { throw "Required file missing: $relative" }
+            $destination = Join-Path $stage $relative
+            New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+            Copy-Item -LiteralPath $relative -Destination $destination -Force
+          }
+          $manifest = @("ADAudit $env:VERSION", "Commit: $env:GITHUB_SHA", "Files: $($required.Count)", '')
+          foreach ($relative in ($required | Sort-Object)) {
+            $manifest += "$((Get-FileHash -LiteralPath (Join-Path $stage $relative) -Algorithm SHA256).Hash)  $relative"
+          }
+          Set-Content -LiteralPath (Join-Path $stage 'MANIFEST.txt') -Value $manifest -Encoding UTF8
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath "dist\$name.zip" -CompressionLevel Optimal
+          Copy-Item -LiteralPath (Join-Path $stage 'MANIFEST.txt') -Destination "dist\$name.MANIFEST.txt"
+          Write-Host "Packaged $($required.Count) files into dist\$name.zip"
+
+      - name: Upload the package as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ADAudit-${{ steps.version.outputs.version }}
+          path: |
+            dist/*.zip
+            dist/*.MANIFEST.txt
+          if-no-files-found: error
+
+      - name: Extract the release notes for this version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # The section headed "## <version>" in RELEASE-NOTES.md becomes the release body.
+          $lines = Get-Content -LiteralPath 'RELEASE-NOTES.md'
+          $start = ($lines | Select-String -Pattern ("^## " + [regex]::Escape($env:VERSION)) | Select-Object -First 1).LineNumber
+          $body = if ($start) {
+            $rest = $lines[$start..($lines.Count - 1)]
+            $next = ($rest | Select-String -Pattern '^## ' | Select-Object -First 1).LineNumber
+            if ($next) { $rest[0..($next - 2)] } else { $rest }
+          } else { @("ADAudit $env:VERSION", '', 'See RELEASE-NOTES.md in the package.') }
+          Set-Content -LiteralPath 'dist\release-body.md' -Value $body -Encoding UTF8
+
+      - name: Publish the GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" "dist\ADAudit-$env:VERSION.zip" "dist\ADAudit-$env:VERSION.MANIFEST.txt" --title "ADAudit $env:VERSION" --notes-file 'dist\release-body.md'

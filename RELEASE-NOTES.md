@@ -65,4 +65,4 @@ Offline suites (Pester 3.4.0, PowerShell 7): Core, ProgressChecks, DomainService
 
 ### Package
 
-The deployment folder is the runner, the GUI, `Library\`, `Checks\`, `Password Audit\`, README and these notes; copying only the runner is insufficient. In the development working copy `Build-ADAuditRelease.ps1` stages exactly that set into `dist\ADAudit-v9.3.0\`, verifies every script parses, writes `MANIFEST.txt` with SHA-256 hashes and produces a zip. The test suites, the packaging script and `dist\` are excluded from the synced repository.
+The deployment folder is the runner, the GUI, `Library\`, `Checks\`, `Password Audit\`, README and these notes; copying only the runner is insufficient. Pushing the tag `v9.3.0` runs `.github/workflows/release.yml`, which verifies the tag against `$versionnum`, checks that every script parses, stages exactly that set, writes `MANIFEST.txt` with SHA-256 hashes and publishes the GitHub Release with `ADAudit-v9.3.0.zip` attached. The offline test suites are excluded from the synced repository.

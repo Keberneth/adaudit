@@ -308,7 +308,18 @@ if ($LASTEXITCODE -ne 0) { throw 'Worker runtime tests failed.' }
 
 The Pester suites use the in-process seam (`ADAuditWorkerMode = 'InProcess'`) so command mocks apply; `WorkerRuntime.Tests.ps1` exercises real worker runspaces, child processes, deadlines, cancellation cleanup and the runner's pre-collection validation without any AD or network call. Validated with Pester 3.4.0 under PowerShell 7. These tests do not replace a pilot audit in a representative AD environment.
 
-The `Tests\` folder, the packaging script `Build-ADAuditRelease.ps1` and its `dist\` output are developer tooling and are excluded from the synced repository (`.gitignore`); they live only in the development working copy. Run output folders (`<COMPUTERNAME>\<yyyy-MM-dd_HH-mm-ss>\`) are excluded as well.
+The `Tests\` folder is developer tooling and is excluded from the synced repository (`.gitignore`); it lives only in the development working copy. Run output folders (`<COMPUTERNAME>\<yyyy-MM-dd_HH-mm-ss>\`) are excluded as well.
+
+## Releases
+
+Releases are built by the GitHub Actions workflow in `.github/workflows/release.yml`. To cut one: set `$versionnum` in `AdAudit-PS7.ps1`, add the matching section to `RELEASE-NOTES.md`, commit, then tag and push:
+
+```powershell
+git tag v9.3.0
+git push origin v9.3.0
+```
+
+The workflow checks that the tag matches the declared version, verifies every script parses, assembles the deployment folder (runner, GUI, `Library\`, `Checks\`, `Password Audit\`, README, release notes), writes a SHA-256 manifest and publishes a GitHub Release with `ADAudit-<version>.zip` attached. Deploy the whole zip; copying only the runner is insufficient.
 
 
 ### IMPORTANT
