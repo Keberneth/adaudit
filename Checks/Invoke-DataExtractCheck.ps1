@@ -187,6 +187,7 @@ function Export-ADAuditDataExtract {
     "@Path parameter: '$outRoot'"                        | Out-File -FilePath $log -Append -Encoding utf8
     "@SearchBase parameter: '$SearchBase'"               | Out-File -FilePath $log -Append -Encoding utf8
 
+    Write-ADAuditProgress -Activity 'Data extract: scope inventory' -Status 'Reading host, domain, DC and forest metadata' -PercentComplete -1
     # OS info
     $sysInfo = Get-CimInstance -ClassName Win32_OperatingSystem
     $PSVersionTable | Out-File -FilePath (Join-Path $outRoot "$env:COMPUTERNAME-sysinfo.txt") -Append -Encoding utf8
@@ -280,6 +281,8 @@ function Export-ADAuditDataExtract {
         'userAccountControl','userWorkstations','whenChanged','whenCreated'
     )
 
+    Write-ADAuditProgress -Activity 'Data extract: users' -Status 'Querying user attributes with paged LDAP' -PercentComplete -1
+    $root = $null; $ds = $null; $searchResults = $null
     try {
         $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$SearchBase")
         $ds = New-Object System.DirectoryServices.DirectorySearcher($root)
@@ -295,7 +298,11 @@ function Export-ADAuditDataExtract {
             $w = [System.IO.StreamWriter]::new($usersCsvPath, $false, [System.Text.Encoding]::UTF8)
             $w.Write(($userHeader -join $delimiter) + $eol)
 
-            foreach ($r in $ds.FindAll()) {
+            $searchResults = $ds.FindAll()
+            $userIndex = 0
+            foreach ($r in $searchResults) {
+                Write-ADAuditProgress -Activity 'Data extract: users' -Status "$userIndex/$($searchResults.Count) users written" -PercentComplete ($userIndex / [math]::Max(1,$searchResults.Count) * 100)
+                $userIndex++
                 $p = $r.Properties
 
                 $managed = ''
@@ -379,8 +386,13 @@ function Export-ADAuditDataExtract {
     } catch {
         "@Problem exporting users (raw LDAP): $_" | Out-File -FilePath $log -Append -Encoding utf8
         Write-Both "    [!] Problem exporting users. See consoleOutput.txt"
+    } finally {
+        if ($null -ne $searchResults) { $searchResults.Dispose() }
+        if ($ds) { $ds.Dispose() }
+        if ($root) { $root.Dispose() }
     }
 
+    Write-ADAuditProgress -Activity 'Data extract: groups' -Status 'Querying group attributes' -PercentComplete -1
     # Groups
     $groupProps = @('CN','description','displayName','distinguishedName','GroupCategory','GroupScope','ManagedBy','memberOf','msDS-PSOApplied','name','objectSID','sAMAccountName','whenCreated','whenChanged')
     $groupHeader = $groupProps + @('relativeIdentifier')
@@ -391,7 +403,11 @@ function Export-ADAuditDataExtract {
     try {
         $w = [System.IO.StreamWriter]::new($groupsCsvPath, $false, [System.Text.Encoding]::UTF8)
         $w.Write(($groupHeader -join $delimiter) + $eol)
+        $groupIndex = 0
+        $groupTotal = @($groups).Count
         foreach ($g in $groups) {
+            Write-ADAuditProgress -Activity 'Data extract: groups' -Status "$groupIndex/$groupTotal groups written" -PercentComplete ($groupIndex / [math]::Max(1,$groupTotal) * 100)
+            $groupIndex++
             $memberof = ($g.memberOf | ForEach-Object { ((($_ -split ',')[0]) -replace '^CN=','') }) -join ', '
             $pso = (($g.'msDS-PSOApplied' -join ';') -replace ",CN=Password Settings Container,CN=System,$domainDN",'') -replace 'CN=',''
             $line = @(
@@ -417,6 +433,7 @@ function Export-ADAuditDataExtract {
         if ($w) { $w.Close() }
     }
 
+    Write-ADAuditProgress -Activity 'Data extract: computers' -Status 'Reading and exporting computer attributes' -PercentComplete -1
     # Computers (keep as-is; if you later hit FileTime errors here, apply the same raw LDAP pattern)
     $computerProps = @('cn','description','displayName','distinguishedName','LastLogonDate','name','objectSid','operatingSystem','operatingSystemServicePack','operatingSystemVersion','primaryGroupID','PasswordLastSet','userAccountControl','whenCreated','whenChanged')
     $computers = Get-ADComputer -SearchBase $SearchBase -Filter * -Properties $computerProps -ErrorAction SilentlyContinue
@@ -426,6 +443,7 @@ function Export-ADAuditDataExtract {
     } | ConvertTo-Csv -Delimiter '|' -NoTypeInformation | ForEach-Object { $_ -replace '"','' } |
         Out-File -FilePath (Join-Path $outRoot "$($domainInfo.DNSRoot)-Computers.csv") -Append
 
+    Write-ADAuditProgress -Activity 'Data extract: organizational units' -Status 'Reading and exporting OU attributes' -PercentComplete -1
     # OUs (unchanged)
     $ouProps = @('CanonicalName','Description','DisplayName','DistinguishedName','ManagedBy','Name','whenChanged','whenCreated')
     Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * -Properties $ouProps -ErrorAction SilentlyContinue |
@@ -445,8 +463,12 @@ function Export-ADAuditDataExtract {
     New-Item -ItemType Directory -Path (Join-Path $gpRoot 'Reports') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $gpRoot 'Inheritance') -Force | Out-Null
 
-    $gpos = Get-GPO -All -ErrorAction SilentlyContinue
+    Write-ADAuditProgress -Activity 'Data extract: GPO reports' -Status 'Enumerating policies' -PercentComplete -1
+    $gpos = @(Get-GPO -All -ErrorAction SilentlyContinue)
+    $gpoIndex = 0
     foreach ($gpo in $gpos) {
+        Write-ADAuditProgress -Activity 'Data extract: GPO reports' -Status "Generating report $($gpoIndex + 1)/$($gpos.Count): $($gpo.DisplayName)" -PercentComplete ($gpoIndex / [math]::Max(1,$gpos.Count) * 100)
+        $gpoIndex++
         $name = Remove-InvalidFileNameChars $gpo.DisplayName
 
         # Prevent path-too-long / weird names
@@ -460,6 +482,7 @@ function Export-ADAuditDataExtract {
         }
     }
 
+    Write-ADAuditProgress -Activity 'Data extract: GPO inheritance' -Status 'Reading domain and OU link inheritance' -PercentComplete -1
     $domainGPI = Get-GPInheritance -Target $domainDN -ErrorAction SilentlyContinue
     $domainGPI | Select-Object Name,ContainerType,Path,GpoInheritanceBlocked | Format-List |
         Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$domainDN.txt")
@@ -467,7 +490,11 @@ function Export-ADAuditDataExtract {
         Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$domainDN.txt") -Append
 
     $adOUs = Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * -ErrorAction SilentlyContinue
+    $ouIndex = 0
+    $ouTotal = @($adOUs).Count
     foreach ($ou in $adOUs) {
+        Write-ADAuditProgress -Activity 'Data extract: GPO inheritance' -Status "Reading OU $($ouIndex + 1)/${ouTotal}: $($ou.DistinguishedName)" -PercentComplete ($ouIndex / [math]::Max(1,$ouTotal) * 100)
+        $ouIndex++
         $fn = Remove-InvalidFileNameChars $ou.DistinguishedName
         if ($fn.Length -gt 150) { $fn = $fn.Substring(0,150) }
 
@@ -478,6 +505,7 @@ function Export-ADAuditDataExtract {
             Out-File -FilePath (Join-Path (Join-Path $gpRoot 'Inheritance') "$fn.txt") -Append
     }
 
+    Write-ADAuditProgress -Activity 'Data extract: OU ACL schema' -Status 'Reading schema GUID and extended-right names' -PercentComplete -1
     # OU ACLs (unchanged)
     New-Item -ItemType Directory -Path (Join-Path $outRoot 'OU\ACLs') -Force | Out-Null
     $schemaIDGUID = @{}
@@ -497,7 +525,10 @@ function Export-ADAuditDataExtract {
         $ouDns += Get-ADOrganizationalUnit -SearchBase $SearchBase -Filter * | Select-Object -ExpandProperty DistinguishedName
     }
 
+    $aclIndex = 0
     foreach ($ouDN in $ouDns) {
+        Write-ADAuditProgress -Activity 'Data extract: OU ACL export' -Status "Reading container $($aclIndex + 1)/$($ouDns.Count): $ouDN" -PercentComplete ($aclIndex / [math]::Max(1,$ouDns.Count) * 100)
+        $aclIndex++
         $fn = Remove-InvalidFileNameChars $ouDN
         if ($fn.Length -gt 150) { $fn = $fn.Substring(0,150) }
 
@@ -515,6 +546,7 @@ function Export-ADAuditDataExtract {
         }
     }
 
+    Write-ADAuditProgress -Activity 'Data extract: schema and policy' -Status 'Reading confidential attributes, password policies and trusts' -PercentComplete -1
     # Confidentiality bit (unchanged)
     try {
         Get-ADObject -SearchBase "CN=Schema,CN=Configuration,$domainDN" -LDAPFilter '(searchFlags:1.2.840.113556.1.4.803:=128)' |
@@ -557,6 +589,7 @@ function Export-ADAuditDataExtract {
 
     "@Finished AD data extract at $(Get-Date -Format G)" | Out-File -FilePath $log -Append -Encoding utf8
 
+    Write-ADAuditProgress -Activity 'Data extract: archive' -Status 'Compressing collected evidence; archive size not known in advance' -PercentComplete -1
     # Zip output (best-effort)
     $zip = Join-Path $Path ("$domainDN.zip")
     if (New-ZipFile -Path $zip -Source $outRoot) {
@@ -569,7 +602,12 @@ function Export-ADAuditDataExtract {
 }
 
 function Invoke-DataExtractCheck {
-    Export-ADAuditDataExtract
+    Write-ADAuditProgress -Activity 'AD data extract' -Status 'Starting collection' -PercentComplete -1
+    try {
+        Export-ADAuditDataExtract
+    } finally {
+        Write-ADAuditProgress -Activity 'AD data extract' -Completed
+    }
 }
 
 # ---- Standalone launch --------------------------------------------------------------------

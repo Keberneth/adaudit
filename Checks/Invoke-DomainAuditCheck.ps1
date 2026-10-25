@@ -32,6 +32,16 @@ Function Get-MachineAccountQuota {
     }
 }
 
+function Get-ADAuditSmbServerConfiguration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ComputerName)
+    # The SMB provider exposes the same effective configuration as the cmdlet,
+    # using local CIM or a DCOM session before considering a WSMan fallback.
+    $response = Invoke-ADAuditCimMethod -ComputerName $ComputerName -Namespace 'root/Microsoft/Windows/SMB' -ClassName MSFT_SmbServerConfiguration -MethodName GetConfiguration -UseWsmanFallback -ErrorAction Stop
+    if ($response.ReturnValue -ne 0 -or $null -eq $response.Output) { throw 'The SMB provider did not return its effective configuration.' }
+    $response.Output
+}
+
 Function Get-SMB1Support {
     # Check whether the DCs still support the SMBv1 server. This is a per-host
     # setting on each DC, so we query the DCs rather than the host running the
@@ -44,19 +54,21 @@ Function Get-SMB1Support {
 
     foreach ($dc in $dcList) {
         $enabled = $null
-        # Preferred: Get-SmbServerConfiguration over WinRM (version-agnostic, authoritative).
+        # Effective configuration through local CIM or DCOM; no remote script.
         try {
-            $enabled = Invoke-Command -ComputerName $dc -ScriptBlock { [bool](Get-SmbServerConfiguration).EnableSMB1Protocol } -ErrorAction Stop
+            $config = Get-ADAuditSmbServerConfiguration -ComputerName $dc
+            if ($null -eq $config.EnableSMB1Protocol) { throw 'SMB1 state was not returned.' }
+            $enabled = [bool]$config.EnableSMB1Protocol
         }
         catch {
             # Fallback: SMB1 REG_DWORD (0 = disabled). Absent is ambiguous on modern OS.
             $reg = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -ValueName 'SMB1'
             if (-not $reg.Success) {
-                Register-ADAuditNotAssessed -Name 'Get-SMB1Support' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "SMBv1 status needs Get-SmbServerConfiguration over WinRM or the SMB1 registry value; neither was reachable on ${dc}: $($reg.Error)"
+                Register-ADAuditNotAssessed -Name 'Get-SMB1Support' -Switch 'domainaudit' -Target $dc -Reason "SMBv1 configuration and registry evidence were unavailable through local/CIM collection on ${dc}: $($reg.Error)"
                 continue
             }
             if ($null -eq $reg.Value) {
-                Register-ADAuditNotAssessed -Name 'Get-SMB1Support' -Switch 'domainaudit' -Target $dc -Reason "The SMB1 registry value is not set on $dc and WinRM was unavailable, so SMBv1 server state is ambiguous (cannot confirm enabled or disabled)."
+                Register-ADAuditNotAssessed -Name 'Get-SMB1Support' -Switch 'domainaudit' -Target $dc -Reason "The SMB1 registry value is not set on $dc and the effective SMB configuration was unavailable; enabled/disabled state is unknown."
                 continue
             }
             $enabled = ($reg.Value -ne 0)
@@ -81,7 +93,7 @@ Function Get-DCsNotOwnedByDA {
     if ($totalcount -gt 0) {
         foreach ($machine in $domaincontrollers) {
             $progresscount++
-            Write-Progress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Currently identified $count" -PercentComplete ($progresscount / $totalcount * 100)
+            Write-ADAuditProgress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Currently identified $count" -PercentComplete ($progresscount / $totalcount * 100)
             $owner = $machine.ntSecurityDescriptor.Owner
             if ($null -eq $owner) {
                 Write-Both "    [!] Could not read owner of DC object $($machine.Name); skipping."
@@ -91,7 +103,7 @@ Function Get-DCsNotOwnedByDA {
                 $count++
             }
         }
-        Write-Progress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Ready" -Completed
+        Write-ADAuditProgress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Ready" -Completed
     }
     if ($count -gt 0) {
         Write-Both "    [!] We found $count DCs not owned by Domains Admins group! see dcs_not_owned_by_da.txt"
@@ -479,40 +491,59 @@ Function Get-RecycleBinState {
 }
 
 Function Get-CriticalServicesStatus {
-    #Check AD services status
+    # Query the selected services together: an unavailable DC should incur one
+    # transport attempt/fallback sequence, not one for each service.
     Write-Both "    [+] Checking services on all DCs"
-    $dcList = @()
-    (Get-ADDomainController -Filter *) | ForEach-Object { $dcList += $_.Name }
-    $searcher = [ADSISearcher] "(objectClass=msDFSR-GlobalSettings)"
-    $objectExists = $searcher.FindOne() -ne $null
-    if ($objectExists) {
-        $services = @("dns", "netlogon", "kdc", "w32time", "dfsr")
-    }
-    else {
-        $services = @("dns", "netlogon", "kdc", "w32time", "ntfrs")
-    }
+    try {
+        Write-ADAuditProgress -Activity 'Domain controller services' -Status 'Enumerating domain controllers' -PercentComplete -1
+        $dcList = @(Get-ADDomainController -Filter * -ErrorAction Stop | Select-Object -ExpandProperty Name)
+        if ($dcList.Count -eq 0) {
+            Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Reason 'No domain controllers returned; service state was not assessed.'
+            return
+        }
+        Write-ADAuditProgress -Activity 'Domain controller services' -Status 'Detecting SYSVOL replication service' -PercentComplete -1
+        $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList '(objectClass=msDFSR-GlobalSettings)'
+        try { $objectExists = $null -ne $searcher.FindOne() }
+        finally { $searcher.Dispose() }
+        $services = @('dns', 'netlogon', 'kdc', 'w32time')
+        $services += if ($objectExists) { 'dfsr' } else { 'ntfrs' }
+        $serviceFilter = ($services | ForEach-Object { "Name='$_'" }) -join ' OR '
+        $completed = 0
 
-    foreach ($DC in $dcList) {
-        foreach ($service in $services) {
+        foreach ($DC in $dcList) {
+            $outcome = 'queried'
+            Write-ADAuditProgress -Activity 'Domain controller services' -Status "DC $($completed + 1)/$($dcList.Count): querying $DC ($($services.Count) services); $completed DCs completed" -PercentComplete ([int](100 * $completed / $dcList.Count)) -Force
             try {
-                $checkService = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $DC -Filter "Name='$service'" -UseWsmanFallback
-                if (-not $checkService) {
-                    Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -RequiresRemotePS -Reason "Service query returned no data (DC unreachable over CIM/DCOM or WinRM); service state unknown, not confirmed running."
-                    continue
+                $serviceRows = @(Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $DC -Filter $serviceFilter -Property Name,State -UseWsmanFallback -ErrorAction Stop)
+                $servicesByName = @{}
+                foreach ($row in $serviceRows) {
+                    if ($row.Name) { $servicesByName[[string]$row.Name] = $row }
                 }
-
-                $serviceStatus = [string]$checkService.State
-                if (-not $serviceStatus) {
-                    Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -RequiresRemotePS -Reason "Service state was empty (DC unreachable over CIM/DCOM or WinRM)."
+                foreach ($service in $services) {
+                    $checkService = $servicesByName[$service]
+                    if (-not $checkService) {
+                        Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -Reason 'The service was not returned by the batched query; its state is unknown, not confirmed running.'
+                        continue
+                    }
+                    $serviceStatus = [string]$checkService.State
+                    if (-not $serviceStatus) {
+                        Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -Reason 'The service query returned an empty state.'
+                    } elseif ($serviceStatus -ne 'Running') {
+                        Write-Both "        [!] Service $service is not running on $DC!"
+                    }
                 }
-                elseif ($serviceStatus -ne "Running") {
-                    Write-Both "        [!] Service $service is not running on $DC!"
-                }
-            }
-            catch {
-                Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target "$DC/$service" -RequiresRemotePS -Reason "Could not query service over CIM/DCOM or WinRM: $($_.Exception.Message)"
+            } catch {
+                $outcome = 'not assessed'
+                Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Target $DC -Reason "Could not query services ($($services -join ', ')) over local/CIM collection: $($_.Exception.Message)"
+            } finally {
+                $completed++
+                Write-ADAuditProgress -Activity 'Domain controller services' -Status "DC $completed/$($dcList.Count): $DC $outcome" -PercentComplete ([int](100 * $completed / $dcList.Count))
             }
         }
+    } catch {
+        Register-ADAuditNotAssessed -Name 'Get-CriticalServicesStatus' -Switch 'domainaudit' -Reason "Service target or replication-service discovery failed: $($_.Exception.Message)"
+    } finally {
+        Write-ADAuditProgress -Activity 'Domain controller services' -Status 'Service collection finished' -Completed
     }
 }
 
@@ -527,14 +558,14 @@ Function Get-LastWUDate {
             $wuService = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $DC -Filter "Name='wuauserv'" -UseWsmanFallback
             $startMode = $wuService.StartMode
             if (-not $startMode) {
-                Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Windows Update service start mode could not be read (DC unreachable over CIM/DCOM or WinRM)."
+                Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -Reason "Windows Update service start mode could not be read (DC unreachable over CIM/DCOM or WinRM)."
             }
             elseif ($startMode -eq "Disabled") {
                 Write-Both "        [!] Windows Update service is disabled on $DC!"
             }
         }
         catch {
-            Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not query Windows Update service over CIM/DCOM or WinRM: $($_.Exception.Message)"
+            Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -Reason "Could not query Windows Update service over CIM/DCOM or WinRM: $($_.Exception.Message)"
         }
     }
 
@@ -542,9 +573,11 @@ Function Get-LastWUDate {
     $totalcount = ($dcList | Measure-Object | Select-Object -ExpandProperty Count)
     foreach ($DC in $dcList) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for last Windows Update installation on all DCs..." -Status "Currently searching on $DC" -PercentComplete ($progresscount / $totalcount * 100)
+        Write-ADAuditProgress -Activity "Searching for last Windows Update installation on all DCs..." -Status "Currently searching on $DC" -PercentComplete ($progresscount / $totalcount * 100)
         try {
-            $lastHotfix = (Get-HotFix -ComputerName $DC | Where-Object { $_.InstalledOn -ne $null } | Sort-Object -Descending InstalledOn | Select-Object -First 1).InstalledOn
+            Assert-ADAuditRemoteTargetAllowed -ComputerName $DC
+            $hotfixes = if (Test-ADAuditLocalComputer $DC) { Get-HotFix -ErrorAction Stop } else { Get-HotFix -ComputerName $DC -ErrorAction Stop }
+            $lastHotfix = ($hotfixes | Where-Object { $_.InstalledOn -ne $null } | Sort-Object -Descending InstalledOn | Select-Object -First 1).InstalledOn
             if ($null -eq $lastHotfix) {
                 # No dated hotfix data returned - do NOT treat as "not up to date" ($null -lt $date is $true)
                 Write-Both "        [!] Could not determine last update date on $DC (no dated hotfix data returned)"
@@ -557,11 +590,11 @@ Function Get-LastWUDate {
             }
         }
         catch {
-            Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not read installed hotfixes (Get-HotFix over RPC failed): $($_.Exception.Message)"
+            Register-ADAuditNotAssessed -Name 'Get-LastWUDate' -Switch 'domainaudit' -Target $DC -Reason "Could not read installed hotfixes (Get-HotFix over RPC failed): $($_.Exception.Message)"
         }
         $progresscount++
     }
-    Write-Progress -Activity "Searching for last Windows Update installation on all DCs..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for last Windows Update installation on all DCs..." -Status "Ready" -Completed
 }
 
 Function Get-TimeSource {
@@ -572,15 +605,16 @@ Function Get-TimeSource {
     foreach ($DC in $dcList) {
         $ntpSource = $null
         try {
-            $ntpSource = (w32tm /query /source /computer:$DC 2>&1 | Out-String).Trim()
+            Assert-ADAuditRemoteTargetAllowed -ComputerName $DC
+            $ntpSource = if (Test-ADAuditLocalComputer $DC) { (w32tm /query /source 2>&1 | Out-String).Trim() } else { (w32tm /query /source /computer:$DC 2>&1 | Out-String).Trim() }
         }
         catch {
-            Register-ADAuditNotAssessed -Name 'Get-TimeSource' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "w32tm could not query the time source (RPC to W32Time failed): $($_.Exception.Message)"
+            Register-ADAuditNotAssessed -Name 'Get-TimeSource' -Switch 'domainaudit' -Target $DC -Reason "w32tm could not query the time source (RPC to W32Time failed): $($_.Exception.Message)"
             continue
         }
         # Reject error codes (e.g. 0x800706BA) and error text instead of printing them as a "source".
         if ([string]::IsNullOrWhiteSpace($ntpSource) -or $ntpSource -match '0x[0-9A-Fa-f]{6,8}' -or $ntpSource -match 'error') {
-            Register-ADAuditNotAssessed -Name 'Get-TimeSource' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not determine NTP source ('$ntpSource'). w32tm needs RPC to the W32Time service on the DC."
+            Register-ADAuditNotAssessed -Name 'Get-TimeSource' -Switch 'domainaudit' -Target $DC -Reason "Could not determine NTP source ('$ntpSource'). w32tm needs RPC to the W32Time service on the DC."
         }
         else {
             Write-Both "        [+] $DC is syncing time from $ntpSource"
@@ -611,12 +645,12 @@ Function Check-Shares {
             $shareList = @(Get-ADAuditCimInstance -ClassName Win32_Share -ComputerName $DC -UseWsmanFallback)
         }
         catch {
-            Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Could not enumerate shares over CIM/DCOM or WinRM: $($_.Exception.Message)"
+            Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -Target $DC -Reason "Could not enumerate shares over CIM/DCOM or WinRM: $($_.Exception.Message)"
             continue
         }
 
         if (-not $shareList -or $shareList.Count -eq 0) {
-            Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -Target $DC -RequiresRemotePS -Reason "Share enumeration returned no data (DC unreachable over CIM/WinRM); SYSVOL/NETLOGON presence is unknown, not confirmed present."
+            Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -Target $DC -Reason "Share enumeration returned no data (DC unreachable over CIM/WinRM); SYSVOL/NETLOGON presence is unknown, not confirmed present."
             continue
         }
 
@@ -628,7 +662,7 @@ Function Check-Shares {
     }
 
     if ($assessed -eq 0 -and $dcList.Count -gt 0) {
-        Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -RequiresRemotePS -Reason "SYSVOL/NETLOGON shares could not be checked on ANY domain controller ($($dcList.Count) total). Requires CIM/DCOM or WinRM to the DCs. Posture is unknown, not 'all shares present'."
+        Register-ADAuditNotAssessed -Name 'Check-Shares' -Switch 'domainaudit' -Reason "SYSVOL/NETLOGON shares could not be checked on ANY domain controller ($($dcList.Count) total). Requires CIM/DCOM or WinRM to the DCs. Posture is unknown, not 'all shares present'."
     }
 }
 
@@ -700,7 +734,7 @@ Function Get-PrintSpoolerOnDCs {
         try {
             $spooler = Get-ADAuditCimInstance -ClassName Win32_Service -Filter "Name='Spooler'" -ComputerName $dc -UseWsmanFallback
             if (-not $spooler) {
-                Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "Win32_Service query returned no data for the Spooler service (DC unreachable over CIM/DCOM or WinRM); spooler state unknown."
+                Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Target $dc -Reason "Win32_Service query returned no data for the Spooler service (DC unreachable over CIM/DCOM or WinRM); spooler state unknown."
                 continue
             }
             $assessed++
@@ -713,7 +747,7 @@ Function Get-PrintSpoolerOnDCs {
             }
         }
         catch {
-            Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "Could not query Print Spooler over CIM/DCOM or WinRM: $($_.Exception.Message)"
+            Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Target $dc -Reason "Could not query Print Spooler over CIM/DCOM or WinRM: $($_.Exception.Message)"
         }
     }
 
@@ -722,7 +756,7 @@ Function Get-PrintSpoolerOnDCs {
         Write-Nessus-Finding "PrintSpoolerOnDC" "KB1203" ([System.IO.File]::ReadAllText($evidencePath))
     }
     elseif ($assessed -eq 0) {
-        Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -RequiresRemotePS -Reason "Print Spooler state could not be queried on ANY domain controller ($($dcList.Count) total). Requires CIM/DCOM or WinRM to the DCs; from a non-DC host with those blocked the spooler posture is unknown, not 'not running'."
+        Register-ADAuditNotAssessed -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Reason "Print Spooler state could not be queried on ANY domain controller ($($dcList.Count) total). Requires CIM/DCOM or WinRM to the DCs; from a non-DC host with those blocked the spooler posture is unknown, not 'not running'."
     }
     else {
         Write-Both "    [+] Print Spooler is not running on any of the $assessed assessed domain controller(s) (of $($dcList.Count) total)"
@@ -744,19 +778,20 @@ Function Get-SMBSigningStatus {
         $reg = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -ValueName 'RequireSecuritySignature'
         $requireSigning = $null
 
-        if ($reg.Success) {
+        if ($reg.Success -and $null -ne $reg.Value) {
             $requireSigning = $reg.Value   # $null here means the value is not set on the DC
             $assessed++
         }
         else {
-            # Fallback: Get-SmbServerConfiguration over WinRM
+            # Effective SMB provider fallback via local CIM or DCOM first.
             try {
-                $smbConfig = Invoke-Command -ComputerName $dc -ScriptBlock { (Get-SmbServerConfiguration).RequireSecuritySignature } -ErrorAction Stop
+                $smbConfig = (Get-ADAuditSmbServerConfiguration -ComputerName $dc).RequireSecuritySignature
+                if ($null -eq $smbConfig) { throw 'SMB server configuration returned no value.' }
                 $requireSigning = if ($smbConfig) { 1 } else { 0 }
                 $assessed++
             }
             catch {
-                Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Target $dc -RequiresRemotePS -Reason "SMB signing posture needs the DC's registry (StdRegProv over CIM/DCOM/WinRM) or Get-SmbServerConfiguration over WinRM; neither was reachable: $($reg.Error)"
+                Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Target $dc -Reason "SMB signing registry and effective configuration were unavailable through local/CIM collection: $($reg.Error)"
                 continue
             }
         }
@@ -780,7 +815,7 @@ Function Get-SMBSigningStatus {
         Write-Nessus-Finding "SMBSigningNotRequired" "KB1204" ([System.IO.File]::ReadAllText($evidencePath))
     }
     elseif ($assessed -eq 0) {
-        Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -RequiresRemotePS -Reason "SMB signing could not be queried on ANY domain controller ($($dcList.Count) total). Requires remote registry (CIM/DCOM/WinRM) or Get-SmbServerConfiguration over WinRM. Posture is unknown, not 'enforced'."
+        Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Reason "SMB signing could not be queried on ANY domain controller ($($dcList.Count) total). Local/CIM registry and effective SMB configuration were unavailable. Posture is unknown."
     }
     else {
         Write-Both "    [+] SMB signing is required on all of the $assessed of $($dcList.Count) domain controller(s) assessed"

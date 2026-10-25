@@ -21,15 +21,15 @@
 function Get-ADUsersWithoutPreAuth {
     try {
         $asrepUsers = Get-ADUser -Filter 'DoesNotRequirePreAuth -eq True -and Enabled -eq True' `
-                                 -Properties SamAccountName, Name, userAccountControl
+                                 -Properties SamAccountName, Name, userAccountControl -ErrorAction Stop
     }
     catch {
         $asrepUsers = @()
     }
 
     if (-not $asrepUsers -or $asrepUsers.Count -eq 0) {
-        $asrepUsers = Get-ADUser -LDAPFilter '(&(userAccountControl:1.2.840.113556.1.4.803:=4194304)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
-                                 -Properties SamAccountName, Name, userAccountControl
+        $asrepUsers = Get-ADUser -LDAPFilter '(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+                                 -Properties SamAccountName, Name, userAccountControl -ErrorAction Stop
     }
 
     $asrepUsers = $asrepUsers | Select-Object SamAccountName, Name, userAccountControl

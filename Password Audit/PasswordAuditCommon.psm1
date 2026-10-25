@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Shared helpers for the Password Audit scripts (Invoke-PwnedPasswordCheck.ps1 and Invoke-SamePasswordCheck.ps1).
 
@@ -20,6 +20,14 @@ transmitted, via the HIBP range endpoint in NTLM mode (?mode=ntlm).
 #>
 
 Set-StrictMode -Version Latest
+
+function Write-PasswordAuditStage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Message)
+    # Host output is visible in a console/transcript without contaminating the
+    # success stream, which can contain credential-equivalent replication data.
+    Write-Host ('[{0}] {1}' -f [datetime]::Now.ToString('HH:mm:ss'), $Message)
+}
 
 function Resolve-DefaultServer {
     [CmdletBinding()]
@@ -176,7 +184,7 @@ function Test-NtlmHashPwned {
     $NtlmHash = $NtlmHash.ToUpperInvariant()
 
     if ($NtlmHash -notmatch '^[A-F0-9]{32}$') {
-        throw "Invalid NTLM hash format: $NtlmHash"
+        throw 'Invalid NTLM hash format; expected 32 hexadecimal characters. The supplied value is not logged.'
     }
 
     $suffix = $NtlmHash.Substring(5)
@@ -235,6 +243,9 @@ function Invoke-HibpNtlmRangeLookup {
     )
 
     $Prefix = $Prefix.ToUpperInvariant()
+    if ($Prefix -notmatch '^[A-F0-9]{5}$') {
+        throw 'Invalid range prefix; expected exactly five hexadecimal characters. The supplied value is not logged.'
+    }
     $uri = 'https://api.pwnedpasswords.com/range/{0}?mode=ntlm' -f $Prefix
 
     $response = $null
@@ -293,7 +304,8 @@ function Invoke-HibpNtlmRangeLookup {
             }
 
             if ($attempt -gt $MaxRetries) {
-                Write-Warning ("Failed pwned lookup for hash prefix {0} after {1} attempt(s): {2}" -f $Prefix, $attempt, $ex.Message)
+                $failureKind = if ($statusCode) { "HTTP $statusCode" } else { 'network/TLS request error' }
+                Write-Warning ("HIBP range lookup failed after {0} attempt(s): {1}. Affected accounts remain LookupFailed. Check HTTPS/proxy/TLS access; no response body or password prefix is logged." -f $attempt, $failureKind)
                 return [pscustomobject]@{
                     Prefix   = $Prefix
                     Failed   = $true
@@ -311,38 +323,43 @@ function Invoke-HibpNtlmRangeLookup {
                 $delay = [math]::Min($delay * 2, 60)
             }
 
-            Write-Warning ("HIBP lookup for prefix {0} failed (attempt {1}/{2}{3}); retrying in {4}s: {5}" -f `
-                $Prefix, ($attempt), ($MaxRetries + 1), $(if ($statusCode) { ", HTTP $statusCode" } else { '' }), $delay, $ex.Message)
+            Write-Warning ("HIBP range request failed (attempt {0}/{1}{2}); retrying in {3}s. Password prefixes and response bodies are not logged." -f `
+                $attempt, ($MaxRetries + 1), $(if ($statusCode) { ", HTTP $statusCode" } else { ', network/TLS request error' }), $delay)
             Start-Sleep -Seconds ([int]$delay)
         }
     }
 
     $suffixes = @{}
-
-    if (-not [string]::IsNullOrWhiteSpace($response.Content)) {
-        foreach ($line in ($response.Content -split "(`r`n|`n|`r)")) {
+    $validRows = 0
+    $invalidResponse = $false
+    if ($null -eq $response -or -not $response.PSObject.Properties['Content'] -or [string]::IsNullOrWhiteSpace([string]$response.Content)) {
+        $invalidResponse = $true
+    } else {
+        foreach ($line in ([string]$response.Content -split "(`r`n|`n|`r)")) {
             if ([string]::IsNullOrWhiteSpace($line)) {
                 continue
             }
-
-            $parts = $line.Split(':', 2)
-            if ($parts.Count -ne 2) {
-                continue
+            # A successful HTTP response may still be a proxy error page or a
+            # truncated/malformed range. Never turn an unvalidated body into No.
+            $entry = $line.Trim()
+            if ($entry -notmatch '^(?<Suffix>[A-Fa-f0-9]{27}):(?<Count>[0-9]+)$') {
+                $invalidResponse = $true
+                break
             }
-
-            $returnedSuffix = $parts[0].Trim().ToUpperInvariant()
-            $countText = $parts[1].Trim()
-
-            # Ignore padded fake rows when Add-Padding=true.
-            if ($countText -eq '0') {
-                continue
-            }
-
+            $returnedSuffix = $Matches['Suffix'].ToUpperInvariant()
             $countValue = [int64]0
-            [void][int64]::TryParse($countText, [ref]$countValue)
-
-            $suffixes[$returnedSuffix] = $countValue
+            if (-not [int64]::TryParse($Matches['Count'], [ref]$countValue)) {
+                $invalidResponse = $true
+                break
+            }
+            $validRows++
+            # Count-zero entries are padding, not matches.
+            if ($countValue -gt 0) { $suffixes[$returnedSuffix] = $countValue }
         }
+    }
+    if ($invalidResponse -or $validRows -eq 0) {
+        Write-Warning 'HIBP returned an empty or malformed range response. Affected lookups remain unknown; response content is not logged.'
+        return [pscustomobject]@{ Prefix=$Prefix; Failed=$true; Suffixes=@{} }
     }
 
     return [pscustomobject]@{
@@ -390,12 +407,27 @@ function Get-PwnedResultsForHashes {
     if ($normalized.Count -eq 0) {
         return $result
     }
+    foreach ($hash in $normalized) {
+        if ($hash -notmatch '^[A-F0-9]{32}$') { throw 'Invalid NTLM hash format; expected 32 hexadecimal characters. The supplied value is not logged.' }
+    }
 
-    $byPrefix = $normalized | Group-Object -Property { $_.Substring(0, 5) }
+    $byPrefix = @($normalized | Group-Object -Property { $_.Substring(0, 5) })
+    $timer = [diagnostics.stopwatch]::StartNew()
+    $completed = 0
+    $failedRanges = 0
+    $lastMessageSeconds = 0
+    Write-PasswordAuditStage ("HIBP lookup started: {0} unique hashes in {1} range requests. Each request can take 30 seconds before retrying." -f $normalized.Count, $byPrefix.Count)
 
-    foreach ($prefixGroup in $byPrefix) {
+    try { foreach ($prefixGroup in $byPrefix) {
+        Write-Progress -Id 42 -Activity 'Password audit: HIBP range lookups' -Status ("{0}/{1} ranges completed; {2} failed; elapsed {3:n0}s" -f $completed,$byPrefix.Count,$failedRanges,$timer.Elapsed.TotalSeconds) -PercentComplete ([int](100*$completed/$byPrefix.Count))
         $prefix = [string]$prefixGroup.Name
         $range = Invoke-HibpNtlmRangeLookup -Prefix $prefix -UserAgent $UserAgent -MaxRetries $MaxRetries
+        $completed++
+        if ($range.Failed) { $failedRanges++ }
+        if ($timer.Elapsed.TotalSeconds - $lastMessageSeconds -ge 30 -or $completed -eq $byPrefix.Count) {
+            Write-PasswordAuditStage ("HIBP progress: {0}/{1} ranges completed; {2} failed; elapsed {3:n0}s." -f $completed,$byPrefix.Count,$failedRanges,$timer.Elapsed.TotalSeconds)
+            $lastMessageSeconds = $timer.Elapsed.TotalSeconds
+        }
 
         foreach ($hash in $prefixGroup.Group) {
             if ($range.Failed) {
@@ -420,7 +452,7 @@ function Get-PwnedResultsForHashes {
                 }
             }
         }
-    }
+    } } finally { Write-Progress -Id 42 -Activity 'Password audit: HIBP range lookups' -Completed; $timer.Stop() }
 
     return $result
 }
@@ -445,16 +477,154 @@ function Get-ReplicatedAccountHashes {
         [string]$NamingContext
     )
 
-    $replAccounts = @(Get-ADReplAccount -All -Server $Server -NamingContext $NamingContext -ErrorAction Stop)
+    $timer = [diagnostics.stopwatch]::StartNew()
+    $lastMessageSeconds = 0
+    $replAccounts = New-Object System.Collections.Generic.List[object]
+    Write-PasswordAuditStage 'AD replication started. Waiting for DSInternals; the first result can take several minutes. The total account count is not known yet.'
+    Write-Progress -Id 41 -Activity 'Password audit: AD replication' -Status 'Waiting for the first account; total count unknown' -PercentComplete -1
+    try {
+        Get-ADReplAccount -All -Server $Server -NamingContext $NamingContext -ErrorAction Stop | ForEach-Object {
+            $replAccounts.Add($_)
+            if ($replAccounts.Count -eq 1 -or $replAccounts.Count % 100 -eq 0) {
+                Write-Progress -Id 41 -Activity 'Password audit: AD replication' -Status ("{0} accounts received; elapsed {1:n0}s; total count unknown" -f $replAccounts.Count,$timer.Elapsed.TotalSeconds) -PercentComplete -1
+            }
+            if ($timer.Elapsed.TotalSeconds - $lastMessageSeconds -ge 30) {
+                Write-PasswordAuditStage ("AD replication progress: {0} accounts received; elapsed {1:n0}s." -f $replAccounts.Count,$timer.Elapsed.TotalSeconds)
+                $lastMessageSeconds = $timer.Elapsed.TotalSeconds
+            }
+        }
+    } finally { Write-Progress -Id 41 -Activity 'Password audit: AD replication' -Completed; $timer.Stop() }
 
     if ($replAccounts.Count -eq 0) {
         throw "No replication accounts were returned from $Server."
     }
 
-    return $replAccounts
+    Write-PasswordAuditStage ("AD replication completed: {0} accounts received in {1:n1}s." -f $replAccounts.Count,$timer.Elapsed.TotalSeconds)
+    return $replAccounts.ToArray()
+}
+
+function Export-PasswordAuditSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutCsv,
+        [Parameter(Mandatory)][ValidateSet('Pwned','Duplicate')][string]$Mode,
+        [Parameter(Mandatory)][string]$Server,
+        [Parameter(Mandatory)][int]$ReturnedCount,
+        [Parameter(Mandatory)][int]$ProcessedCount,
+        [int]$ExcludedCount, [int]$MissingNameCount, [int]$MissingHashCount,
+        [int]$EnabledProcessedCount, [int]$DisabledProcessedCount, [int]$UnknownProcessedCount,
+        [int]$LookupFailedCount, [int]$DuplicateGroupCount, [int]$HibpCheckedCount,
+        [switch]$HibpRequested,
+        [AllowEmptyCollection()][object[]]$Results = @()
+    )
+    # Only explicitly allowed display fields are serialized below. In particular,
+    # this helper never serializes replication objects or full NT/LM hashes.
+    $findingRows = @($Results | Where-Object {
+        $_.SamAccountName -and ($(if ($Mode -eq 'Pwned') { $_.Pwned -eq 'Yes' } else { $_.DuplicatePasswordGroup -ne '' }))
+    })
+    $enabled = @($findingRows | Where-Object AccountStatus -in @('Active','Enabled')).Count
+    $disabled = @($findingRows | Where-Object AccountStatus -eq 'Disabled').Count
+    $unknown = @($findingRows | Where-Object AccountStatus -eq 'Unknown').Count
+    $unavailableRows = @($Results | Where-Object { $_.SamAccountName -and $_.Pwned -eq 'NotAssessed' })
+    $missingEnabled = @($unavailableRows | Where-Object AccountStatus -in @('Active','Enabled')).Count
+    $missingDisabled = @($unavailableRows | Where-Object AccountStatus -eq 'Disabled').Count
+    # Include missing records without display rows in the unknown-state bucket.
+    $missingUnknown = [math]::Max(0, $MissingHashCount - $missingEnabled - $missingDisabled)
+    $coverage = if ($ProcessedCount -eq 0) { 'Not assessed' } elseif ($MissingHashCount -or $MissingNameCount -or $LookupFailedCount -or $unknown -or $UnknownProcessedCount) { 'Partial' } else { 'Complete for selected scope' }
+    $coverageReasons = New-Object System.Collections.Generic.List[string]
+    if ($ProcessedCount -eq 0) { $coverageReasons.Add('No accounts had usable password material for the selected check.') }
+    if ($MissingHashCount) { $coverageReasons.Add(("Accounts with unavailable NT password material: {0} ({1} enabled, {2} disabled, {3} unknown state)." -f $MissingHashCount,$missingEnabled,$missingDisabled,$missingUnknown)) }
+    if ($MissingNameCount) { $coverageReasons.Add("$MissingNameCount accounts had no usable account name.") }
+    if ($LookupFailedCount) { $coverageReasons.Add("$LookupFailedCount accounts could not complete their HIBP lookup.") }
+    if ($UnknownProcessedCount -or $unknown) { $coverageReasons.Add('Some account enablement states could not be established.') }
+    if ($coverageReasons.Count -eq 0) { $coverageReasons.Add('All available accounts in the selected scope completed the requested check.') }
+    $hibpStatus = if (-not $HibpRequested) { 'Not requested' } elseif ($HibpCheckedCount -eq 0 -and $LookupFailedCount -gt 0) { 'Failed' } elseif ($LookupFailedCount -gt 0) { 'Partial' } elseif ($HibpCheckedCount -gt 0) { 'Completed' } else { 'No eligible accounts' }
+    $summary = [pscustomobject][ordered]@{
+        GeneratedUTC=[datetime]::UtcNow.ToString('o'); Audit=$Mode; SourceServer=$Server; Coverage=$coverage
+        CoverageReasons=($coverageReasons -join ' ')
+        ReturnedAccounts=$ReturnedCount; ExcludedByScope=$ExcludedCount; MissingAccountName=$MissingNameCount
+        ProcessedAccounts=$ProcessedCount; MissingNTPasswordMaterial=$MissingHashCount
+        MissingNTEnabledAccounts=$missingEnabled; MissingNTDisabledAccounts=$missingDisabled; MissingNTUnknownStateAccounts=$missingUnknown
+        EnabledProcessedAccounts=$EnabledProcessedCount; DisabledProcessedAccounts=$DisabledProcessedCount; UnknownStateProcessedAccounts=$UnknownProcessedCount
+        HIBPRequested=[bool]$HibpRequested; HIBPStatus=$hibpStatus; HIBPSuccessfulAccounts=$HibpCheckedCount; HIBPLookupFailedAccounts=$LookupFailedCount
+        EnabledFindingAccounts=$enabled; DisabledFindingAccounts=$disabled; UnknownStateFindingAccounts=$unknown
+        DuplicateGroups=$DuplicateGroupCount
+    }
+    $summaryPath = [IO.Path]::ChangeExtension($OutCsv, 'summary.csv')
+    $htmlPath = [IO.Path]::ChangeExtension($OutCsv, 'html')
+    $summary | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+    $encode = { param($value) [System.Net.WebUtility]::HtmlEncode([string]$value) }
+    $html = [System.Text.StringBuilder]::new()
+    [void]$html.AppendLine(@'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Password audit</title><style>
+:root{color-scheme:light;--page:#f4f6fa;--surface:#fff;--text:#172033;--muted:#536174;--border:#ccd3df;--card:#f8fafc;--header:#e9eef5;--note:#edf3fa;--accent:#6588ad;--link:#174a8b}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0d1420;--surface:#151f2e;--text:#e5ecf6;--muted:#aebed2;--border:#43526a;--card:#1d2a3c;--header:#29384d;--note:#20344b;--accent:#91b9ed;--link:#a9d1ff}}
+:root[data-theme="dark"]{color-scheme:dark;--page:#0d1420;--surface:#151f2e;--text:#e5ecf6;--muted:#aebed2;--border:#43526a;--card:#1d2a3c;--header:#29384d;--note:#20344b;--accent:#91b9ed;--link:#a9d1ff}
+body{font:16px system-ui,sans-serif;color:var(--text);background:var(--page);margin:0}main{max-width:1200px;margin:2rem auto;padding:2rem;background:var(--surface);border:1px solid var(--border);border-radius:14px}h1{margin:0 0 .4rem}h2{font-size:1.2rem;margin-top:1.5rem}.meta{color:var(--muted);font-size:.9rem}.toolbar{display:flex;justify-content:flex-end;gap:.6rem;align-items:center;margin-bottom:1rem}.toolbar label{color:var(--muted);font-size:.9rem}select{font:inherit;color:var(--text);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:.35rem}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.8rem;margin:1.4rem 0}.metric{border:1px solid var(--border);border-radius:10px;padding:1rem;background:var(--card)}.metric-label{font-size:.85rem;color:var(--muted)}.metric-value{font-size:1.8rem;font-weight:700;margin-top:.3rem}.metric-value.coverage{font-size:1.1rem;line-height:1.45}.table-wrap{overflow-x:auto;max-width:100%}table{border-collapse:collapse;width:100%;margin:.8rem 0}th,td{text-align:left;border:1px solid var(--border);padding:.6rem;vertical-align:top;overflow-wrap:anywhere}th{background:var(--header)}.account-table{min-width:760px}.scope-table th{width:34%;font-weight:600}a{color:var(--link)}.note{background:var(--note);border-left:4px solid var(--accent);padding:1rem;line-height:1.5}details{border:1px solid var(--border);border-radius:8px;padding:.8rem;margin:1rem 0}summary{cursor:pointer;font-weight:600}
+@media(max-width:760px){main{margin:0;padding:1rem;border-radius:0}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media print{:root{color-scheme:light}body,main,.metric,.note,th,td{background:#fff!important;color:#000!important;border-color:#777!important}.toolbar{display:none}main{margin:0;border:0;max-width:none}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.table-wrap{overflow:visible}.account-table{min-width:0;font-size:10px}a{color:#000!important}}
+</style></head><body><main><div class="toolbar"><label for="theme">Appearance</label><select id="theme" aria-label="Report appearance"><option value="system">Use system setting</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
+<script>(function(){var select=document.getElementById('theme');function apply(value){if(value==='light'||value==='dark'){document.documentElement.setAttribute('data-theme',value)}else{document.documentElement.removeAttribute('data-theme');value='system'}select.value=value}try{apply(localStorage.getItem('adaudit-password-theme')||'system')}catch(e){apply('system')}select.addEventListener('change',function(){apply(select.value);try{localStorage.setItem('adaudit-password-theme',select.value)}catch(e){}})})();</script>
+'@)
+    $reportTitle = if ($Mode -eq 'Duplicate') { 'Shared password assessment' } else { 'Known breached password assessment' }
+    [void]$html.AppendLine("<h1>$reportTitle</h1><p class='meta'>Source: $(& $encode $Server) · Generated: $(& $encode $summary.GeneratedUTC)</p>")
+    [void]$html.AppendLine("<div class='metrics'><div class='metric'><div class='metric-label'>Assessment coverage</div><div class='metric-value coverage'>$(& $encode $coverage)</div></div><div class='metric'><div class='metric-label'>Enabled finding accounts</div><div class='metric-value'>$enabled</div></div><div class='metric'><div class='metric-label'>Disabled finding accounts</div><div class='metric-value'>$disabled</div></div><div class='metric'><div class='metric-label'>Unknown-state finding accounts</div><div class='metric-value'>$unknown</div></div></div>")
+    [void]$html.AppendLine("<p class='note'><strong>Coverage explanation:</strong> $(& $encode $summary.CoverageReasons)<br><strong>HIBP lookup:</strong> $(& $encode $hibpStatus). $HibpCheckedCount accounts completed their lookup; $LookupFailedCount failed.</p>")
+    [void]$html.AppendLine('<p class="note">Enabled accounts are prioritized for remediation. Disabled accounts remain visible for cleanup and reactivation review. Unknown account state, unavailable password material and failed lookups are not evidence of a clean account. A corpus match identifies a known password, not proof this customer account was breached. A negative match is not proof of password strength.</p>')
+    $friendlyLabels = @{
+        GeneratedUTC='Report generated (UTC)'; Audit='Assessment type'; SourceServer='Source domain controller'; Coverage='Assessment coverage'; CoverageReasons='Coverage explanation'
+        ReturnedAccounts='Accounts returned by replication'; ExcludedByScope='Accounts excluded by scope'; MissingAccountName='Accounts without a usable name'
+        ProcessedAccounts='Accounts with password material checked'; MissingNTPasswordMaterial='Accounts without NT password material'
+        MissingNTEnabledAccounts='Enabled accounts without NT material'; MissingNTDisabledAccounts='Disabled accounts without NT material'; MissingNTUnknownStateAccounts='Unknown-state accounts without NT material'
+        EnabledProcessedAccounts='Enabled accounts checked'; DisabledProcessedAccounts='Disabled accounts checked'; UnknownStateProcessedAccounts='Checked accounts with unknown enablement state'
+        HIBPRequested='HIBP lookup requested'; HIBPStatus='HIBP run status'; HIBPSuccessfulAccounts='Accounts with a successful HIBP lookup'; HIBPLookupFailedAccounts='Accounts with a failed HIBP lookup'
+        EnabledFindingAccounts='Enabled finding accounts'; DisabledFindingAccounts='Disabled finding accounts'; UnknownStateFindingAccounts='Finding accounts with unknown enablement state'
+        DuplicateGroups='Shared password groups'
+    }
+    $lookupScope = if (-not $HibpRequested) { 'HIBP lookup was not requested. NotChecked is expected; run Invoke-SamePasswordCheck.ps1 -Pwned to include that optional lookup.' } elseif ($Mode -eq 'Duplicate') { 'HIBP lookup covers shared password groups only; unique-password accounts are outside that lookup.' } else { 'HIBP lookup covers accounts with available NT password material in the selected scope.' }
+    [void]$html.AppendLine("<h2>Collection scope</h2><p>$ProcessedCount of $ReturnedCount returned accounts had password material checked; $ExcludedCount excluded by scope; $MissingHashCount without NT password material. $lookupScope</p><details><summary>Collection totals and lookup coverage</summary><div class='table-wrap'><table class='scope-table'><tbody>")
+    foreach ($property in $summary.PSObject.Properties) {
+        $label = if ($friendlyLabels.ContainsKey($property.Name)) { $friendlyLabels[$property.Name] } else { $property.Name }
+        [void]$html.AppendLine("<tr><th scope='row'>$(& $encode $label)</th><td>$(& $encode $property.Value)</td></tr>")
+    }
+    [void]$html.AppendLine('</tbody></table></div></details><p class="meta">Results describe the directory data returned by the selected controller at collection time. An isolated or cloned controller may contain historical account and password state.</p><h2>Recommended actions</h2><p>Prioritize enabled privileged and service accounts. Coordinate password rotation with application owners and dependencies; use unique credentials and managed service accounts where supported. Review disabled accounts before reactivation. Investigate unavailable password material separately from failed network lookups. Shared password group identifiers apply only within this run.</p>')
+    $columns = @('SamAccountName','AccountType','AccountStatus','DuplicatePasswordGroup','DuplicatePasswordGroupSize','Pwned','PwnedCount','Comment')
+    $presentColumns = @($columns | Where-Object { $field=$_; @($Results | Where-Object { $_.PSObject.Properties[$field] }).Count -gt 0 })
+    $otherRows = @($Results | Where-Object {
+        -not ($_.SamAccountName -and ($(if ($Mode -eq 'Pwned') { $_.Pwned -eq 'Yes' } else { $_.DuplicatePasswordGroup -ne '' })))
+    })
+    $sections = @(
+        [pscustomobject]@{Title='Confirmed account findings';Rows=$findingRows;Collapsed=$false},
+        [pscustomobject]@{Title='Unavailable checks and additional evidence';Rows=$otherRows;Collapsed=$true}
+    )
+    foreach ($section in $sections) {
+        if ($section.Rows.Count -eq 0) { continue }
+        if ($section.Collapsed) { [void]$html.AppendLine("<details><summary>$($section.Title) (records: $($section.Rows.Count))</summary>") }
+        else { [void]$html.AppendLine("<h2>$($section.Title)</h2>") }
+        [void]$html.AppendLine('<div class="table-wrap"><table class="account-table"><thead><tr>')
+        $columnLabels = @{SamAccountName='Account';AccountType='Account type';AccountStatus='Account state';DuplicatePasswordGroup='Shared password group';DuplicatePasswordGroupSize='Accounts in group';Pwned='HIBP result';PwnedCount='Corpus occurrences';Comment='Evidence and interpretation'}
+        foreach ($column in $presentColumns) { [void]$html.AppendLine("<th>$(& $encode $columnLabels[$column])</th>") }
+        [void]$html.AppendLine('</tr></thead><tbody>')
+        foreach ($row in $section.Rows) {
+            [void]$html.AppendLine('<tr>')
+            foreach ($column in $presentColumns) {
+                $value = if ($row.PSObject.Properties[$column]) { $row.$column } else { '' }
+                [void]$html.AppendLine("<td>$(& $encode $value)</td>")
+            }
+            [void]$html.AppendLine('</tr>')
+        }
+        [void]$html.AppendLine('</tbody></table></div>')
+        if ($section.Collapsed) { [void]$html.AppendLine('</details>') }
+    }
+    [void]$html.AppendLine("<p><a href='$(& $encode ([uri]::EscapeDataString([IO.Path]::GetFileName($OutCsv))))'>Download account evidence</a> · <a href='$(& $encode ([uri]::EscapeDataString([IO.Path]::GetFileName($summaryPath))))'>Download coverage summary</a></p></main></body></html>")
+    Set-Content -LiteralPath $htmlPath -Value $html.ToString() -Encoding UTF8
+    Write-Host "Coverage: $coverage. Enabled finding accounts: $enabled; disabled: $disabled; unknown state: $unknown."
+    Write-Host ("Coverage explanation: {0} HIBP status: {1}." -f $summary.CoverageReasons,$hibpStatus)
+    Write-Host "Customer report: $htmlPath"
 }
 
 Export-ModuleMember -Function `
+    Write-PasswordAuditStage, `
     Resolve-DefaultServer, `
     Ensure-DirectoryPath, `
     Resolve-ParentDirectory, `
@@ -464,4 +634,5 @@ Export-ModuleMember -Function `
     Test-NtlmHashPwned, `
     Invoke-HibpNtlmRangeLookup, `
     Get-PwnedResultsForHashes, `
-    Get-ReplicatedAccountHashes
+    Get-ReplicatedAccountHashes, `
+    Export-PasswordAuditSummary

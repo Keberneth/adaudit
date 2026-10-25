@@ -57,9 +57,12 @@ Function Get-PasswordPolicy {
         if (-not $noLm.Success) {
             Register-ADAuditNotAssessed -Name 'Get-PasswordPolicy' -Switch 'passwordpolicy' -Target $pdc -RequiresRemotePS -Reason "Could not read NoLmHash from the PDC emulator's registry (remote registry over CIM/DCOM/WinRM unavailable): $($noLm.Error)"
         }
+        elseif ($null -eq $noLm.Value) {
+            Register-ADAuditNotAssessed -Name 'LM hash storage policy' -Switch 'passwordpolicy' -Target $pdc -Reason 'NoLmHash is absent. Effective OS/policy behavior was not established; this does not prove that LM hashes are stored.'
+        }
         elseif ($noLm.Value -eq 0) {
-            Write-Both "    [!] LM Hashes are stored on $pdc! (KB510)"
-            Write-Nessus-Finding "LMHashesAreStored" "KB510" "LM Hashes are stored (NoLmHash=0) on $pdc"
+            Write-Both "    [!] LM hash storage is permitted by configuration (NoLmHash=0) on $pdc; actual stored hashes require separate evidence. (KB510)"
+            Write-Nessus-Finding 'LMHashStoragePermitted' 'KB510' "LM hash storage prevention is disabled (NoLmHash=0) on $pdc. This configuration permits legacy storage; it does not prove any account currently has an LM hash. Use the separate DSInternals LMHash results to establish actual stored credentials."
         }
     }
     Write-Both "    [-] Finished checking default password policy"
@@ -102,7 +105,7 @@ Function Get-UserPasswordNotChangedRecently {
     $totalcount = ($accountsoldpasswords | Measure-Object | Select-Object Count).count
     foreach ($account in $accountsoldpasswords) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for passwords older than 90days..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
+        Write-ADAuditProgress -Activity "Searching for passwords older than 90days..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         if ($account.PasswordLastSet) {
             $datelastchanged = $account.PasswordLastSet
         }
@@ -112,7 +115,7 @@ Function Get-UserPasswordNotChangedRecently {
         Add-Content -Path (Get-EvidencePath 'accounts_with_old_passwords.txt') -Value "User $($account.SamAccountName) ($($account.Name)) has not changed their password since $datelastchanged"
         $count++
     }
-    Write-Progress -Activity "Searching for passwords older than 90days..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for passwords older than 90days..." -Status "Ready" -Completed
     if ($count -gt 0) {
         Write-Both "    [!] $count accounts with passwords older than 90days, see accounts_with_old_passwords.txt (KB550)"
         Write-Nessus-Finding "AccountsWithOldPasswords" "KB550" ([System.IO.File]::ReadAllText((Get-EvidencePath 'accounts_with_old_passwords.txt')))
@@ -131,11 +134,11 @@ Function Get-AccountPassDontExpire {
     $totalcount = ($nonexpiringpasswords | Measure-Object | Select-Object Count).count
     foreach ($account in $nonexpiringpasswords) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for users with passwords that dont expire..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
+        Write-ADAuditProgress -Activity "Searching for users with passwords that dont expire..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'accounts_passdontexpire.txt') -Value "$($account.SamAccountName) ($($account.Name))"
         $count++
     }
-    Write-Progress -Activity "Searching for users with passwords that dont expire..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for users with passwords that dont expire..." -Status "Ready" -Completed
     if ($count -gt 0) {
         Write-Both "    [!] There are $count accounts that don't expire, see accounts_passdontexpire.txt (KB254)"
         Write-Nessus-Finding "AccountsThatDontExpire" "KB254" ([System.IO.File]::ReadAllText((Get-EvidencePath 'accounts_passdontexpire.txt')))
@@ -245,22 +248,22 @@ Function Get-PasswordQuality {
             }
 
             if ($count -ne $totalSite) {
-                Write-Both "    [!] One or more sites have illegal characters in their name, can't get password quality!"
+                    Register-ADAuditNotAssessed -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Reason 'Password quality was skipped because a site name failed the legacy character validation.'
                 return
             }
         }
         catch {
-            Write-Both "    [!] Failed to enumerate AD sites for password quality test: $($_.Exception.Message)"
+            Register-ADAuditNotAssessed -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Reason "Could not enumerate AD sites: $($_.Exception.Message)"
             return
         }
 
         # Determine a single DC to query (fallback chain to ensure we get a plain string)
-        $dcObj = Get-ADDomainController -Discover
+        $dcObj = if ($script:ADAuditIsolatedClone) { Get-ADDomainController -Identity $env:COMPUTERNAME -Server $env:COMPUTERNAME -ErrorAction Stop } else { Get-ADDomainController -Discover }
         $dc = $dcObj.DNSHostName
         if (-not $dc) { $dc = $dcObj.HostName }
         if (-not $dc) { $dc = $dcObj.Name }
         if (-not $dc -or [string]::IsNullOrWhiteSpace($dc)) {
-            Write-Both "    [!] Could not determine a domain controller hostname for password quality test."
+            Register-ADAuditNotAssessed -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Reason 'Could not determine a domain controller hostname.'
             return
         }
         $dc = [string]$dc
@@ -275,9 +278,9 @@ Function Get-PasswordQuality {
                 # Run DSInternals password quality test and capture the full report
                 $passwordQualityPath = Get-EvidencePath 'password_quality.txt'
 
-                $accounts |
-                    Test-PasswordQuality -IncludeDisabledAccounts |
-                    Out-File -FilePath $passwordQualityPath
+                Write-ADAuditProgress -Activity 'Password quality: DSInternals analysis' -Status "Evaluating $(@($accounts).Count) replicated accounts; this operation does not expose per-account completion" -PercentComplete -1
+                $quality = $accounts | Test-PasswordQuality -IncludeDisabledAccounts -ErrorAction Stop
+                $quality | Out-File -FilePath $passwordQualityPath
 
                 if (Test-Path $passwordQualityPath) {
                     Write-Both "    [!] Password quality test done, see password_quality.txt"
@@ -287,10 +290,11 @@ Function Get-PasswordQuality {
                     # keeps the explanatory prose out of pq_kerberoastable.txt (otherwise
                     # each sentence is mis-counted as a Kerberoastable account).
                     try {
-                        Split-PasswordQualityReport -ReportPath $passwordQualityPath
+                        Write-ADAuditProgress -Activity 'Password quality: evidence export' -Status 'Separating categories and account states' -PercentComplete -1
+                        Export-ADAuditPasswordQualityEvidence -Quality $quality -Accounts @($accounts)
                     }
                     catch {
-                        Write-Both "    [*] Failed to split password quality report into category files: $($_.Exception.Message)"
+                        Register-ADAuditNotAssessed -Name 'Password quality evidence' -Switch 'passwordpolicy' -Reason "Could not create structured password-quality evidence: $($_.Exception.Message)"
                     }
 
                     # Then annotate the combined human-readable report to clarify why accounts
@@ -310,17 +314,155 @@ Function Get-PasswordQuality {
                 }
             }
             else {
-                Write-Both "    [!] No replication accounts retrieved from DC $dc; skipping password quality test."
+                Register-ADAuditNotAssessed -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Target $dc -Reason 'No replication accounts retrieved; password quality was not assessed.'
             }
         }
         catch {
             # Delimit $dc to avoid $dc: being parsed as an (invalid) scope qualifier
-            Write-Both "    [!] Failed password quality test on DC ${dc}: $($_.Exception.Message)"
+            Register-ADAuditNotAssessed -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Target $dc -Reason "Password quality collection failed: $($_.Exception.Message)"
         }
     }
     else {
-        Write-Both "    [!] DSInternals module not available; skipping password quality test."
+        Register-ADAuditNotAssessed -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Reason 'DSInternals module not available; password quality was not assessed.'
     }
+}
+
+function Get-ADAuditPasswordAccountState {
+    param([AllowNull()][object]$Account)
+    if ($null -eq $Account) { return 'Unknown' }
+    $enabled = $Account.PSObject.Properties['Enabled']
+    if ($enabled -and $enabled.Value -is [bool]) {
+        if ($enabled.Value) { return 'Enabled' }
+        return 'Disabled'
+    }
+    $uac = $Account.PSObject.Properties['UserAccountControl']
+    if ($uac -and $null -ne $uac.Value) {
+        try { if (([int64]$uac.Value -band 2) -ne 0) { return 'Disabled' }; return 'Enabled' } catch { }
+    }
+    return 'Unknown'
+}
+
+function ConvertTo-ADAuditPasswordQualityFinding {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Quality, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Accounts)
+    # DSInternals returns typed collections of LogonName values. Join those to the
+    # replication objects, not optional Users.csv or formatted console output.
+    $lookup = @{}
+    foreach ($account in $Accounts) {
+        foreach ($keyName in @('LogonName','SamAccountName','DistinguishedName')) {
+            $property = $account.PSObject.Properties[$keyName]
+            if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                $key = [string]$property.Value
+                # Ambiguous short names must not inherit another account's state.
+                if ($lookup.ContainsKey($key) -and $lookup[$key] -ne $account) { $lookup[$key] = $null }
+                else { $lookup[$key] = $account }
+            }
+        }
+    }
+    $categories = @('ClearTextPassword','LMHash','EmptyPassword','WeakPassword','WeakPasswordHistory',
+        'DuplicatePasswordGroups','DefaultComputerPassword','AESKeysMissing','PreAuthNotRequired',
+        'DESEncryptionOnly','DelegatableAdmins','PasswordNeverExpires','PasswordNotRequired',
+        'Kerberoastable','SamAccountNameAsPassword','SmartCardUsersWithPassword')
+    foreach ($category in $categories) {
+        $property = $Quality.PSObject.Properties[$category]
+        if (-not $property) { continue }
+        $groupNumber = 0
+        foreach ($entry in $property.Value) {
+            $groupNumber++
+            $names = if ($category -eq 'DuplicatePasswordGroups') { @($entry) } else { @([string]$entry) }
+            foreach ($name in $names) {
+                $name = [string]$name
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                $account = $lookup[$name]
+                $sam = if ($account) { [string]$account.SamAccountName } else { $name }
+                $detail = 'Reported by DSInternals Test-PasswordQuality.'
+                $passwordEvidence = 'NotApplicable'
+                if ($category -eq 'PasswordNotRequired') {
+                    $detail = 'PASSWD_NOTREQD is set; this flag does not establish that the current password is empty.'
+                } elseif ($category -eq 'EmptyPassword') {
+                    $hashProperty = if ($account) { $account.PSObject.Properties['NTHash'] } else { $null }
+                    if ($hashProperty -and $null -ne $hashProperty.Value) {
+                        $hashHex = -join (@($hashProperty.Value) | ForEach-Object { ([byte]$_).ToString('X2') })
+                        $passwordEvidence = if ($hashHex -eq '31D6CFE0D16AE931B73C59D7E0C089C0') { 'EmptyNtHash' } else { 'Unknown' }
+                        $detail = if ($passwordEvidence -eq 'EmptyNtHash') {
+                            'The replicated NT hash matches an empty password.'
+                        } else { 'DSInternals reported no password; verify the account credential configuration.' }
+                    } else {
+                        $passwordEvidence = 'NoNtHash'
+                        $detail = 'No NT hash was available in the replication result; this does not prove that a blank-password logon succeeds.'
+                    }
+                }
+                $objectClass = ''
+                if ($account) {
+                    if ($account.PSObject.Properties['ObjectClass']) { $objectClass = [string]$account.ObjectClass }
+                    elseif ($account.PSObject.Properties['SamAccountType']) { $objectClass = [string]$account.SamAccountType }
+                }
+                [pscustomobject][ordered]@{
+                    Category = $category
+                    SamAccountName = $sam
+                    DistinguishedName = $(if ($account -and $account.PSObject.Properties['DistinguishedName']) { [string]$account.DistinguishedName } else { '' })
+                    AccountStatus = Get-ADAuditPasswordAccountState -Account $account
+                    ObjectClass = $objectClass
+                    GroupId = $(if ($category -eq 'DuplicatePasswordGroups') { 'PWD-REUSE-{0:d3}' -f $groupNumber } else { '' })
+                    EvidenceSource = 'DSInternals Test-PasswordQuality'
+                    EvidenceDetail = $detail
+                    PasswordEvidence = $passwordEvidence
+                }
+            }
+        }
+    }
+}
+
+function Export-ADAuditPasswordQualityEvidence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Quality, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Accounts)
+    $rows = @(ConvertTo-ADAuditPasswordQualityFinding -Quality $Quality -Accounts $Accounts)
+    $csvPath = Get-EvidencePath 'password_quality_findings.csv'
+    # Always create the schema, including a successfully assessed empty result.
+    '"Category","SamAccountName","DistinguishedName","AccountStatus","ObjectClass","GroupId","EvidenceSource","EvidenceDetail","PasswordEvidence"' | Set-Content -LiteralPath $csvPath -Encoding UTF8
+    if ($rows.Count) { $rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8 }
+    $categoryMap = [ordered]@{
+        ClearTextPassword = @('pq_reversible_encryption.txt','KB997','Critical','reversible encryption')
+        LMHash = @('pq_lm_hashes.txt','KB998','Critical','LM hashes present')
+        EmptyPassword = @('pq_no_password.txt','KB999','Critical','empty or absent NT password credential')
+        WeakPassword = @('pq_dictionary_passwords.txt','KB1000','Critical','dictionary passwords')
+        WeakPasswordHistory = @('pq_historical_dictionary.txt','KB1001','Medium','historical dictionary passwords')
+        DuplicatePasswordGroups = @('pq_duplicate_passwords.txt','KB1002','Critical','duplicate passwords')
+        DefaultComputerPassword = @('pq_default_computer_passwords.txt','KB1003','High','default computer passwords')
+        AESKeysMissing = @('pq_missing_aes_keys.txt','KB1004','Medium','missing Kerberos AES keys')
+        PreAuthNotRequired = @('pq_no_preauth.txt','KB1005','Critical','Kerberos pre-auth not required')
+        DESEncryptionOnly = @('pq_des_only.txt','KB1006','Critical','DES-only encryption')
+        DelegatableAdmins = @('pq_admin_delegation.txt','KB1007','High','admin accounts delegatable')
+        PasswordNeverExpires = @('pq_password_never_expires.txt','KB1008','Medium','password never expires')
+        PasswordNotRequired = @('pq_password_not_required.txt','KB1009','High','password not required flag')
+        Kerberoastable = @('pq_kerberoastable.txt','KB1010','High','Kerberoastable accounts')
+        SamAccountNameAsPassword = @('pq_username_passwords.txt','KB1011','Critical','account name used as password')
+        SmartCardUsersWithPassword = @('pq_smartcard_passwords.txt','KB1012','Medium','smart-card accounts with password credentials')
+    }
+    foreach ($category in $categoryMap.Keys) {
+        $meta = $categoryMap[$category]
+        $path = Get-EvidencePath $meta[0]
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        $entries = @($rows | Where-Object Category -eq $category)
+        if (-not $entries.Count) { continue }
+        $enabled = @($entries | Where-Object { $_.AccountStatus -eq 'Enabled' -and ($_.Category -ne 'EmptyPassword' -or $_.PasswordEvidence -eq 'EmptyNtHash') })
+        $disabled = @($entries | Where-Object AccountStatus -eq 'Disabled')
+        $unknown = @($entries | Where-Object { $_.AccountStatus -eq 'Unknown' -or ($_.Category -eq 'EmptyPassword' -and $_.PasswordEvidence -ne 'EmptyNtHash') })
+        $content = @("PASSWORD QUALITY: $($meta[3])", "Enabled: $($enabled.Count); Disabled: $($disabled.Count); Unknown: $($unknown.Count)",
+            'Disabled accounts are hygiene items; unknown state is not assumed enabled.',
+            'Source: DSInternals typed results; see password_quality_findings.csv for authoritative account state.', '')
+        $content += @($entries | ForEach-Object { "[$($_.AccountStatus)] $($_.SamAccountName) $($_.GroupId) $($_.DistinguishedName) -- $($_.EvidenceDetail)" })
+        $content | Set-Content -LiteralPath $path -Encoding UTF8
+        if ($enabled.Count) {
+            $activeContent = ($enabled | ForEach-Object { "$($_.SamAccountName) $($_.GroupId) -- $($_.EvidenceDetail)" }) -join "`n"
+            Write-Nessus-Finding "PasswordQuality_$category" $meta[1] $activeContent $meta[2]
+        }
+        if ($disabled.Count -or $unknown.Count) { Write-Nessus-Finding "PasswordQuality_${category}_Review" $meta[1] ($content -join "`n") 'Info' }
+    }
+    if (@($rows | Where-Object AccountStatus -eq 'Unknown').Count) {
+        Register-ADAuditNotAssessed -Name 'Password quality account state' -Switch 'passwordpolicy' -Reason 'Some typed findings could not be joined to a replicated account with known enabled/disabled state; see password_quality_findings.csv.'
+    }
+    Write-Both "    [+] Password quality state preserved for $($rows.Count) category/account rows in password_quality_findings.csv"
 }
 
 function Split-PasswordQualityReport {
@@ -487,10 +629,15 @@ share the same NTLM hash (i.e. the same password):
 }
 
 function Invoke-PasswordPolicyCheck {
-    Invoke-AuditStep -Name 'Get-AccountPassDontExpire' -Switch 'passwordpolicy' -Body { Get-AccountPassDontExpire }
-    Invoke-AuditStep -Name 'Get-UserPasswordNotChangedRecently' -Switch 'passwordpolicy' -Body { Get-UserPasswordNotChangedRecently }
-    Invoke-AuditStep -Name 'Get-PasswordPolicy' -Switch 'passwordpolicy' -Body { Get-PasswordPolicy }
-    Invoke-AuditStep -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Body { Get-PasswordQuality }
+    Write-ADAuditProgress -Activity 'Password policy checks' -Status 'Starting collection' -PercentComplete -1
+    try {
+        Invoke-AuditStep -Name 'Get-AccountPassDontExpire' -Switch 'passwordpolicy' -Body { Get-AccountPassDontExpire }
+        Invoke-AuditStep -Name 'Get-UserPasswordNotChangedRecently' -Switch 'passwordpolicy' -Body { Get-UserPasswordNotChangedRecently }
+        Invoke-AuditStep -Name 'Get-PasswordPolicy' -Switch 'passwordpolicy' -Body { Get-PasswordPolicy }
+        Invoke-AuditStep -Name 'Get-PasswordQuality' -Switch 'passwordpolicy' -Body { Get-PasswordQuality }
+    } finally {
+        Write-ADAuditProgress -Activity 'Password policy checks' -Completed
+    }
 }
 
 # ---- Standalone launch --------------------------------------------------------------------

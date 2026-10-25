@@ -74,6 +74,32 @@ function Import-ADAuditModule {
     return $null
 }
 
+function Get-ADAuditLocalComputerNames {
+    # These are local configuration reads, not DNS lookups. Do not treat every
+    # FQDN sharing our short name as local: another domain can reuse that name.
+    $names = @('.', 'localhost', '127.0.0.1', '::1', $env:COMPUTERNAME, [Environment]::MachineName)
+    try {
+        $ip = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+        $names += $ip.HostName
+        if ($ip.HostName -and $ip.DomainName) { $names += "$($ip.HostName).$($ip.DomainName)" }
+    } catch { }
+    @($names | Where-Object { $_ } | ForEach-Object { $_.Trim().TrimEnd('.').ToLowerInvariant() } | Select-Object -Unique)
+}
+
+function Test-ADAuditLocalComputer {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$ComputerName)
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) { return $true }
+    (Get-ADAuditLocalComputerNames) -contains $ComputerName.Trim().TrimEnd('.').ToLowerInvariant()
+}
+
+function Assert-ADAuditRemoteTargetAllowed {
+    param([string]$ComputerName)
+    if ($script:ADAuditIsolatedClone -and -not (Test-ADAuditLocalComputer $ComputerName)) {
+        throw "Isolated-clone mode: remote target '$ComputerName' was intentionally not contacted. Snapshot data cannot establish current production state."
+    }
+}
+
 function Get-ADAuditCimInstance {
     [CmdletBinding(DefaultParameterSetName = 'ByClass')]
     param(
@@ -91,15 +117,18 @@ function Get-ADAuditCimInstance {
 
         [string]$ComputerName = $env:COMPUTERNAME,
 
-        [switch]$UseWsmanFallback
+        [switch]$UseWsmanFallback,
+
+        [ValidateRange(1,300)][int]$OperationTimeoutSec = 15
     )
 
     if (-not $script:ADAuditIsWindows) {
         throw "Get-ADAuditCimInstance requires Windows."
     }
 
-    $remoteTarget = $ComputerName -and $ComputerName -notin @('.', 'localhost', $env:COMPUTERNAME)
-    $baseParams = @{ Namespace = $Namespace; ErrorAction = 'Stop' }
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $ComputerName
+    $remoteTarget = -not (Test-ADAuditLocalComputer $ComputerName)
+    $baseParams = @{ Namespace = $Namespace; ErrorAction = 'Stop'; OperationTimeoutSec = $OperationTimeoutSec }
 
     if ($PSCmdlet.ParameterSetName -eq 'ByClass') {
         $baseParams.ClassName = $ClassName
@@ -117,7 +146,7 @@ function Get-ADAuditCimInstance {
     $session = $null
     try {
         $sessionOption = New-CimSessionOption -Protocol Dcom
-        $session = New-CimSession -ComputerName $ComputerName -SessionOption $sessionOption -ErrorAction Stop
+        $session = New-CimSession -ComputerName $ComputerName -SessionOption $sessionOption -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop
         $baseParams.CimSession = $session
         return Get-CimInstance @baseParams
     }
@@ -143,6 +172,37 @@ function Get-ADAuditCimInstance {
     finally {
         if ($session) {
             $session | Remove-CimSession -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-ADAuditCimMethod {
+    # Read-only collectors use this for StdRegProv and SMB configuration methods.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$ClassName,
+        [Parameter(Mandatory)][string]$MethodName,
+        [string]$Namespace = 'root/cimv2',
+        [hashtable]$Arguments = @{},
+        [switch]$UseWsmanFallback,
+        [ValidateRange(1,300)][int]$OperationTimeoutSec = 15
+    )
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $ComputerName
+    $params = @{Namespace=$Namespace; ClassName=$ClassName; MethodName=$MethodName; Arguments=$Arguments; OperationTimeoutSec=$OperationTimeoutSec; ErrorAction='Stop'}
+    if (Test-ADAuditLocalComputer $ComputerName) { return Invoke-CimMethod @params }
+    $protocols = @('Dcom')
+    if ($UseWsmanFallback) { $protocols += 'Wsman' }
+    foreach ($protocol in $protocols) {
+        $session = $null
+        try {
+            $option = New-CimSessionOption -Protocol $protocol
+            $session = New-CimSession -ComputerName $ComputerName -SessionOption $option -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop
+            return Invoke-CimMethod @params -CimSession $session
+        } catch {
+            if ($protocol -eq $protocols[-1]) { throw }
+        } finally {
+            if ($session) { $session | Remove-CimSession -ErrorAction SilentlyContinue }
         }
     }
 }
@@ -317,13 +377,13 @@ Function Get-Variables() {
     # Schema Admins (518) and Enterprise Admins (519) exist only in the FOREST
     # ROOT domain; in a child domain the current domain's SID-518/519 resolve
     # to nothing and the lookups below would leave the names null.
-    $rootDomainSidValue = $domainSidValue
+    $rootDomainSidValue = $null
     try {
         $forestRootDomain = (Get-ADForest -ErrorAction Stop).RootDomain
-        $rootDomainSidValue = (Get-ADDomain -Identity $forestRootDomain -ErrorAction Stop).domainsid.value
-    } catch { }
-    $script:SchemaAdminsSID = $rootDomainSidValue + "-518"
-    $script:EnterpriseAdminsSID = $rootDomainSidValue + "-519"
+        $rootDomainSidValue = (Get-ADDomain -Server $forestRootDomain -ErrorAction Stop).domainsid.value
+    } catch { Register-ADAuditNotAssessed -Name 'Forest-root privileged group discovery' -Reason $_.Exception.Message }
+    $script:SchemaAdminsSID = if ($rootDomainSidValue) { $rootDomainSidValue + '-518' } else { $null }
+    $script:EnterpriseAdminsSID = if ($rootDomainSidValue) { $rootDomainSidValue + '-519' } else { $null }
     $script:EveryOneSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-1-0"
     $script:EntrepriseDomainControllersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-9"
     $script:AuthenticatedUsersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-11"
@@ -334,8 +394,8 @@ Function Get-Variables() {
     $script:DomainControllers = (Get-ADGroup -Identity $DomainControllersSID).SamAccountName
     # Fall back to the well-known English names rather than leaving these null:
     # downstream -match/-eq checks against a null name would match everything.
-    $script:SchemaAdmins = try { (Get-ADGroup -Identity $SchemaAdminsSID -ErrorAction Stop).SamAccountName } catch { 'Schema Admins' }
-    $script:EnterpriseAdmins = try { (Get-ADGroup -Identity $EnterpriseAdminsSID -ErrorAction Stop).SamAccountName } catch { 'Enterprise Admins' }
+    $script:SchemaAdmins = try { (Get-ADGroup -Identity $SchemaAdminsSID -Server $forestRootDomain -ErrorAction Stop).SamAccountName } catch { 'Schema Admins (unresolved)' }
+    $script:EnterpriseAdmins = try { (Get-ADGroup -Identity $EnterpriseAdminsSID -Server $forestRootDomain -ErrorAction Stop).SamAccountName } catch { 'Enterprise Admins (unresolved)' }
     $script:EveryOne = $EveryOneSID.Translate([System.Security.Principal.NTAccount]).Value
     $script:EntrepriseDomainControllers = $EntrepriseDomainControllersSID.Translate([System.Security.Principal.NTAccount]).Value
     $script:AuthenticatedUsers = $AuthenticatedUsersSID.Translate([System.Security.Principal.NTAccount]).Value
@@ -405,12 +465,14 @@ Function Get-RawSourceDataDir {
 }
 
 Function Get-PreparedDataDir {
-    # Merged into Source - all output now goes to the same folder to eliminate duplication
+    # Derived report tables must never share names with collected evidence.
     param(
         [string]$BaseRoot = $(if ($script:outputdir) { $script:outputdir } elseif ($outputdir) { $outputdir } else { Join-Path (Get-Location) $env:COMPUTERNAME })
     )
 
-    return (Get-RawSourceDataDir -BaseRoot $BaseRoot)
+    $path = Join-Path (Get-RawDataDir -BaseRoot $BaseRoot) 'ReportDownloads'
+    if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+    return $path
 }
 
 Function Get-HtmlDownloadsDir {
@@ -527,12 +589,42 @@ ul.link-list li::before{content:'\1F4C4';font-size:1rem}
 '@
 }
 
+function Get-ADAuditCloneNotice {
+    param([bool]$IsolatedClone = $script:ADAuditIsolatedClone, [string]$SnapshotDate = $script:ADAuditSnapshotDate)
+    if (-not $IsolatedClone) { return '' }
+    $date = if ($SnapshotDate) { [System.Net.WebUtility]::HtmlEncode($SnapshotDate) } else { 'not supplied' }
+    return "<aside class='clone-notice' style='border:2px solid #b45309;border-radius:10px;padding:16px;margin:16px 0;background:var(--panel);color:var(--text)'><strong>ISOLATED CLONE — snapshot date: $date</strong><p>This assessment describes a copied directory and this clone's local state. It does not establish current production security or operational health. Password ages, activity timestamps, certificates and replication evidence may reflect the age of the copy. Verify time-based findings in the current environment before remediation. Unreachable production systems are outside this assessment.</p></aside>"
+}
+
+function Get-ADAuditThemeMarkup {
+    return @'
+<style>
+html[data-theme="dark"]{--bg:#0f172a;--panel:#1e293b;--text:#e2e8f0;--muted:#94a3b8;--line:#334155;--shadow:0 10px 24px rgba(0,0,0,.4);--accent:#60a5fa;--accent-soft:rgba(96,165,250,.15);--critical:#f87171;--critical-soft:rgba(248,113,113,.15);--high:#fb923c;--high-soft:rgba(251,146,60,.15);--medium:#60a5fa;--medium-soft:rgba(96,165,250,.15);--low:#4ade80;--low-soft:rgba(74,222,128,.15);--info:#94a3b8;--info-soft:rgba(148,163,184,.15);color-scheme:dark}
+html[data-theme="light"]{--bg:#f5f7fb;--panel:#fff;--text:#1b2430;--muted:#5f6b7a;--line:#d9e0ea;--shadow:0 10px 24px rgba(15,23,42,.08);--accent:#3b82f6;--accent-soft:#dbeafe;--critical:#c62828;--critical-soft:#fdecec;--high:#ef6c00;--high-soft:#fff2e5;--medium:#0277bd;--medium-soft:#e8f4fd;--low:#2e7d32;--low-soft:#edf8ee;--info:#6c757d;--info-soft:#f2f4f6;color-scheme:light}
+.audit-theme-toggle{display:block;margin:0 0 16px auto;padding:9px 15px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:999px;cursor:pointer;font:inherit}
+@media print{.audit-theme-toggle{display:none}}
+</style>
+<button id="sharedAuditThemeToggle" class="audit-theme-toggle" type="button" aria-pressed="false">Dark mode</button>
+<script>
+(function(){
+  var key='adaudit-theme', root=document.documentElement;
+  function stored(){try{return localStorage.getItem(key)}catch(e){return null}}
+  var media=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;
+  function apply(theme){root.setAttribute('data-theme',theme);var b=document.getElementById('sharedAuditThemeToggle');if(b){b.textContent=theme==='dark'?'Light mode':'Dark mode';b.setAttribute('aria-pressed',theme==='dark'?'true':'false')}}
+  var saved=stored();apply(saved==='light'||saved==='dark'?saved:media&&media.matches?'dark':'light');
+  var button=document.getElementById('sharedAuditThemeToggle');if(button){button.addEventListener('click',function(){var next=root.getAttribute('data-theme')==='dark'?'light':'dark';apply(next);try{localStorage.setItem(key,next)}catch(e){}})}
+  if(media&&media.addEventListener){media.addEventListener('change',function(e){var s=stored();if(s!=='light'&&s!=='dark')apply(e.matches?'dark':'light')})}
+})();
+</script>
+'@
+}
+
 Function Get-ADAuditReportHeader {
     <#
     .SYNOPSIS
         Returns the HTML header/doctype block for companion reports.
     #>
-    param([string]$Title = 'AD Audit Report')
+    param([string]$Title = 'AD Audit Report', [switch]$NoThemeControl)
     $css = Get-ADAuditReportCss
     return @"
 <!doctype html>
@@ -545,6 +637,8 @@ $css
 </head>
 <body>
 <div class="container">
+$(if (-not $NoThemeControl) { Get-ADAuditThemeMarkup })
+$(Get-ADAuditCloneNotice)
 "@
 }
 
@@ -625,6 +719,84 @@ $script:CheckFailures = New-Object System.Collections.Generic.List[object]
 # confidence, not raise the risk score.
 # ---------------------------------------------------------------------------
 $script:NotAssessed = New-Object System.Collections.Generic.List[object]
+$script:ADAuditCheckStatus = New-Object System.Collections.Generic.List[object]
+$script:ADAuditCurrentCheckSwitch = $null
+$script:ADAuditIsolatedClone = $false
+$script:ADAuditSnapshotDate = $null
+$script:ADAuditProgressContext = $null
+$script:ADAuditProgressLastActivity = ''
+$script:ADAuditProgressLastUi = [datetime]::MinValue
+$script:ADAuditProgressLastLog = [datetime]::MinValue
+
+function New-ADAuditRunDirectory {
+    param([Parameter(Mandatory)][string]$ParentPath, [datetimeoffset]$Timestamp = [datetimeoffset]::Now)
+    New-Item -ItemType Directory -Path $ParentPath -Force -ErrorAction Stop | Out-Null
+    $name = $Timestamp.ToString('yyyy-MM-dd_HH-mm-ss', [cultureinfo]::InvariantCulture)
+    $suffix = 1
+    while ($true) {
+        $leaf = if ($suffix -eq 1) { $name } else { '{0}_{1:00}' -f $name,$suffix }
+        $candidate = Join-Path $ParentPath $leaf
+        try { return (New-Item -ItemType Directory -Path $candidate -ErrorAction Stop).FullName }
+        catch { if (-not (Test-Path -LiteralPath $candidate)) { throw }; $suffix++ }
+    }
+}
+
+function Write-ADAuditProgress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Activity,
+        [string]$Status = 'Working',
+        [ValidateRange(-1,100)][double]$PercentComplete = -1,
+        [switch]$Completed,
+        [switch]$Force
+    )
+    $now = [datetime]::UtcNow
+    $context = $script:ADAuditProgressContext
+    $prefix = if ($context) { "Check $($context.Index) of $($context.Total)" } else { 'Audit' }
+    $elapsed = if ($context) { ' | elapsed {0:hh\:mm\:ss}' -f ($now - $context.Started) } else { '' }
+    $percentLabel = if ($PercentComplete -ge 0) { '{0:0}% of phase' -f $PercentComplete } else { 'total not available' }
+    $changed = $Activity -ne $script:ADAuditProgressLastActivity
+    if ($Force -or $Completed -or $changed -or ($now - $script:ADAuditProgressLastUi).TotalMilliseconds -ge 250) {
+        $parameters = @{ Id=1; Activity="$prefix - $Activity"; Status="$Status | $percentLabel$elapsed"; PercentComplete=[int]$PercentComplete }
+        if ($context) {
+            $parameters.ParentId = 0
+            # Some hosts only display the parent record during a blocking call.
+            # Keep its status useful even when the child phase bar is hidden.
+            $overallActivity = if ($context.Available) { "AD audit - $($context.Total) of $($context.Available) checks selected; $($context.Available - $context.Total) skipped" } else { "AD audit - $($context.Total) checks selected" }
+            Write-Progress -Id 0 -Activity $overallActivity -Status "$prefix`: $Activity - $Status | $percentLabel$elapsed" -PercentComplete ([int](100 * ($context.Index - 1) / $context.Total))
+        }
+        if ($Completed) { $parameters.Completed = $true }
+        Write-Progress @parameters
+        $script:ADAuditProgressLastUi = $now
+    }
+    if ($Force -or $Completed -or $changed -or ($now - $script:ADAuditProgressLastLog).TotalSeconds -ge 10) {
+        $state = if ($Completed) { 'phase finished' } else { $percentLabel }
+        Write-Both "    [$prefix] $Activity - $Status ($state$elapsed)"
+        $script:ADAuditProgressLastLog = $now
+    }
+    $script:ADAuditProgressLastActivity = if ($Completed) { '' } else { $Activity }
+}
+
+function Initialize-ADAuditCheckStatus {
+    param([object[]]$Checks, [string[]]$SelectedSwitches)
+    $script:ADAuditCheckStatus.Clear()
+    foreach ($check in $Checks) {
+        $selected = $check.Switch -in $SelectedSwitches
+        $script:ADAuditCheckStatus.Add([pscustomobject]@{
+            CheckName = $check.Name; Switch = $check.Switch; Selected = $selected
+            Status = $(if ($selected) { 'NotRun' } else { 'NotSelected' })
+            StartedUtc = ''; FinishedUtc = ''; DurationSeconds = 0
+            FailureCount = 0; NotAssessedCount = 0; Reason = ''
+        })
+    }
+}
+
+function Write-ADAuditRunMetadata {
+    param([hashtable]$Metadata)
+    $rawDir = Get-RawSourceDataDir
+    $script:ADAuditCheckStatus | Export-Csv -LiteralPath (Join-Path $rawDir 'audit_check_status.csv') -NoTypeInformation -Encoding UTF8
+    $Metadata | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $rawDir 'audit_run.json') -Encoding UTF8
+}
 
 $script:ADAuditIsDC = $null
 
@@ -717,6 +889,7 @@ Function Register-AuditFailure {
         [string]$Prefix = '    [!] STEP FAILED'
     )
 
+    if (-not $Switch) { $Switch = $script:ADAuditCurrentCheckSwitch }
     $errMsg  = $ErrorRecord.Exception.Message
     $errType = $ErrorRecord.Exception.GetType().FullName
     $isConn  = Test-IsConnectionError -ErrorMessage $errMsg -ErrorType $errType
@@ -765,15 +938,62 @@ Function Invoke-AuditCheck {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Description,
         [Parameter(Mandatory)][scriptblock]$Body,
-        [string]$Switch
+        [string]$Switch,
+        [string[]]$Modules = @(),
+        [int]$CheckIndex = 0,
+        [int]$SelectedCount = 0,
+        [int]$AvailableCount = 0
     )
 
-    Write-Both "[*] $Description"
+    $previousProgressContext = $script:ADAuditProgressContext
+    $script:ADAuditProgressLastActivity = ''
+    if ($SelectedCount -gt 0) {
+        $script:ADAuditProgressContext = @{ Index=$CheckIndex; Total=$SelectedCount; Available=$AvailableCount; Started=[datetime]::UtcNow }
+        Write-Both "[*] Check $CheckIndex of $SelectedCount - $Description ($SelectedCount of $AvailableCount selected; $($AvailableCount - $SelectedCount) skipped)"
+        Write-Progress -Id 0 -Activity "AD audit - $SelectedCount of $AvailableCount checks selected" -Status "Check $CheckIndex of $SelectedCount - $Description; $($AvailableCount - $SelectedCount) skipped" -PercentComplete ([int](100 * ($CheckIndex - 1) / $SelectedCount))
+    } else { Write-Both "[*] $Description" }
+    Write-ADAuditProgress -Activity $Description -Status 'Starting collection'
+    $previousSwitch = $script:ADAuditCurrentCheckSwitch
+    $script:ADAuditCurrentCheckSwitch = $Switch
+    $status = $script:ADAuditCheckStatus | Where-Object { $_.Switch -eq $Switch } | Select-Object -First 1
+    $started = [datetime]::UtcNow
+    $failuresBefore = $script:CheckFailures.Count
+    $unknownBefore = $script:NotAssessed.Count
+    $terminated = $false
+    if ($status) { $status.StartedUtc = $started.ToString('o') }
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
     try {
+        foreach ($moduleName in $Modules) {
+            if (-not (Get-Module -Name $moduleName)) {
+                Register-ADAuditNotAssessed -Name $Name -Switch $Switch -Target $moduleName -Reason "Required module '$moduleName' was not loaded. Dependent subchecks may be unavailable."
+            }
+        }
         & $Body
     } catch {
+        $terminated = $true
         Register-AuditFailure -ErrorRecord $_ -Name $Name -Description $Description -Switch $Switch -Prefix '    [!] CHECK FAILED'
         Write-Both "    [*] Continuing with remaining checks..."
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+        if ($status) {
+            $status.FinishedUtc = [datetime]::UtcNow.ToString('o')
+            $status.DurationSeconds = [math]::Round(([datetime]::UtcNow - $started).TotalSeconds, 2)
+            $status.FailureCount = $script:CheckFailures.Count - $failuresBefore
+            $status.NotAssessedCount = $script:NotAssessed.Count - $unknownBefore
+            $status.Status = if ($terminated) { 'Failed' } elseif ($status.FailureCount -gt 0 -or $status.NotAssessedCount -gt 0) { 'Partial' } else { 'Completed' }
+            $status.Reason = if ($terminated) { 'Check terminated; inspect collection failures.' } elseif ($status.Status -eq 'Partial') { 'Some subchecks or targets could not be assessed; findings cover collected evidence only.' } else { 'Execution completed without recorded collection gaps; this does not mean all controls passed.' }
+        }
+        Write-Progress -Id 1 -Activity $Description -Completed
+        # Also clear legacy/default records left by older check implementations.
+        Write-Progress -Id 0 -Activity 'AD audit' -Completed
+        $resultLabel = if ($status) { $status.Status } elseif ($terminated) { 'Failed' } else { 'Finished' }
+        Write-Both ("[+] {0}: {1} in {2:hh\:mm\:ss}" -f $Name,$resultLabel,([datetime]::UtcNow - $started))
+        if ($SelectedCount -gt 0 -and $CheckIndex -lt $SelectedCount) {
+            Write-Progress -Id 0 -Activity "AD audit - $SelectedCount of $AvailableCount checks selected" -Status "$CheckIndex of $SelectedCount finished; $($AvailableCount - $SelectedCount) skipped" -PercentComplete ([int](100 * $CheckIndex / $SelectedCount))
+        }
+        $script:ADAuditProgressContext = $previousProgressContext
+        $script:ADAuditCurrentCheckSwitch = $previousSwitch
     }
 }
 
@@ -785,10 +1005,14 @@ Function Invoke-AuditStep {
         [string]$Switch
     )
 
+    Write-ADAuditProgress -Activity $Name -Status 'Collecting; this operation does not expose a total'
     try {
         & $Body
     } catch {
         Register-AuditFailure -ErrorRecord $_ -Name $Name -Switch $Switch -Prefix '    [!] STEP FAILED'
+    } finally {
+        Write-Progress -Id 1 -Activity $Name -Completed
+        $script:ADAuditProgressLastActivity = ''
     }
 }
 
@@ -885,6 +1109,7 @@ Function Register-ADAuditNotAssessed {
         [string]$Target,
         [switch]$RequiresRemotePS
     )
+    if (-not $Switch) { $Switch = $script:ADAuditCurrentCheckSwitch }
     $script:NotAssessed.Add([pscustomobject]@{
         Time             = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         CheckName        = $Name
@@ -897,9 +1122,8 @@ Function Register-ADAuditNotAssessed {
     Write-Both "    [~] NOT ASSESSED ($Name$tgt): $Reason"
 }
 
-Function Get-ADAuditRemoteRegistryDword {
-    # Reads a single HKLM REG_DWORD from a (possibly remote) host via the StdRegProv
-    # WMI provider, trying DCOM first then WSMan/WinRM. Returns a tri-state hashtable:
+Function Get-ADAuditRemoteRegistryValue {
+    # Reads one HKLM value locally or with StdRegProv over DCOM first. Returns:
     #   Success=$true,  Value=<int>  -> reached the host, value is set
     #   Success=$true,  Value=$null  -> reached the host, value is NOT set
     #   Success=$false, Error=<msg>  -> could not reach/query the host (=> NotAssessed)
@@ -907,42 +1131,40 @@ Function Get-ADAuditRemoteRegistryDword {
     param(
         [Parameter(Mandatory)][string]$ComputerName,
         [Parameter(Mandatory)][string]$SubKey,
-        [Parameter(Mandatory)][string]$ValueName
+        [Parameter(Mandatory)][string]$ValueName,
+        [ValidateSet('Dword','String')][string]$ValueType = 'Dword',
+        [switch]$UseWsmanFallback
     )
     $HKLM = [uint32]2147483650
     $result = @{ Success = $false; Value = $null; Error = $null }
     $regArgs = @{ hDefKey = $HKLM; sSubKeyName = $SubKey; sValueName = $ValueName }
-    $isLocal = $ComputerName -in @('.', 'localhost', $env:COMPUTERNAME)
-
-    if ($isLocal) {
-        try {
-            $r = Invoke-CimMethod -Namespace 'root/default' -ClassName StdRegProv -MethodName GetDWORDValue -Arguments $regArgs -ErrorAction Stop
-            # Invoke-CimMethod does not throw on provider-level failures; StdRegProv
-            # reports them via ReturnValue (1/2 = value/key not present, 5 = access
-            # denied, other = read failure). Only 1/2 mean 'value is not set'.
-            if ($r.ReturnValue -eq 0) { $result.Success = $true; $result.Value = $r.uValue }
-            elseif ($r.ReturnValue -in 1, 2) { $result.Success = $true; $result.Value = $null }
-            else { $result.Error = "StdRegProv GetDWORDValue failed (ReturnValue=$($r.ReturnValue))" }
+    try {
+        $method = if ($ValueType -eq 'Dword') { 'GetDWORDValue' } else { 'GetStringValue' }
+        $r = Invoke-ADAuditCimMethod -ComputerName $ComputerName -Namespace 'root/default' -ClassName StdRegProv -MethodName $method -Arguments $regArgs -UseWsmanFallback:$UseWsmanFallback -ErrorAction Stop
+        # Provider errors do not throw. Only missing key/value (1/2) is absence;
+        # access denied, unsupported provider and other failures remain unknown.
+        if ($r.ReturnValue -eq 0) {
+            $result.Success = $true
+            $result.Value = if ($ValueType -eq 'Dword') { $r.uValue } else { $r.sValue }
+        } elseif ($r.ReturnValue -in 1, 2) {
+            $result.Success = $true
+        } else {
+            $result.Error = "StdRegProv $method failed (ReturnValue=$($r.ReturnValue))"
         }
-        catch { $result.Error = $_.Exception.Message }
-        return $result
-    }
-
-    foreach ($proto in @('Dcom', 'Wsman')) {
-        $session = $null
-        try {
-            $opt = New-CimSessionOption -Protocol $proto
-            $session = New-CimSession -ComputerName $ComputerName -SessionOption $opt -ErrorAction Stop
-            $r = Invoke-CimMethod -CimSession $session -Namespace 'root/default' -ClassName StdRegProv -MethodName GetDWORDValue -Arguments $regArgs -ErrorAction Stop
-            if ($r.ReturnValue -eq 0) { $result.Success = $true; $result.Value = $r.uValue; $result.Error = $null }
-            elseif ($r.ReturnValue -in 1, 2) { $result.Success = $true; $result.Value = $null; $result.Error = $null }
-            else { $result.Success = $false; $result.Value = $null; $result.Error = "StdRegProv GetDWORDValue failed (ReturnValue=$($r.ReturnValue))" }
-            if ($result.Success) { return $result }
-        }
-        catch { $result.Error = $_.Exception.Message }
-        finally { if ($session) { $session | Remove-CimSession -ErrorAction SilentlyContinue } }
+    } catch {
+        $result.Error = $_.Exception.Message
     }
     return $result
+}
+
+Function Get-ADAuditRemoteRegistryDword {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$SubKey,
+        [Parameter(Mandatory)][string]$ValueName
+    )
+    Get-ADAuditRemoteRegistryValue -ComputerName $ComputerName -SubKey $SubKey -ValueName $ValueName -ValueType Dword -UseWsmanFallback
 }
 
 Function Write-NotAssessedReport {
@@ -1010,7 +1232,7 @@ Function Write-Nessus-Header() {
 $script:NessusSeverityByKB = @{
     'KB510' = 'Critical'; 'KB1200' = 'Critical'; 'KB253' = 'Critical'; 'KB611' = 'Critical'
     'KB720' = 'Critical'; 'KB1095' = 'Critical'; 'KB1096' = 'Critical'; 'KB1205' = 'Critical'
-    'KB329' = 'Critical'
+    'KB329' = 'Critical'; 'KB1206' = 'Critical'
     'KB842' = 'High'; 'KB551' = 'High'; 'KB426' = 'High'; 'KB427' = 'High'; 'KB428' = 'High'
     'KB262' = 'High'; 'KB263' = 'High'; 'KB81' = 'High'; 'KB290' = 'High'; 'KB479' = 'High'
     'KB995' = 'High'; 'KB1101' = 'High'; 'KB1203' = 'High'; 'KB1204' = 'High'; 'KB258' = 'High'

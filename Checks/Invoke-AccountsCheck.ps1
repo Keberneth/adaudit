@@ -29,11 +29,11 @@ Function Get-PrivilegedGroupAccounts {
     $totalcount = ($privilegedusers | Measure-Object | Select-Object Count).count
     foreach ($account in $privusersunique) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for users who are in privileged groups..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
+        Write-ADAuditProgress -Activity "Searching for users who are in privileged groups..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'accounts_userPrivileged.txt') -Value "$($account.SamAccountName) ($($account.Name))"
         $count++
     }
-    Write-Progress -Activity "Searching for users who are in privileged groups..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for users who are in privileged groups..." -Status "Ready" -Completed
     if ($count -gt 0) {
         Write-Both "    [!] There are $count accounts in privileged groups, see accounts_userPrivileged.txt (KB426)"
         Write-Nessus-Finding "PrivilegedGroupMembers" "KB426" ([System.IO.File]::ReadAllText((Get-EvidencePath 'accounts_userPrivileged.txt')))
@@ -48,8 +48,8 @@ Function Get-PrivilegedGroupAccounts {
 # environments scale: a 100-user shop with 6 named DAs is high risk; a
 # 3,000-user shop with 6 named DAs is "review and justify, not necessarily
 # break-glass-fail". The functions below let the script reflect that without
-# normalising dangerous DA sprawl - scaling is capped at 10, and any service
-# account / computer / gMSA / nested group inside DA is automatic Critical.
+# normalising DA sprawl - scaling is capped at 10. Counts, principal type,
+# naming and stale activity are review signals, not proof of credential compromise.
 # ---------------------------------------------------------------------------
 Function Get-DomainAdminTargetMax {
     [CmdletBinding()]
@@ -123,6 +123,43 @@ Function Get-PrincipalKindForDA {
     return 'NormalUser'
 }
 
+Function Get-DomainAdminReviewAssessment {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Members = @(), [int]$EnabledHumanUsers, [switch]$IsolatedClone)
+    $effectivePerm = @($Members | Where-Object { $_.Kind -eq 'NormalUser' -and $_.Enabled -eq $true }).Count
+    $targetMax = Get-DomainAdminTargetMax -EnabledHumanUsers $EnabledHumanUsers
+    $sizeLimit = Get-DomainAdminSizeAdjustedLimit -EnabledHumanUsers $EnabledHumanUsers
+    $severity = 'Information'
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if ($effectivePerm -gt 10) {
+        $severity = 'High'; $reasons.Add("Enabled named Domain Admin count ($effectivePerm) exceeds the audit review cap (10). Validate standing access and temporary-elevation options.")
+    } elseif ($effectivePerm -gt $sizeLimit) {
+        $severity = 'High'; $reasons.Add("Enabled named Domain Admin count ($effectivePerm) exceeds the size-adjusted review threshold ($sizeLimit).")
+    } elseif ($effectivePerm -gt 5) {
+        $severity = 'Medium'; $reasons.Add("Enabled named Domain Admin count ($effectivePerm) exceeds the audit benchmark (5) but remains within the size-adjusted threshold ($sizeLimit).")
+    } elseif ($effectivePerm -gt $targetMax) {
+        $severity = 'Low'; $reasons.Add("Enabled named Domain Admin count ($effectivePerm) exceeds the audit target ($targetMax).")
+    }
+    $activeSpecial = @($Members | Where-Object { ($_.Enabled -eq $true -and $_.Kind -in @('Service','Computer','gMSA')) -or $_.Kind -eq 'NestedGroup' }).Count
+    $staleEnabled = @($Members | Where-Object { $_.Enabled -eq $true -and $_.Kind -eq 'NormalUser' -and $_.Stale }).Count
+    $disabled = @($Members | Where-Object { $_.Enabled -eq $false -and $_.Kind -ne 'BuiltinAdmin500' }).Count
+    $unknown = @($Members | Where-Object { $null -eq $_.Enabled }).Count
+    if ($activeSpecial) {
+        $severity = 'High'; $reasons.Add("$activeSpecial enabled service/computer/managed-account or nested-group membership signals require privilege-design review. A service-style name or principal type does not establish weak credentials or exploitation.")
+    }
+    if ($staleEnabled) {
+        if (-not $IsolatedClone -and $severity -in @('Information','Low')) { $severity = 'Medium' }
+        $reasons.Add("$staleEnabled enabled named members have old or missing replicated logon signals; confirm actual use and snapshot age before action. Isolated-clone age signals do not increase severity.")
+    }
+    if ($disabled) {
+        if ($severity -eq 'Information') { $severity = 'Low' }
+        $reasons.Add("$disabled disabled members require retention/reactivation review; disabled membership alone is not an active credential exposure.")
+    }
+    if ($unknown) { $reasons.Add("$unknown members have unknown enablement state and are not assumed active.") }
+    if ($reasons.Count -eq 0) { $reasons.Add('Membership is within the configured audit review thresholds; this does not establish that every privileged account is secure.') }
+    [pscustomobject]@{Severity=$severity;Reason=($reasons -join ' ')}
+}
+
 Function Get-DomainAdminScaledRisk {
     <#
     .SYNOPSIS
@@ -134,7 +171,8 @@ Function Get-DomainAdminScaledRisk {
         the precomputed severity directly.
     .NOTES
         Severity model:
-          - High-risk members > 0  -> Critical
+          - Enabled service/computer/gMSA or nested membership -> High review
+          - Stale activity only -> Medium review; disabled-only membership -> Low
           - Effective permanent > hard cap (10)  -> High
           - Effective permanent > size-adjusted limit  -> High
           - Effective permanent > static benchmark (5) -> Medium
@@ -219,7 +257,10 @@ Function Get-DomainAdminScaledRisk {
 
     # Hydrate each effective member with the attributes we need to classify.
     $rows = @()
+    $memberIndex = 0
     foreach ($m in $effectiveMembers) {
+        Write-ADAuditProgress -Activity 'Accounts: classify Domain Admins members' -Status "Reading member $($memberIndex + 1)/$($effectiveMembers.Count); $memberIndex finished" -PercentComplete ($memberIndex / [math]::Max(1,$effectiveMembers.Count) * 100)
+        $memberIndex++
         $obj = $null
         $hydrated = $false
         try {
@@ -233,9 +274,8 @@ Function Get-DomainAdminScaledRisk {
             Write-Both "        [i] Could not fully hydrate Domain Admins member $($m.distinguishedName): $($_.Exception.Message)"
         }
         $kind = Get-PrincipalKindForDA -Member $obj -DomainSid $domainSid
-        # Default to enabled/not-stale on a hydration failure so we do not falsely
-        # escalate the whole finding to Critical when a single member cannot be read.
-        $enabled = $true
+        # Unknown state must not be presumed enabled for severity calculations.
+        $enabled = $null
         if ($hydrated -and $obj.PSObject.Properties['userAccountControl'] -and $null -ne $obj.userAccountControl) {
             $enabled = -not ([bool]([int]$obj.userAccountControl -band 0x2))
         }
@@ -263,7 +303,7 @@ Function Get-DomainAdminScaledRisk {
     $effectivePerm = ($rows | Where-Object { $_.Kind -eq 'NormalUser' -and $_.Enabled }).Count
     $highRiskFromRecursive = $rows | Where-Object {
         $_.Kind -in @('Service','Computer','gMSA') -or
-        (-not $_.Enabled -and $_.Kind -ne 'BuiltinAdmin500') -or
+        ($_.Enabled -eq $false -and $_.Kind -ne 'BuiltinAdmin500') -or
         ($_.Kind -eq 'NormalUser' -and $_.Stale -and $_.Enabled)
     }
     # Direct nested groups are high-risk regardless: they hide effective
@@ -271,29 +311,9 @@ Function Get-DomainAdminScaledRisk {
     $highRiskRows  = @($highRiskFromRecursive) + @($nestedGroupRows)
     $highRiskCount = ($highRiskRows | Measure-Object).Count
 
-    # Severity ladder
-    $severity = 'Information'
-    $reason   = 'Permanent Domain Admin count is within the recommended target.'
-    if ($highRiskCount -gt 0) {
-        $severity = 'Critical'
-        $reason   = "$highRiskCount high-risk principal(s) inside Domain Admins (service / computer / gMSA / nested / stale / disabled-but-member). High risk regardless of total count."
-    }
-    elseif ($effectivePerm -gt $hardCap) {
-        $severity = 'High'
-        $reason   = "Effective permanent named Domain Admins ($effectivePerm) exceeds the hard cap ($hardCap). Scaling stops here - use PAM/PIM/JIT or temporary elevation."
-    }
-    elseif ($effectivePerm -gt $sizeLimit) {
-        $severity = 'High'
-        $reason   = "Effective permanent named Domain Admins ($effectivePerm) exceeds the size-adjusted threshold ($sizeLimit) for $enabledHumanUsers enabled human users."
-    }
-    elseif ($effectivePerm -gt $staticBenchmark) {
-        $severity = 'Medium'
-        $reason   = "Effective permanent named Domain Admins ($effectivePerm) is above the static benchmark of $staticBenchmark, but within the size-adjusted threshold ($sizeLimit). Validate business justification."
-    }
-    elseif ($effectivePerm -gt $targetMax) {
-        $severity = 'Low'
-        $reason   = "Effective permanent named Domain Admins ($effectivePerm) is within the size-adjusted threshold but above the recommended target ($targetMax) for this AD size."
-    }
+    $assessment = Get-DomainAdminReviewAssessment -Members (@($rows) + @($nestedGroupRows)) -EnabledHumanUsers $enabledHumanUsers -IsolatedClone:$script:ADAuditIsolatedClone
+    $severity = $assessment.Severity
+    $reason = $assessment.Reason
 
     # Other privileged groups (folded in for one-stop review)
     $otherGroups = @(
@@ -309,7 +329,10 @@ Function Get-DomainAdminScaledRisk {
         } catch { }
     }
     $otherGroupSummaries = @()
+    $groupIndex = 0
     foreach ($og in $otherGroups) {
+        Write-ADAuditProgress -Activity 'Accounts: privileged group membership' -Status "Group $($groupIndex + 1)/$($otherGroups.Count): $($og.Name)" -PercentComplete ($groupIndex / [math]::Max(1,$otherGroups.Count) * 100)
+        $groupIndex++
         if ([string]::IsNullOrWhiteSpace($og.Name)) { continue }
         $members = @()
         try { $members = @(Get-ADGroupMember -Identity $og.SID -Recursive -ErrorAction Stop) } catch { continue }
@@ -344,12 +367,12 @@ Function Get-DomainAdminScaledRisk {
     [void]$sb.AppendLine("Enabled human AD users (denominator): $enabledHumanUsers")
     [void]$sb.AppendLine("Total Domain Admins members (recursive): $($rows.Count)")
     [void]$sb.AppendLine("  - Built-in domain Administrator (RID-500): $rid500Count")
-    [void]$sb.AppendLine("  - Effective permanent named (enabled human): $effectivePerm")
-    [void]$sb.AppendLine("  - High-risk (service/computer/gMSA/nested/stale/disabled-but-member): $highRiskCount")
+    [void]$sb.AppendLine("  - Effective named (enabled human; permanence not established): $effectivePerm")
+    [void]$sb.AppendLine("  - Membership review signals (service/computer/gMSA/nested/stale/disabled): $highRiskCount")
     [void]$sb.AppendLine("  - Direct nested groups in Domain Admins: $directNestedGroupCount")
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('----- THRESHOLDS -----')
-    [void]$sb.AppendLine("Static benchmark (Microsoft baseline):       $staticBenchmark")
+    [void]$sb.AppendLine("Static benchmark (audit heuristic):          $staticBenchmark")
     [void]$sb.AppendLine("Recommended target for this AD size:         $targetMax")
     [void]$sb.AppendLine("Size-adjusted threshold (severity floor):    $sizeLimit")
     [void]$sb.AppendLine("Hard cap (PAM/PIM/JIT recommended beyond):   $hardCap")
@@ -363,11 +386,10 @@ Function Get-DomainAdminScaledRisk {
     [void]$sb.AppendLine('Microsoft AD guidance is that Domain Admins is intended for build')
     [void]$sb.AppendLine('and disaster-recovery scenarios only, with day-to-day work performed')
     [void]$sb.AppendLine('via delegated administration, tiered admin accounts, and temporary')
-    [void]$sb.AppendLine('elevation (PAM / PIM / JIT). Many security baselines use 5 named')
-    [void]$sb.AppendLine('Domain Admins as a static benchmark. Service accounts, computer')
-    [void]$sb.AppendLine('accounts, gMSAs and nested groups in Domain Admins are dangerous')
-    [void]$sb.AppendLine('regardless of count: long-lived credentials, weak interactive')
-    [void]$sb.AppendLine('monitoring, and effective-membership inflation through nesting.')
+    [void]$sb.AppendLine('elevation. The numeric targets here are audit heuristics, not universal')
+    [void]$sb.AppendLine('Microsoft limits. Service, computer, managed-account and nested membership')
+    [void]$sb.AppendLine('deserve review for unnecessary broad privilege. A name/type, stale timestamp')
+    [void]$sb.AppendLine('or disabled account does not prove weak credentials, compromise or active misuse.')
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('----- HOW TO FIX -----')
     [void]$sb.AppendLine(' - Reduce permanent Domain Admins membership where possible.')
@@ -385,19 +407,21 @@ Function Get-DomainAdminScaledRisk {
     $allMembersForDisplay = @($rows) + @($nestedGroupRows)
     foreach ($r in ($allMembersForDisplay | Sort-Object Kind, SamAccountName)) {
         $flags = @()
-        if (-not $r.Enabled) { $flags += 'DISABLED' }
-        if ($r.Stale)        { $flags += 'STALE>90d' }
+        if ($r.Enabled -eq $false) { $flags += 'DISABLED' }
+        if ($null -eq $r.Enabled) { $flags += 'STATE UNKNOWN' }
+        if ($r.Stale)        { $flags += 'OLD/MISSING REPLICATED LOGON SIGNAL' }
         $flagStr = if ($flags.Count -gt 0) { ' [' + ($flags -join ',') + ']' } else { '' }
         [void]$sb.AppendLine(("  [{0}] {1}{2}    {3}" -f $r.Kind.PadRight(15), $r.SamAccountName, $flagStr, $r.DN))
     }
     [void]$sb.AppendLine('')
     if ($highRiskCount -gt 0) {
-        [void]$sb.AppendLine('----- HIGH-RISK MEMBERS DETAIL -----')
+        [void]$sb.AppendLine('----- MEMBERSHIP REVIEW DETAIL -----')
         foreach ($r in $highRiskRows) {
             $whys = @()
             if ($r.Kind -in @('Service','Computer','gMSA','NestedGroup')) { $whys += "principal type = $($r.Kind)" }
-            if (-not $r.Enabled -and $r.Kind -ne 'BuiltinAdmin500')        { $whys += 'disabled but still a member' }
-            if ($r.Kind -eq 'NormalUser' -and $r.Stale -and $r.Enabled)    { $whys += 'no logon in 90 days' }
+            if ($r.Enabled -eq $false -and $r.Kind -ne 'BuiltinAdmin500') { $whys += 'disabled but still a member' }
+            if ($null -eq $r.Enabled) { $whys += 'enablement state not established' }
+            if ($r.Kind -eq 'NormalUser' -and $r.Stale -and $r.Enabled) { $whys += 'old or missing replicated logon signal; verify current use' }
             [void]$sb.AppendLine(("  [{0}] {1}: {2}" -f $r.Kind.PadRight(15), $r.SamAccountName, ($whys -join '; ')))
         }
         [void]$sb.AppendLine('')
@@ -419,7 +443,7 @@ Function Get-DomainAdminScaledRisk {
     }
 
     Set-Content -LiteralPath (Get-EvidencePath 'domain_admins_scaled.txt') -Value $sb.ToString() -Encoding UTF8
-    Write-Both "    [!] Domain Admins review: severity=$severity (effective=$effectivePerm, high-risk=$highRiskCount, threshold=$sizeLimit, target=$targetMax for $enabledHumanUsers users). See domain_admins_scaled.txt"
+    Write-Both "    [!] Domain Admins review: severity=$severity (effective=$effectivePerm, review-signals=$highRiskCount, threshold=$sizeLimit, target=$targetMax for $enabledHumanUsers users). See domain_admins_scaled.txt"
 
     # Pass the computed size-adjusted severity; Get-NessusSeverityTuple has no
     # 'Information' case, so map it to the tuple's 'Info' key.
@@ -524,12 +548,12 @@ Function Get-ProtectedUsers {
         $totalcount = ($protectedaccounts | Measure-Object | Select-Object -ExpandProperty Count)
         foreach ($members in $protectedaccounts) {
             if ($totalcount -eq 0) { break }
-            Write-Progress -Activity "Searching for protected users..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
+            Write-ADAuditProgress -Activity "Searching for protected users..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
             $account = Get-ADObject $members -Properties SamAccountName
             Add-Content -Path $evPath -Value "$($account.SamAccountName) ($($account.Name))"
             $count++
         }
-        Write-Progress -Activity "Searching for protected users..." -Status "Ready" -Completed
+        Write-ADAuditProgress -Activity "Searching for protected users..." -Status "Ready" -Completed
 
         if ($count -gt 0) {
             Write-Both "    [!] There are $count accounts in the 'Protected Users' group, see accounts_protectedusers.txt"
@@ -684,12 +708,15 @@ Function Get-InactiveAccounts {
 
     $props = @('samAccountName','name','distinguishedName','lastLogonTimestamp','whenCreated','pwdLastSet')
 
-    $inactiveUsers = Get-ADUser -LDAPFilter $ldapFilter -Properties $props
+    $inactiveUsers = @(Get-ADUser -LDAPFilter $ldapFilter -Properties $props -ErrorAction Stop | Where-Object {
+        # New accounts that have not logged on yet are not stale accounts.
+        $_.whenCreated -and ([datetime]$_.whenCreated).ToUniversalTime() -le $cutoffUtc
+    })
 
     $totalcount = ($inactiveUsers | Measure-Object).Count
 
     if ($totalcount -gt 0) {
-        "Accounts inactive (no logon) for the past $InactiveDays days (based on lastLogonTimestamp)" |
+        "Enabled user accounts with no recent replicated logon signal ($InactiveDays days); confirm owner and actual use before disabling." |
             Set-Content -Encoding UTF8 -Path $txtPath
     } else {
         # Ensure no stale file from previous runs
@@ -700,7 +727,7 @@ Function Get-InactiveAccounts {
 
     $results = foreach ($u in $inactiveUsers) {
         $progresscount++
-        Write-Progress -Activity "Searching for inactive users..." -Status "Currently identified $count" -PercentComplete (($progresscount / [math]::Max($totalcount,1)) * 100)
+        Write-ADAuditProgress -Activity "Searching for inactive users..." -Status "Currently identified $count" -PercentComplete (($progresscount / [math]::Max($totalcount,1)) * 100)
 
         $lastLogonUtc = $null
         if ($u.lastLogonTimestamp) {
@@ -727,7 +754,7 @@ Function Get-InactiveAccounts {
         }
     }
 
-    Write-Progress -Activity "Searching for inactive users..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for inactive users..." -Status "Ready" -Completed
 
     if ($count -gt 0) {
         # Sort: oldest logon first (nulls last)
@@ -1011,13 +1038,13 @@ Function Get-DisabledAccounts {
     foreach ($account in $disabledaccounts) {
         if ($totalcount -eq 0) { break }
 
-        Write-Progress -Activity "Searching for disabled users..." -Status "Currently identified $count" -PercentComplete (($count / $totalcount) * 100)
+        Write-ADAuditProgress -Activity "Searching for disabled users..." -Status "Currently identified $count" -PercentComplete (($count / $totalcount) * 100)
 
         Add-Content -Encoding UTF8 -Path $txtPath -Value "Account $($account.SamAccountName) ($($account.Name)) is disabled"
         $count++
     }
 
-    Write-Progress -Activity "Searching for disabled users..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for disabled users..." -Status "Ready" -Completed
 
     if ($count -gt 0) {
         Write-Both "    [!] $count disabled user accounts, see accounts_disabled.txt (KB501)"
@@ -1034,11 +1061,11 @@ Function Get-LockedAccounts {
     $totalcount = ($lockedAccounts | Measure-Object | Select-Object Count).Count
     foreach ($account in $lockedAccounts) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for locked users..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
+        Write-ADAuditProgress -Activity "Searching for locked users..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'accounts_locked.txt') -Value "Account $($account.SamAccountName) ($($account.Name)) is locked"
         $count++
     }
-    Write-Progress -Activity "Searching for locked users..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for locked users..." -Status "Ready" -Completed
     if ($count -gt 0) {
         Write-Both "    [!] $count locked user accounts, see accounts_locked.txt"
     }
@@ -1111,31 +1138,26 @@ Function Get-RC4OnlyAccounts {
     $header = @"
 # RC4-only accounts (CVE-2026-20833 / Kerberos RC4 hardening)
 #
-# These accounts have msDS-SupportedEncryptionTypes set such that no AES key
-# (AES128 0x8 / AES256 0x10) is advertised. After Microsoft's RC4 hardening
-# update (CVE-2026-20833) the KDC stops issuing RC4-encrypted service tickets
-# for affected accounts and authentication will fail unless AES is enabled.
+# These enabled accounts have explicit configuration without AES ticket
+# encryption bits. This is configuration evidence, not proof of actual key
+# availability, observed RC4 use, or a particular hardening enforcement phase.
 #
 # How to remediate (per account):
-#   1. Add AES support to the account:
-#        Set-ADUser     <account> -Replace @{'msDS-SupportedEncryptionTypes'=24}
-#        Set-ADComputer <account> -Replace @{'msDS-SupportedEncryptionTypes'=24}
-#      Value 24 = AES128 + AES256 (recommended). Use 28 if RC4 must coexist.
-#   2. Force a password change so AES keys are actually generated in the KDS:
-#        - User / service account: reset the password
-#        - Computer account:       Reset-ComputerMachinePassword (or rejoin)
-#        - Service account with SPN: rotate password or migrate to gMSA
+#   1. Confirm application/client AES support and review effective KDC policy.
+#      Plan an account-specific change preserving unrelated bit flags and test
+#      dependencies before removing RC4. AES128/AES256 ticket bits are 0x8/0x10.
+#   2. Verify AES key availability. Coordinate any necessary password rotation
+#      with service owners and update dependent services/keytabs; consider gMSA.
+#      Do not reset machine passwords or rejoin machines solely on this finding.
 #   3. Validate the account no longer requests RC4 by inspecting DC event 4769
 #      (TicketEncryptionType 0x17 = RC4-HMAC, 0x12 = AES256, 0x11 = AES128).
 #   4. For the krbtgt account, perform a planned double-rotation - do NOT use
 #      this script's remediation steps directly on krbtgt.
 #
 # Domain-wide controls referenced by the CVE update:
-#   - DefaultDomainSupportedEncTypes (HKLM\SYSTEM\CCS\Services\Kdc) controls
-#     the fallback used when an account's attribute is unset (0). Set to 0x18
-#     so blank accounts negotiate AES rather than RC4.
-#   - KrbtgtFullPacSignature / Audit mode registry knobs may need to be
-#     reviewed alongside the RC4 hardening update.
+#   - Review per-DC DefaultDomainSupportedEncTypes, applicable Group Policy,
+#     update level and RC4 hardening phase. An absent registry value is not
+#     assumed to mean a universal default. See kerberos_dc_defaults.csv.
 #
 # References:
 #   https://www.cayosoft.com/blog/kerberos-rc4-hardening-what-microsoft-s-cve-2026-20833-update-really-means-for-active-directory-admins/
@@ -1151,65 +1173,56 @@ Function Get-RC4OnlyAccounts {
     # Pull all security principals that can hold a Kerberos key
     $props = @('SamAccountName','DistinguishedName','ObjectClass','Enabled','msDS-SupportedEncryptionTypes','PasswordLastSet','ServicePrincipalName','userAccountControl')
 
+    Write-ADAuditProgress -Activity 'Kerberos: account enumeration' -Status 'Reading user and computer encryption attributes' -PercentComplete -1
     $allAccounts = New-Object System.Collections.Generic.List[object]
     $enumFailures = @()
     try { Get-ADUser     -Filter * -Properties $props -ErrorAction Stop | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { $enumFailures += "Get-ADUser: $($_.Exception.Message)" }
     try { Get-ADComputer -Filter * -Properties $props -ErrorAction Stop | ForEach-Object { $allAccounts.Add($_) | Out-Null } } catch { $enumFailures += "Get-ADComputer: $($_.Exception.Message)" }
-    if ($allAccounts.Count -eq 0 -and $enumFailures.Count -gt 0) {
+    if ($enumFailures.Count -gt 0) {
         # A failed enumeration must not fall through to the 'no accounts found' all-clear
         Register-ADAuditNotAssessed -Name 'Get-RC4OnlyAccounts' -Switch 'accounts' -Reason "Account enumeration failed: $($enumFailures -join '; ')"
-        return
+        if ($allAccounts.Count -eq 0) { return }
     }
 
-    # Domain default fallback (when attribute is null/0). Best effort - read from PDC.
+    # Defaults vary by DC update level and policy. An absent/unreadable value
+    # is not evidence for a universal 0x1C fallback or for available AES keys.
     $domainDefault = $null
-    try {
-        $pdc = (Get-ADDomain -ErrorAction SilentlyContinue).PDCEmulator
-        if ($pdc) {
-            $reg = Invoke-CimMethod -ClassName StdRegProv -Namespace 'root/default' -MethodName GetDWORDValue -Arguments @{
-                hDefKey     = [uint32]2147483650
-                sSubKeyName = 'SYSTEM\CurrentControlSet\Services\Kdc'
-                sValueName  = 'DefaultDomainSupportedEncTypes'
-            } -CimSession (New-CimSession -ComputerName $pdc -ErrorAction Stop) -ErrorAction Stop
-            $domainDefault = $reg.uValue
+    $fallbackRows = @()
+    $dcsForDefaults = @(Get-ADDomainController -Filter * -ErrorAction Stop)
+    $defaultsIndex = 0
+    foreach ($dcForDefaults in $dcsForDefaults) {
+        Write-ADAuditProgress -Activity 'Kerberos: DC encryption defaults' -Status "DC $($defaultsIndex + 1)/$($dcsForDefaults.Count): $($dcForDefaults.HostName)" -PercentComplete ($defaultsIndex / [math]::Max(1,$dcsForDefaults.Count) * 100)
+        $defaultsIndex++
+        $remote = Get-ADAuditRemoteRegistryDword -ComputerName $dcForDefaults.HostName -SubKey 'SYSTEM\CurrentControlSet\Services\Kdc' -ValueName 'DefaultDomainSupportedEncTypes'
+        $fallbackRows += [pscustomobject]@{ DomainController=$dcForDefaults.HostName; Value=$remote.Value; State=$(if (-not $remote.Success) { 'Unreadable' } elseif ($null -eq $remote.Value) { 'OS/update default not established' } else { 'Explicit registry value' }) }
+        if (-not $remote.Success -or $null -eq $remote.Value) {
+            Register-ADAuditNotAssessed -Name 'Kerberos default encryption types' -Switch 'accounts' -Target $dcForDefaults.HostName -Reason 'KDC fallback cannot be established from an absent/unreadable registry value. Validate update level, policy and Kerberos audit events; no AES default is assumed.'
         }
-    } catch { }
-    # OS hardcoded fallback used by Windows DCs (Server 2008+) when neither the
-    # account's msDS-SupportedEncryptionTypes nor DefaultDomainSupportedEncTypes is
-    # set. Value 0x1C = AES256 (0x10) + AES128 (0x8) + RC4_HMAC (0x4). This is what
-    # the KDC actually uses at ticket-issuance time, and why most accounts with a
-    # null attribute negotiate AES in practice (verifiable via DSInternals - the
-    # KerberosNew credentials block contains AES256/AES128 keys for these accounts).
-    $osHardcodedFallback = 0x1C
-
-    if ($null -ne $domainDefault) {
-        $domainDefaultHex = '0x{0:X}' -f [int]$domainDefault
-        $evidenceBuffer.Add("# Domain DefaultDomainSupportedEncTypes (KDC fallback) = $domainDefault ($domainDefaultHex)`n") | Out-Null
-    } else {
-        $evidenceBuffer.Add("# Domain DefaultDomainSupportedEncTypes is not set on the PDC. Using Windows OS hardcoded fallback 0x1C (AES256+AES128+RC4) for accounts with a null msDS-SupportedEncryptionTypes attribute.`n") | Out-Null
     }
-
+    if ($fallbackRows.Count) { $fallbackRows | Export-Csv -LiteralPath (Get-EvidencePath 'kerberos_dc_defaults.csv') -NoTypeInformation -Encoding UTF8 }
+    $unknownDefaults = @($fallbackRows | Where-Object State -ne 'Explicit registry value')
+    $distinctDefaults = @($fallbackRows | Where-Object State -eq 'Explicit registry value' | Select-Object -ExpandProperty Value -Unique)
+    # Explicit registry values are useful inventory but do not establish policy
+    # precedence or key availability. Keep all unset account attributes unverified.
+    $unknownAccounts = [System.Collections.Generic.List[object]]::new()
     $rows = New-Object System.Collections.Generic.List[object]
+    $accountIndex = 0
     foreach ($acct in $allAccounts) {
+        Write-ADAuditProgress -Activity 'Kerberos: account encryption assessment' -Status "$accountIndex/$($allAccounts.Count) accounts processed" -PercentComplete ($accountIndex / [math]::Max(1,$allAccounts.Count) * 100)
+        $accountIndex++
+        if ($acct.Enabled -ne $true) { continue }
         $encType = $acct.'msDS-SupportedEncryptionTypes'
         $effective = $encType
         $effectiveSource = 'attribute'
         if ($null -eq $encType -or $encType -eq 0) {
-            # Attribute is unset - the KDC falls back to DefaultDomainSupportedEncTypes
-            # if that registry value is configured on the PDC, otherwise to the Windows
-            # OS hardcoded default (0x1C = AES256+AES128+RC4). Only treat the account
-            # as at-risk when the *fallback itself* lacks AES bits - a null attribute
-            # alone is not a problem on a modern DC where the OS default already
-            # includes AES and the KDS holds AES keys for the account.
             if ($null -ne $domainDefault) {
                 $effective = $domainDefault
-                $effectiveSource = 'DefaultDomainSupportedEncTypes'
+                $effectiveSource = 'Explicit consistent KDC registry values'
             } else {
-                $effective = $osHardcodedFallback
-                $effectiveSource = 'OS hardcoded default'
+                $unknownAccounts.Add([pscustomobject]@{ SamAccountName=$acct.SamAccountName; DistinguishedName=$acct.DistinguishedName; Enabled=$acct.Enabled; Reason='Encryption attribute unset; per-DC effective defaults/key availability require verification.' })
+                continue
             }
         }
-
         $hasAes128 = (($effective -band 0x8)  -ne 0)
         $hasAes256 = (($effective -band 0x10) -ne 0)
         $hasRc4    = (($effective -band 0x4)  -ne 0)
@@ -1241,14 +1254,18 @@ Function Get-RC4OnlyAccounts {
         }
     }
 
+    if ($unknownAccounts.Count) {
+        $unknownAccounts | Export-Csv -LiteralPath (Get-EvidencePath 'kerberos_encryption_unverified.csv') -NoTypeInformation -Encoding UTF8
+        Register-ADAuditNotAssessed -Name 'Kerberos account encryption' -Switch 'accounts' -Reason "$($unknownAccounts.Count) accounts have unset encryption attributes and unverified/inconsistent KDC defaults; see kerberos_encryption_unverified.csv."
+    }
     if ($rows.Count -gt 0) {
         Set-Content -LiteralPath $evidencePath -Value ($evidenceBuffer -join "`n") -Encoding UTF8
         $rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
-        Write-Both "    [!] $($rows.Count) account(s) lack AES Kerberos support and are affected by CVE-2026-20833 RC4 hardening (KB1205)"
-        Write-Both "    [!] Set msDS-SupportedEncryptionTypes to 24 (AES128+AES256) and rotate passwords - see rc4_only_accounts.txt"
+        Write-Both "    [!] $($rows.Count) enabled account(s) have explicit encryption settings without AES ticket bits (KB1205)"
+        Write-Both "    [!] Validate application support, effective DC policy and key availability before planning changes; see rc4_only_accounts.txt"
         Write-Nessus-Finding "RC4OnlyAccountsCVE202620833" "KB1205" ([System.IO.File]::ReadAllText($evidencePath))
     } else {
-        Write-Both "    [+] No accounts found that rely solely on RC4/DES for Kerberos (CVE-2026-20833)"
+        Write-Both "    [+] No explicit RC4/DES-only account configurations found; unverified defaults and actual key availability require separate review."
     }
 
     # ---- Best-effort runtime check: query DC security logs for RC4 service ticket events ----
@@ -1286,13 +1303,26 @@ Function Get-RC4OnlyAccounts {
     try { $dcs = @(Get-ADDomainController -Filter * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty HostName) } catch { }
 
     $rc4UserHits = @{}
+    $eventCoverage = [System.Collections.Generic.List[object]]::new()
+    $eventDcIndex = 0
     foreach ($dc in $dcs) {
+        Write-ADAuditProgress -Activity 'Kerberos: DC Security event sample' -Status "DC $($eventDcIndex + 1)/$($dcs.Count): $dc; reading up to $perDcCap events" -PercentComplete ($eventDcIndex / [math]::Max(1,$dcs.Count) * 100)
+        $eventDcIndex++
+        if ($script:ADAuditIsolatedClone -and -not (Test-ADAuditLocalComputer -ComputerName $dc)) {
+            Register-ADAuditNotAssessed -Name 'Kerberos event sample coverage' -Switch 'accounts' -Target $dc -Reason 'Isolated clone mode: event logs on other domain controllers were not contacted.'
+            continue
+        }
         try {
-            $events = Get-WinEvent -ComputerName $dc -FilterHashtable @{
+            $events = @(Get-WinEvent -ComputerName $dc -FilterHashtable @{
                 LogName   = 'Security'
                 Id        = @(4768,4769)
                 StartTime = $startTime
-            } -MaxEvents $perDcCap -ErrorAction Stop
+            } -MaxEvents $perDcCap -ErrorAction Stop)
+            $oldestEvent = $events | Sort-Object TimeCreated | Select-Object -First 1
+            $eventCoverage.Add([pscustomobject]@{ DomainController=$dc; EventsRead=$events.Count; RequestedStartUTC=$startTime.ToUniversalTime().ToString('o'); OldestReturnedUTC=$(if ($oldestEvent) { $oldestEvent.TimeCreated.ToUniversalTime().ToString('o') } else { '' }); Truncated=($events.Count -ge $perDcCap) })
+            if ($events.Count -ge $perDcCap) {
+                Register-ADAuditNotAssessed -Name 'Kerberos event sample coverage' -Switch 'accounts' -Target $dc -Reason "The $perDcCap-event cap was reached before filtering RC4; the sample does not establish seven-day coverage. See kerberos_event_coverage.csv."
+            }
         } catch {
             # "No events were found" is a clean result (no RC4 traffic in the window), not
             # a query failure - it must not create the evidence file on its own.
@@ -1303,19 +1333,18 @@ Function Get-RC4OnlyAccounts {
             continue
         }
 
+        $eventIndex = 0
         foreach ($evt in $events) {
-            # TicketEncryptionType is exposed as an integer (UInt32) in event Properties.
+            Write-ADAuditProgress -Activity 'Kerberos: inspect collected events' -Status "DC $eventDcIndex/$($dcs.Count): $dc; $eventIndex/$($events.Count) events processed" -PercentComplete ($eventIndex / [math]::Max(1,$events.Count) * 100)
+            $eventIndex++
+            # Read named XML fields: event versions may add/reorder properties.
             # 0x17 (23) = RC4-HMAC, 0x18 (24) = RC4-HMAC-EXP
             # 0x11 (17) = AES128, 0x12 (18) = AES256
             $encVal = $null
             try {
-                # 4769: Properties index 5 = TicketEncryptionType ; 4768: index 7
-                # (TicketEncryptionType; index 8 is PreAuthType)
-                if ($evt.Id -eq 4769 -and $evt.Properties.Count -ge 6) {
-                    $encVal = $evt.Properties[5].Value
-                } elseif ($evt.Id -eq 4768 -and $evt.Properties.Count -ge 8) {
-                    $encVal = $evt.Properties[7].Value
-                }
+                $eventData = @{}
+                foreach ($node in ([xml]$evt.ToXml()).Event.EventData.Data) { $eventData[[string]$node.Name] = [string]$node.'#text' }
+                $encVal = $eventData['TicketEncryptionType']
             } catch { }
             if ($null -eq $encVal) { continue }
 
@@ -1333,10 +1362,10 @@ Function Get-RC4OnlyAccounts {
                 $svc    = $null
                 try {
                     if ($evt.Id -eq 4769) {
-                        $user = [string]$evt.Properties[0].Value
-                        $svc  = [string]$evt.Properties[2].Value
+                        $user = $eventData['TargetUserName']
+                        $svc  = $eventData['ServiceName']
                     } else {
-                        $user = [string]$evt.Properties[0].Value
+                        $user = $eventData['TargetUserName']
                     }
                 } catch { }
                 if (-not $user) { continue }
@@ -1354,9 +1383,12 @@ Function Get-RC4OnlyAccounts {
                     }
                 }
                 $rc4UserHits[$key].Count++
+                if ($evt.TimeCreated -lt $rc4UserHits[$key].FirstSeen) { $rc4UserHits[$key].FirstSeen = $evt.TimeCreated }
             }
         }
     }
+
+    if ($eventCoverage.Count) { $eventCoverage | Export-Csv -LiteralPath (Get-EvidencePath 'kerberos_event_coverage.csv') -NoTypeInformation -Encoding UTF8 }
 
     # A DC whose Security log could not be read is reduced coverage, not evidence: it goes
     # to not_assessed and the evidence file is only written when there are actual hits.
@@ -1376,7 +1408,7 @@ Function Get-RC4OnlyAccounts {
         $authHasContent = $true
         Write-Both "    [!] Detected $($rc4UserHits.Count) distinct RC4 Kerberos exchanges in the last 7 days - see rc4_authentication_events.txt"
     } else {
-        Write-Both "    [+] No RC4 Kerberos events observed in the last 7 days (or Kerberos auditing not enabled on DCs)"
+        Write-Both "    [+] No RC4 Kerberos events observed in the returned sample. Verify logging, retention and sampling coverage; absence is not proof RC4 is unused."
     }
 
     # Only materialise rc4_authentication_events.txt if we have something to report
@@ -1388,17 +1420,22 @@ Function Get-RC4OnlyAccounts {
 }
 
 function Invoke-AccountsCheck {
-    Invoke-AuditStep -Name 'Get-InactiveAccounts' -Switch 'accounts' -Body { Get-InactiveAccounts }
-    Invoke-AuditStep -Name 'Get-DisabledAccounts' -Switch 'accounts' -Body { Get-DisabledAccounts }
-    Invoke-AuditStep -Name 'Get-LockedAccounts' -Switch 'accounts' -Body { Get-LockedAccounts }
-    Invoke-AuditStep -Name 'Get-AdminAccountChecks' -Switch 'accounts' -Body { Get-AdminAccountChecks }
-    Invoke-AuditStep -Name 'Get-NULLSessions' -Switch 'accounts' -Body { Get-NULLSessions }
-    Invoke-AuditStep -Name 'Get-PrivilegedGroupAccounts' -Switch 'accounts' -Body { Get-PrivilegedGroupAccounts }
-    Invoke-AuditStep -Name 'Get-DomainAdminScaledRisk' -Switch 'accounts' -Body { Get-DomainAdminScaledRisk }
-    Invoke-AuditStep -Name 'Get-ProtectedUsers' -Switch 'accounts' -Body { Get-ProtectedUsers }
-    Invoke-AuditStep -Name 'Get-DomainAdminsGroupOverlap' -Switch 'accounts' -Body { Get-DomainAdminsGroupOverlap }
-    Invoke-AuditStep -Name 'Get-GMSAStatus' -Switch 'accounts' -Body { Get-GMSAStatus }
-    Invoke-AuditStep -Name 'Get-RC4OnlyAccounts' -Switch 'accounts' -Body { Get-RC4OnlyAccounts }
+    Write-ADAuditProgress -Activity 'Account checks' -Status 'Starting collection' -PercentComplete -1
+    try {
+        Invoke-AuditStep -Name 'Get-InactiveAccounts' -Switch 'accounts' -Body { Get-InactiveAccounts }
+        Invoke-AuditStep -Name 'Get-DisabledAccounts' -Switch 'accounts' -Body { Get-DisabledAccounts }
+        Invoke-AuditStep -Name 'Get-LockedAccounts' -Switch 'accounts' -Body { Get-LockedAccounts }
+        Invoke-AuditStep -Name 'Get-AdminAccountChecks' -Switch 'accounts' -Body { Get-AdminAccountChecks }
+        Invoke-AuditStep -Name 'Get-NULLSessions' -Switch 'accounts' -Body { Get-NULLSessions }
+        Invoke-AuditStep -Name 'Get-PrivilegedGroupAccounts' -Switch 'accounts' -Body { Get-PrivilegedGroupAccounts }
+        Invoke-AuditStep -Name 'Get-DomainAdminScaledRisk' -Switch 'accounts' -Body { Get-DomainAdminScaledRisk }
+        Invoke-AuditStep -Name 'Get-ProtectedUsers' -Switch 'accounts' -Body { Get-ProtectedUsers }
+        Invoke-AuditStep -Name 'Get-DomainAdminsGroupOverlap' -Switch 'accounts' -Body { Get-DomainAdminsGroupOverlap }
+        Invoke-AuditStep -Name 'Get-GMSAStatus' -Switch 'accounts' -Body { Get-GMSAStatus }
+        Invoke-AuditStep -Name 'Get-RC4OnlyAccounts' -Switch 'accounts' -Body { Get-RC4OnlyAccounts }
+    } finally {
+        Write-ADAuditProgress -Activity 'Account checks' -Completed
+    }
 }
 
 # ---- Standalone launch --------------------------------------------------------------------

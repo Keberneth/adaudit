@@ -51,6 +51,8 @@ $ErrorActionPreference = 'Stop'
 # not duplicated across the two Password Audit scripts. Imported via $PSScriptRoot so it resolves
 # regardless of the current working directory.
 Import-Module (Join-Path $PSScriptRoot 'PasswordAuditCommon.psm1') -Force
+$runTimer = [diagnostics.stopwatch]::StartNew()
+Write-PasswordAuditStage 'Pwned password audit started. Loading Active Directory and DSInternals modules.'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($scriptDir)) {
@@ -67,9 +69,11 @@ Import-Module ActiveDirectory -ErrorAction Stop
 Import-Module DSInternals -ErrorAction Stop
 
 if ([string]::IsNullOrWhiteSpace($Server)) {
+    Write-PasswordAuditStage 'Discovering a domain controller.'
     $Server = Resolve-DefaultServer
 }
 
+Write-PasswordAuditStage 'Reading the domain naming context.'
 $domain = Get-ADDomain -Server $Server -ErrorAction Stop
 $domainDN = $domain.DistinguishedName
 
@@ -79,20 +83,34 @@ Write-Host ("Include computer accounts: {0}" -f $(if ($IncludeComputers) { 'YES'
 $replAccounts = @(Get-ReplicatedAccountHashes -Server $Server -NamingContext $domainDN)
 
 $accountRows = New-Object System.Collections.Generic.List[object]
+$missingHashRows = New-Object System.Collections.Generic.List[object]
+$excludedCount = 0
+$missingNameCount = 0
+$preparedCount = 0
+Write-PasswordAuditStage 'Preparing account scope and password-material availability from replicated records.'
 
 foreach ($ra in $replAccounts) {
+    $preparedCount++
+    if ($preparedCount % 250 -eq 0) { Write-Progress -Id 43 -Activity 'Password audit: preparing accounts' -Status "$preparedCount/$($replAccounts.Count) records" -PercentComplete ([int](100*$preparedCount/$replAccounts.Count)) }
     $sam = [string]$ra.SamAccountName
 
     if ([string]::IsNullOrWhiteSpace($sam)) {
+        $missingNameCount++
         continue
     }
 
     if (-not $IncludeComputers -and $sam -match '\$$') {
+        $excludedCount++
         continue
     }
 
     $ntlmHash = Convert-BytesToHex -Bytes $ra.NTHash
     if ([string]::IsNullOrWhiteSpace($ntlmHash)) {
+        $missingHashRows.Add([pscustomobject][ordered]@{
+            SamAccountName=$sam; AccountType=Get-AccountTypeLabel -AccountName $sam; SourceServer=[string]$Server
+            AccountStatus=Get-AccountStatusFromReplObject -ReplAccount $ra; Pwned='NotAssessed'; PwnedCount=''
+            Comment='No NT password material available; not checked against HIBP. This does not establish an empty password or a safe account.'
+        })
         continue
     }
 
@@ -107,7 +125,14 @@ foreach ($ra in $replAccounts) {
         AccountStatus  = Get-AccountStatusFromReplObject -ReplAccount $ra
     })
 }
+Write-Progress -Id 43 -Activity 'Password audit: preparing accounts' -Completed
+Write-PasswordAuditStage ("Account preparation completed: {0} eligible; {1} without NT material; {2} excluded by scope." -f $accountRows.Count,$missingHashRows.Count,$excludedCount)
 
+$stateCounts = @{
+    EnabledProcessedCount = @($accountRows | Where-Object AccountStatus -eq 'Active').Count
+    DisabledProcessedCount = @($accountRows | Where-Object AccountStatus -eq 'Disabled').Count
+    UnknownProcessedCount = @($accountRows | Where-Object AccountStatus -eq 'Unknown').Count
+}
 if ($accountRows.Count -eq 0) {
     $emptyResult = @(
         [pscustomobject]([ordered]@{
@@ -121,8 +146,12 @@ if ($accountRows.Count -eq 0) {
         })
     )
 
+    if ($missingHashRows.Count) { $emptyResult = @($missingHashRows.ToArray()) }
+    Write-PasswordAuditStage 'Writing account evidence, coverage summary and offline HTML report.'
     $emptyResult | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+    Export-PasswordAuditSummary -OutCsv $OutCsv -Mode Pwned -Server $Server -ReturnedCount $replAccounts.Count -ProcessedCount 0 -ExcludedCount $excludedCount -MissingNameCount $missingNameCount -MissingHashCount $missingHashRows.Count -HibpRequested -Results $emptyResult @stateCounts
     Write-Host ("CSV written to: {0}" -f $OutCsv)
+    Write-PasswordAuditStage ("Pwned password audit finished in {0:n1}s. No accounts could be checked; see coverage explanation." -f $runTimer.Elapsed.TotalSeconds)
     return
 }
 
@@ -139,82 +168,32 @@ Write-Host ("Checking {0} unique NTLM hash(es) against HIBP..." -f $uniqueHashes
 $pwnedCache = Get-PwnedResultsForHashes -Hashes $uniqueHashes -UserAgent 'Invoke-PwnedPasswordCheck.ps1'
 
 $results = New-Object System.Collections.Generic.List[object]
-$failedResults = New-Object System.Collections.Generic.List[object]
-
+$failedAccountCount = 0
+$pwnedAccountCount = 0
 foreach ($row in $accountRows) {
     $lookup = $pwnedCache[$row.NTHash]
-
-    if ($null -eq $lookup) {
-        # Defensive: hash was not in the cache (should not happen). Treat as a failed lookup
-        # rather than silently dropping the account.
-        $lookup = [pscustomobject]@{ Pwned = 'LookupFailed'; PwnedCount = $null }
-    }
-
-    if ($lookup.Pwned -eq 'Yes') {
-        $results.Add([pscustomobject]([ordered]@{
-            SamAccountName = $row.SamAccountName
-            AccountType    = $row.AccountType
-            SourceServer   = $row.SourceServer
-            AccountStatus  = $row.AccountStatus
-            Pwned          = $lookup.Pwned
-            PwnedCount     = $lookup.PwnedCount
-            Comment        = 'NTLM hash found in Have I Been Pwned Pwned Passwords corpus.'
-        }))
-    }
-    elseif ($lookup.Pwned -eq 'LookupFailed') {
-        # FIX: failed lookups are no longer silently dropped. They are reported as their own
-        # rows so a rate-limited / errored run is not mistaken for a clean one.
-        $failedResults.Add([pscustomobject]([ordered]@{
-            SamAccountName = $row.SamAccountName
-            AccountType    = $row.AccountType
-            SourceServer   = $row.SourceServer
-            AccountStatus  = $row.AccountStatus
-            Pwned          = 'LookupFailed'
-            PwnedCount     = ''
-            Comment        = 'HIBP lookup failed for this account (possible rate limiting / network error) - status UNKNOWN.'
-        }))
-    }
+    if ($null -eq $lookup) { $lookup = [pscustomobject]@{ Pwned='LookupFailed'; PwnedCount=$null } }
+    if ($lookup.Pwned -eq 'No') { continue }
+    if ($lookup.Pwned -eq 'LookupFailed') { $failedAccountCount++ }
+    if ($lookup.Pwned -eq 'Yes') { $pwnedAccountCount++ }
+    $results.Add([pscustomobject][ordered]@{
+        SamAccountName=$row.SamAccountName; AccountType=$row.AccountType; SourceServer=$row.SourceServer
+        AccountStatus=$row.AccountStatus; Pwned=$lookup.Pwned; PwnedCount=$lookup.PwnedCount
+        Comment=$(if ($lookup.Pwned -eq 'Yes') { 'Password found in the HIBP corpus; not proof this customer account was breached.' } else { 'HIBP lookup failed; password exposure remains unknown. Re-run to complete coverage.' })
+    })
 }
-
-# Distinct account count behind the failed lookups (for the summary warning).
-$failedAccountCount = $failedResults.Count
-
-if ($results.Count -eq 0 -and $failedResults.Count -eq 0) {
-    $noPwnedResult = @(
-        [pscustomobject]([ordered]@{
-            SamAccountName = ''
-            AccountType    = if ($IncludeComputers) { 'UserAndComputerScope' } else { 'UserScope' }
-            SourceServer   = [string]$Server
-            AccountStatus  = ''
-            Pwned          = 'No'
-            PwnedCount     = 0
-            Comment        = 'No processed accounts were found in the Have I Been Pwned password corpus.'
-        })
-    )
-
-    $noPwnedResult | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+foreach ($row in $missingHashRows) { $results.Add($row) }
+if ($results.Count -eq 0) {
+    $results.Add([pscustomobject][ordered]@{
+        SamAccountName=''; AccountType=$(if ($IncludeComputers) { 'UserAndComputerScope' } else { 'UserScope' })
+        SourceServer=[string]$Server; AccountStatus=''; Pwned='No'; PwnedCount=0
+        Comment='No matches among successfully checked accounts. A negative corpus lookup does not prove password strength; see coverage summary.'
+    })
 }
-else {
-    $allRows = New-Object System.Collections.Generic.List[object]
-    foreach ($r in $results)       { $allRows.Add($r) }
-    foreach ($r in $failedResults) { $allRows.Add($r) }
-
-    $sortedResults = @(
-        $allRows |
-            Sort-Object -Property Pwned, AccountType, SamAccountName
-    )
-
-    $sortedResults | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
-}
-
-Write-Host ("Processed accounts: {0}" -f $accountRows.Count)
-if ($results.Count -eq 0 -and $failedAccountCount -eq 0) {
-    Write-Host "Pwned accounts exported: 0 (all lookups succeeded - none found in HIBP)."
-}
-else {
-    Write-Host ("Pwned accounts exported: {0}" -f $results.Count)
-}
-if ($failedAccountCount -gt 0) {
-    Write-Warning ("{0} account(s) could NOT be checked (lookup failed - possible rate limiting or network error). Their pwned status is UNKNOWN; re-run to complete the check." -f $failedAccountCount)
-}
+$exportRows = @($results | Sort-Object Pwned,AccountStatus,AccountType,SamAccountName)
+Write-PasswordAuditStage 'Writing account evidence, coverage summary and offline HTML report.'
+$exportRows | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath $OutCsv
+Export-PasswordAuditSummary -OutCsv $OutCsv -Mode Pwned -Server $Server -ReturnedCount $replAccounts.Count -ProcessedCount $accountRows.Count -ExcludedCount $excludedCount -MissingNameCount $missingNameCount -MissingHashCount $missingHashRows.Count -LookupFailedCount $failedAccountCount -HibpCheckedCount ($accountRows.Count - $failedAccountCount) -HibpRequested -Results $exportRows @stateCounts
+Write-Host ("Processed accounts: {0}; pwned matches: {1}; failed lookups: {2}; missing NT material: {3}" -f $accountRows.Count,$pwnedAccountCount,$failedAccountCount,$missingHashRows.Count)
 Write-Host ("CSV written to: {0}" -f $OutCsv)
+Write-PasswordAuditStage ("Pwned password audit finished in {0:n1}s." -f $runTimer.Elapsed.TotalSeconds)

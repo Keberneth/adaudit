@@ -135,7 +135,7 @@
 
     .NOTES
         Author : Keberneth (AdAudit-PS7 companion)
-        Version: 1.0 - 08/10/2026
+        Version: 1.1 - 25/10/2026
         Requires PowerShell 7 and the ActiveDirectory module. Read-only - never modifies AD.
 
         Rule ids (LM01-LM23) are documented in the 'Rules & guidance' tab of the HTML map and
@@ -179,11 +179,36 @@ $ErrorActionPreference = 'Stop'
 $script:LmIntegrated   = [bool](Get-Command -Name 'Register-ADAuditNotAssessed' -ErrorAction SilentlyContinue) -and
                          [bool](Get-Command -Name 'Write-Both' -ErrorAction SilentlyContinue)
 $script:LmNotAssessed  = New-Object System.Collections.Generic.List[object]
-$script:LmVersion      = '1.0'
+$script:LmVersion      = '1.1'
 
 function Write-LmLog {
     param([string]$Message)
     if (Get-Command -Name 'Write-Both' -ErrorAction SilentlyContinue) { Write-Both $Message } else { Write-Host $Message }
+}
+
+# The standalone check uses its own progress ID; integrated runs use the shared
+# throttled child progress and leave the overall check counter on ID 0 intact.
+$script:LmHasSharedProgress = [bool](Get-Command -Name 'Write-ADAuditProgress' -ErrorAction SilentlyContinue)
+$script:LmProgressUi = [datetime]::MinValue
+$script:LmProgressLog = [datetime]::MinValue
+$script:LmProgressActivity = ''
+function Write-LmProgress {
+    param([string]$Activity, [string]$Status = 'Working', [double]$PercentComplete = -1, [switch]$Completed)
+    if ($script:LmHasSharedProgress) {
+        Write-ADAuditProgress -Activity $Activity -Status $Status -PercentComplete $PercentComplete -Completed:$Completed
+        return
+    }
+    $now = [datetime]::UtcNow
+    $changed = $Activity -ne $script:LmProgressActivity
+    if ($Completed -or $changed -or ($now - $script:LmProgressUi).TotalMilliseconds -ge 250) {
+        Write-Progress -Id 1 -Activity $Activity -Status $Status -PercentComplete ([int]$PercentComplete) -Completed:$Completed
+        $script:LmProgressUi = $now
+    }
+    if ($Completed -or $changed -or ($now - $script:LmProgressLog).TotalSeconds -ge 10) {
+        Write-LmLog "    [*] $Activity - $Status$(if ($Completed) { ' (phase finished)' })"
+        $script:LmProgressLog = $now
+    }
+    $script:LmProgressActivity = if ($Completed) { '' } else { $Activity }
 }
 
 function Register-LmNotAssessed {
@@ -301,14 +326,14 @@ function Get-LmWellKnownCatalog {
 # as the 'Rules & guidance' tab; the TXT evidence carries the same text.
 function Get-LmRuleCatalog {
     return [ordered]@{
-        'LM01' = @{ Title='Nesting path into a Tier 0 / privileged built-in group'; Default='Critical'
-                    What='A group that is not itself a well-known or declared Tier 0 group is (directly or through other groups) a member of a Tier 0 / privileged built-in group. Everyone who is or will be put into that group inherits the privilege, and nobody who reviews the privileged group sees them.'
-                    Why='This is the mechanism behind most "we did not know helpdesk was Domain Admin" incidents. Each edge looked reasonable when it was added; the chain is only visible when you follow memberOf transitively. The token of every user in the chain contains the Tier 0 SID exactly as if they were a direct member.'
-                    Fix='Remove the edge that closes the chain (the group nested in the Tier 0 group). If a team really needs a Tier 0 right, give it through a dedicated, named Tier 0 group with direct members and time-bound membership (PAM/PIM), never through a role or resource group that exists for another purpose. Afterwards compare lateral_movement_edges.csv against a baseline on a schedule.' }
-        'LM02' = @{ Title='Account reaches Tier 0 through group nesting'; Default='Critical'
-                    What='A user, computer or service account is effectively Tier 0: its transitive group membership contains a Tier 0 group. Severity depends on how it gets there (visible direct membership vs. hidden chain), whether the account looks like a dedicated admin account, and its hygiene.'
-                    Why='Attackers do not need to compromise a Domain Admin - they need any account whose token contains a Tier 0 SID. "whoami /groups" on a compromised client lists the whole transitive set directly; your access reviews usually show only the direct members.'
-                    Fix='For every listed account decide: is this person supposed to be Tier 0? If yes, give them a dedicated Tier 0 account (-t0 / adm- naming), add it to Protected Users, mark it sensitive, and remove the hidden path. If no, remove the edge in the chain that grants it (see LM01).' }
+        'LM01' = @{ Title='Nesting path into a Tier 0 / privileged group'; Default='High'
+                    What='Directory membership places a group inside a privileged or Tier 0-classified group. The path is an observed fact; whether the delegation is approved requires review. Ordinary nesting is High at most; broad membership into a SID-identified high-impact group can be Critical.'
+                    Why='Reviewing only direct members can miss the accounts included through security-group nesting. A confirmed path into a privileged group should be included in access reviews, even when the nesting is intentional.'
+                    Fix='Confirm the purpose, approved members and actual privileges of the target group. Remove unnecessary paths after checking dependencies; retain and document justified delegation with appropriate Tier 0 identity controls and recurring access reviews.' }
+        'LM02' = @{ Title='Account membership in a Tier 0-classified group'; Default='High'
+                    What='The directory shows a user account in a group classified as Tier 0, directly or through nesting. A path to a SID-identified privileged group confirms membership; a name or tier tag alone does not establish permissions. Ordinary nesting is a membership review, not a Critical vulnerability. Account naming does not establish how an account is used.'
+                    Why='An account nested into a privileged security group has privileged membership even when it is absent from the direct member list. Confirm whether the account should hold that membership; names alone do not establish account purpose or target-system permissions.'
+                    Fix='Review intended account purpose and authorization. Use dedicated identities and suitable authentication protections for approved Tier 0 work; remove unapproved memberships after checking dependencies. Validate names and tier tags against actual privileges before remediation.' }
         'LM03' = @{ Title='Non-user principal inside a Tier 0 / privileged group'; Default='Critical'
                     What='A computer account, gMSA/MSA, foreign security principal (Everyone, Authenticated Users, cross-domain SID), contact or unresolved object is a transitive member of a privileged group where it is not expected.'
                     Why='A computer account in Domain Admins means anyone who is SYSTEM on that machine is Domain Admin. A service account there is Kerberoastable Tier 0. Everyone / Authenticated Users makes the privilege public. Cross-domain principals move the trust boundary to a domain you cannot audit.'
@@ -375,7 +400,7 @@ function Get-LmRuleCatalog {
                     Fix='Clear adminCount, re-enable inheritance on the object and verify its current rights: Set-ADObject <dn> -Clear adminCount; then enable inheritance in the object''s security tab.' }
         'LM19' = @{ Title='Group nesting drift since baseline'; Default='Medium'
                     What='Group-to-group edges that are new or removed compared with the baseline file (-BaselinePath).'
-                    Why='Detecting new nesting edges is the single control that would have caught every chain in this report before it was exploited. A new edge into a Tier 0 group is an incident until proven otherwise.'
+                    Why='A new membership edge may change effective privilege. Review its authorization and target permissions; a change or an administrative-looking name alone does not establish an incident.'
                     Fix='Review each new edge with the person who created it (event 4728/4756 on the DC). Keep lateral_movement_edges.csv of every approved state as the next baseline and alert on differences.' }
         'LM20' = @{ Title='Dormant privileged path (empty group nested into Tier 0)'; Default='Medium'
                     What='A group with no transitive user members is nested into a Tier 0 / privileged group.'
@@ -385,14 +410,14 @@ function Get-LmRuleCatalog {
                     What='An account is a transitive member of a very large number of groups.'
                     Why='Beyond roughly 1,000 SIDs Kerberos tickets exceed MaxTokenSize and logons / group policy fail; it is also a sign that nobody understands what the account can reach.'
                     Fix='Clean up nested memberships; use resource groups per system instead of per permission; set MaxTokenSize only as a stop-gap.' }
-        'LM22' = @{ Title='Group grants administrative access on many systems through nesting'; Default='High'
-                    What='Through its memberOf chain the group is a transitive member of several administrative groups (local Administrators / sysadmin / RDP style resource groups, matched by name). Everyone who is put into this group is an administrator on every one of those systems, whatever the group''s own name suggests. Severity follows the number of administrative groups reached: 10 or more = Critical, 5 or more = High, 2 or more = Medium.'
-                    Why='This is Tier 1 lateral movement in one edge: an account in an innocent-looking role group (a SQL sysadmin group for one server, a support group) is local administrator on dozens of servers because that group sits inside an aggregation group that sits inside every SRV-*-Administrators group. A single compromised member credential gives an attacker the whole server estate.'
-                    Fix='Cut the chain: remove the group from the aggregation group that carries the administrative memberships (the first hop of the path shown), and add only the people who really administer those servers to a dedicated server-admin role group. Keep per-system admin groups flat (role group -> SRV-x-Administrators) and never nest a resource-style group into another one.' }
-        'LM23' = @{ Title='Account is administrator on many systems'; Default='Medium'
-                    What='An account whose transitive group membership contains several administrative groups (see LM22). The account can log on with administrative rights to every one of those systems.'
-                    Why='The more systems one credential administers, the more places it can be stolen from and the bigger the blast radius when it is. A daily-use account (not a dedicated admin account) with admin on many servers combines browsing/mail exposure with server-wide impact.'
-                    Fix='Give the person a dedicated admin account (-adm / -t1 naming) for server administration and remove the administrative memberships from the daily-use account. Scope admin groups per system or per application tier instead of one group for everything.' }
+        'LM22' = @{ Title='Group reaches multiple potentially administrative groups'; Default='Medium'
+                    What='Directory membership reaches multiple groups whose names match the configured administrative pattern. These are group counts, not verified system counts. Names containing admin, SQL, backup or RDP do not establish local administrator, database administrator or logon rights. Populated paths are Medium review findings; empty paths are Low.'
+                    Why='If the target groups hold administrative permissions, shared membership can increase the impact of one compromised account. Confirm those assignments on the affected systems before deciding the exposure or remediation priority.'
+                    Fix='Verify each group against actual local group membership, user rights, application roles and ACLs. Document intended aggregation; remove only unnecessary membership edges after reviewing service dependencies and approved access.' }
+        'LM23' = @{ Title='Account reaches multiple potentially administrative groups'; Default='Medium'
+                    What='An enabled account reaches multiple groups matched by administrative-name patterns. Membership is observed; the number of systems and effective host or application permissions are unverified. Naming patterns also do not establish whether the account is used for daily work.'
+                    Why='If these groups grant administrative permissions, shared account membership can increase compromise impact. Confirm actual resource assignments and account use before treating the group count as administrative exposure.'
+                    Fix='Verify each group against host and application permissions, confirm the intended account purpose, then remove unnecessary memberships and use dedicated administration identities where appropriate.' }
     }
 }
 
@@ -583,7 +608,8 @@ function Get-LmDirectoryData {
     )
 
     $ad = @{}
-    if ($Server) { $ad['Server'] = $Server }
+    if ($script:ADAuditIsolatedClone) { $ad['Server'] = $env:COMPUTERNAME }
+    elseif ($Server) { $ad['Server'] = $Server }
 
     $domain = Get-ADDomain @ad
     $domainSid = [string]$domain.DomainSID.Value
@@ -597,9 +623,13 @@ function Get-LmDirectoryData {
         $forest  = Get-ADForest @ad
         $rootDns = [string]$forest.RootDomain
         if ($rootDns -and ($rootDns -ne $domainDns)) {
-            $rootSid = [string](Get-ADDomain -Identity $rootDns -ErrorAction Stop).DomainSID.Value
+            if ($script:ADAuditIsolatedClone) {
+                Register-LmNotAssessed -Reason 'Isolated clone mode: the other forest-root domain was not contacted; forest-root privileged-group SID classification is unverified.' -Target $rootDns
+            } else {
+                $rootSid = [string](Get-ADDomain -Identity $rootDns -ErrorAction Stop).DomainSID.Value
+            }
         }
-        $gcServer = "$($rootDns):3268"
+        if (-not $script:ADAuditIsolatedClone) { $gcServer = "$($rootDns):3268" }
     } catch {
         Register-LmNotAssessed -Reason "Forest root domain could not be queried ($($_.Exception.Message)); forest-level groups (Enterprise Admins, Schema Admins, Enterprise Key Admins) are matched against the current domain SID only." -Target $domainDns
     }
@@ -619,6 +649,9 @@ function Get-LmDirectoryData {
         Coverage = New-Object System.Collections.Generic.List[string]
     }
     $nodes = $data.Nodes
+    if ($script:ADAuditIsolatedClone) {
+        $data.Coverage.Add('Isolated clone scope: directory queries use this clone. Foreign SID translation and other-domain/global-catalog member resolution are skipped; unresolved nodes and their known membership edges are retained.')
+    }
 
     $t0re = $TierTagPattern.Replace('{0}', '0')
     $t1re = $TierTagPattern.Replace('{0}', '1')
@@ -678,6 +711,7 @@ function Get-LmDirectoryData {
         $Node.Temporary = [bool]("$($Node.Sam) $($Node.Name) $($Node.Description)" -match $TemporaryGroupPattern)
     }
 
+    Write-LmProgress -Activity 'Lateral movement: groups' -Status 'Querying groups and membership attributes' -PercentComplete -1
     # ---- Groups (always domain-wide)
     Write-LmLog "    [*] Loading groups from $domainDns ..."
     $groupProps = @('sAMAccountName','name','objectSid','groupType','member','description','info','whenCreated','whenChanged','managedBy','adminCount','isCriticalSystemObject','mail')
@@ -703,6 +737,7 @@ function Get-LmDirectoryData {
             Set-LmGroupClassification -Node $n
             Add-LmNodeToData -Node $n | Out-Null
             $data.GroupIds.Add($n.Id)
+            Write-LmProgress -Activity 'Lateral movement: groups' -Status "$($data.GroupIds.Count) groups loaded; directory query in progress" -PercentComplete -1
             $rawMembers[$n.Id] = @($g.member)
         }
     } catch {
@@ -711,6 +746,7 @@ function Get-LmDirectoryData {
     $data.Stats.Groups = $data.GroupIds.Count
     Write-LmLog "    [*] Groups loaded: $($data.Stats.Groups)"
 
+    Write-LmProgress -Activity 'Lateral movement: principals' -Status 'Querying users, computers and service accounts' -PercentComplete -1
     # ---- Users, computers, managed service accounts
     $principalBase = if ($SearchBase) { $SearchBase } else { $domainDn }
     Write-LmLog "    [*] Loading users, computers and service accounts from $principalBase ..."
@@ -754,6 +790,7 @@ function Get-LmDirectoryData {
             elseif ($n.Sam -match $t2re) { $n.DeclTier = 2; $n.DeclTierSource = 'name tag' }
             Add-LmNodeToData -Node $n | Out-Null
             $data.PrincipalIds.Add($n.Id)
+            Write-LmProgress -Activity 'Lateral movement: principals' -Status "$($data.PrincipalIds.Count) principals loaded; directory query in progress" -PercentComplete -1
             switch ($type) {
                 'user'     { $data.Stats.Users++; if ($n.Enabled) { $data.Stats.EnabledUsers++ } }
                 'computer' { $data.Stats.Computers++ }
@@ -786,10 +823,16 @@ function Get-LmDirectoryData {
                 $n.WellKnown = $wk.Name; $n.WkKey = 'SID'; $n.AdminNamed = $true
             } elseif ($sid -match '^S-1-5-21-') {
                 $n.Name = $sid
-                try {
-                    $nt = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value
-                    if ($nt) { $n.Name = $nt; $n.Sam = $nt }
-                } catch { $n.Sam = $sid }
+                if ($script:ADAuditIsolatedClone) {
+                    $n.Sam = $sid
+                    $data.Stats.Unresolved++
+                    Register-LmNotAssessed -Reason 'Isolated clone mode: foreign SID name translation was skipped; the SID and membership edge remain in the graph.' -Target $sid
+                } else {
+                    try {
+                        $nt = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value
+                        if ($nt) { $n.Name = $nt; $n.Sam = $nt }
+                    } catch { $n.Sam = $sid }
+                }
                 $n.Domain = 'trusted domain'
                 $n.AdminNamed = $true
             } else {
@@ -801,8 +844,12 @@ function Get-LmDirectoryData {
             $suffix = Get-LmDnDomainSuffix $MemberDn
             $isLocal = ($suffix -ieq $domainDns) -or ($MemberDn.EndsWith($domainDn, [System.StringComparison]::OrdinalIgnoreCase))
             $obj = $null
-            if ($data.Stats.Lookups -lt $lookupCap) {
+            $cloneSkipped = $script:ADAuditIsolatedClone -and -not $isLocal
+            if ($cloneSkipped) {
+                Register-LmNotAssessed -Reason 'Isolated clone mode: cross-domain member lookup was skipped; the unresolved node and membership edge remain in the graph.' -Target $MemberDn
+            } elseif ($data.Stats.Lookups -lt $lookupCap) {
                 $data.Stats.Lookups++
+                Write-LmProgress -Activity 'Lateral movement: membership graph' -Status "$membershipIndex/$($membershipGroupIds.Count) groups started; resolving unloaded member $($data.Stats.Lookups) (cap $lookupCap)" -PercentComplete -1
                 try {
                     if ($isLocal) {
                         $obj = Get-ADObject -Identity $MemberDn -Properties objectClass,objectCategory,sAMAccountName,objectSid,userAccountControl,primaryGroupID,groupType,servicePrincipalName,adminCount,description,displayName,name -ErrorAction Stop @ad
@@ -843,7 +890,7 @@ function Get-LmDirectoryData {
             } else {
                 $n = New-LmNode -Id 0 -Dn $MemberDn -Type $(if ($isLocal) { 'unknown' } else { 'external' })
                 $n.Sam = $n.Name; $n.External = -not $isLocal; $n.AdminNamed = $true
-                if ($isLocal) { $data.Stats.Unresolved++ } else { $data.Stats.External++ }
+                if ($isLocal) { $data.Stats.Unresolved++ } else { $data.Stats.External++; if ($cloneSkipped) { $data.Stats.Unresolved++ } }
             }
         }
         Add-LmNodeToData -Node $n | Out-Null
@@ -853,7 +900,11 @@ function Get-LmDirectoryData {
     }
 
     Write-LmLog "    [*] Building membership graph ..."
-    foreach ($gid in @($data.GroupIds)) {
+    $membershipGroupIds = @($data.GroupIds)
+    $membershipIndex = 0
+    foreach ($gid in $membershipGroupIds) {
+        Write-LmProgress -Activity 'Lateral movement: membership graph' -Status "$membershipIndex/$($membershipGroupIds.Count) groups processed; $($data.Stats.Lookups) individual member lookups" -PercentComplete ($membershipIndex / [math]::Max(1,$membershipGroupIds.Count) * 100)
+        $membershipIndex++
         $members = $null
         if (-not $rawMembers.TryGetValue($gid, [ref]$members)) { continue }
         $gnode = $nodes[$gid]
@@ -878,6 +929,7 @@ function Get-LmDirectoryData {
     $rawMembers.Clear()
     $data.Stats.Edges = $data.Edges.Count
 
+    Write-LmProgress -Activity 'Lateral movement: primary groups' -Status 'Adding primaryGroupID membership edges' -PercentComplete -1
     # Primary group membership is not in 'member' - add it as its own edge kind.
     foreach ($prId in @($data.PrincipalIds)) {
         $p = $nodes[$prId]
@@ -935,7 +987,10 @@ function Invoke-LmGraphAnalysis {
     Write-LmLog "    [*] Computing transitive membership (memberOf closure) for $($groupIds.Count) groups ..."
     $upClosure = New-Object 'System.Collections.Generic.Dictionary[int,System.Collections.Generic.HashSet[int]]'
     $queue = New-Object System.Collections.Generic.Queue[int]
+    $closureIndex = 0
     foreach ($gid in $groupIds) {
+        Write-LmProgress -Activity 'Lateral movement: transitive group membership' -Status "$closureIndex/$($groupIds.Count) groups processed" -PercentComplete ($closureIndex / [math]::Max(1,$groupIds.Count) * 100)
+        $closureIndex++
         $set = New-Object System.Collections.Generic.HashSet[int]
         $queue.Clear()
         $queue.Enqueue($gid)
@@ -962,6 +1017,7 @@ function Invoke-LmGraphAnalysis {
     }
     $Data.UpClosure = $upClosure
 
+    Write-LmProgress -Activity 'Lateral movement: group privilege paths' -Status 'Identifying cycles, privileged targets and effective tiers' -PercentComplete -1
     # ---- Cycles: group cycle ids
     $cycleId = 0
     foreach ($gid in $groupIds) {
@@ -1074,6 +1130,7 @@ function Invoke-LmGraphAnalysis {
         foreach ($c in $cl) { if ($nodes[$c].Type -eq 'group') { $groupChildEdges.Add(@($gid, $c)) } }
     }
     for ($iter = 0; $iter -lt $MaxDepth; $iter++) {
+        Write-LmProgress -Activity 'Lateral movement: nesting depth' -Status "Relaxation pass $($iter + 1) of at most $MaxDepth; $($groupChildEdges.Count) group edges" -PercentComplete -1
         $changed = $false
         foreach ($e in $groupChildEdges) {
             $p = $nodes[$e[0]]; $c = $nodes[$e[1]]
@@ -1088,7 +1145,10 @@ function Invoke-LmGraphAnalysis {
     $protectedUsersId = -1
     foreach ($gid in $groupIds) { if ($nodes[$gid].WkKey -eq 'PU') { $protectedUsersId = $gid; break } }
     $userSet = New-Object System.Collections.Generic.HashSet[int]
+    $principalIndex = 0
     foreach ($prId in $Data.PrincipalIds) {
+        Write-LmProgress -Activity 'Lateral movement: principal privilege paths' -Status "$principalIndex/$($Data.PrincipalIds.Count) principals processed" -PercentComplete ($principalIndex / [math]::Max(1,$Data.PrincipalIds.Count) * 100)
+        $principalIndex++
         $p = $nodes[$prId]
         $pl = $null
         if (-not $parents.TryGetValue($prId, [ref]$pl)) { $p.TransGroupsUp = 0; continue }
@@ -1154,6 +1214,7 @@ function Invoke-LmGraphAnalysis {
         }
     }
 
+    Write-LmProgress -Activity 'Lateral movement: broad groups' -Status 'Classifying group reach' -PercentComplete -1
     # ---- Broad groups (everyone-style)
     $enabledUsers = [int]$Data.Stats.EnabledUsers
     $threshold = [math]::Ceiling($enabledUsers * $BroadGroupPercent / 100.0)
@@ -1238,6 +1299,23 @@ function Get-LmGroupLabel {
     return "$($Node.Name) ($scope $kind group, $($Node.DirectUsers) direct users, $($Node.DirectGroups) nested groups, $($Node.TransUsers) transitive users$extra)"
 }
 
+function Test-LmKnownTier0Path {
+    # Only SID-classified, high-impact built-in/domain groups establish this basis.
+    # Names and operator tier tags identify review scope, not observed host rights.
+    param($Node, $Nodes, $Catalog)
+    if ($null -eq $Node) { return $false }
+    $candidates = @($Node)
+    foreach ($id in (@($Node.T0Targets) + @($Node.PrivTargets))) {
+        if ($null -ne $id -and $id -ge 0 -and $id -lt $Nodes.Count) { $candidates += $Nodes[$id] }
+    }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate.WellKnown -or -not $Catalog.ContainsKey($candidate.WkKey)) { continue }
+        $entry = $Catalog[$candidate.WkKey]
+        if ($entry.Where -ne 'Name' -and $entry.Tier -eq 0 -and $entry.Severity -eq 'Critical') { return $true }
+    }
+    return $false
+}
+
 function Invoke-LmFindings {
     [CmdletBinding()]
     param(
@@ -1272,6 +1350,9 @@ function Invoke-LmFindings {
         if ($c.WellKnown -or $c.DeclTier -eq 0) { continue }   # default / designed Tier 0 nesting
         if (Test-LmApproved -P $p -C $c) { continue }
         $sev = if ($p.WellKnown -and $catalog.ContainsKey($p.WkKey)) { $catalog[$p.WkKey].Severity } else { 'High' }
+        if ($sev -eq 'Critical') { $sev = 'High' } # Nesting itself is a membership review, not a demonstrated exploit.
+        if ($p.DeclTierSource -eq 'name tag' -and -not (Test-LmKnownTier0Path $p $nodes $catalog)) { $sev = 'Medium' }
+        if ($c.Broad -and (Test-LmKnownTier0Path $p $nodes $catalog)) { $sev = 'Critical' }
         $what = if ($p.WellKnown) { "well-known $(if ($p.WkTier -eq 0) { 'Tier 0' } else { 'privileged' }) group '$($p.Name)'" } else { "declared Tier 0 group '$($p.Name)' ($($p.DeclTierSource))" }
         if ($c.TransUsers -eq 0 -and $c.TransComputers -eq 0) {
             Add-LmFinding -Data $Data -RuleId 'LM20' -Severity 'Medium' -Subject $c -Target $p -Kind 'edge' -EdgeP $p.Id -EdgeC $c.Id `
@@ -1299,9 +1380,12 @@ function Invoke-LmFindings {
             $cur = $nx; $guard++
         }
         if ($closingChild -and (Test-LmApproved -P $closingParent -C $closingChild)) { continue }
-        $sev = 'Critical'
+        $sev = 'High'
         if ($closingParent -and $closingParent.WellKnown -and $catalog.ContainsKey($closingParent.WkKey)) { $sev = $catalog[$closingParent.WkKey].Severity }
         elseif ($closingParent -and -not $closingParent.WellKnown) { $sev = 'High' }
+        if ($sev -eq 'Critical') { $sev = 'High' }
+        if (-not (Test-LmKnownTier0Path $g $nodes $catalog) -and $closingParent.DeclTierSource -eq 'name tag') { $sev = 'Medium' }
+        if ($g.Broad -and (Test-LmKnownTier0Path $g $nodes $catalog)) { $sev = 'Critical' }
         if ($g.TransUsers -eq 0 -and $g.TransComputers -eq 0) { $sev = 'Medium' }
         $edgeTxt = if ($closingChild) { " The edge that closes the chain is '$($closingChild.Name)' -> '$($closingParent.Name)'." } else { '' }
         Add-LmFinding -Data $Data -RuleId 'LM01' -Severity $sev -Subject $g -Target $closingParent -Kind 'inherited' `
@@ -1329,11 +1413,13 @@ function Invoke-LmFindings {
         $sev = 'Low'
         $how = ''
         if ($u.IsRid500) { $sev = 'Information'; $how = 'built-in domain Administrator (RID-500); expected direct member of Domain Admins / Administrators' }
-        elseif ($hidden) { $sev = 'Critical'; $how = "reaches Tier 0 through nesting ($($u.T0Hops) hops) - not visible as a direct member of the Tier 0 group" }
-        elseif (-not $u.AdminNamed) { $sev = 'High'; $how = 'direct Tier 0 member, but the account name does not follow a dedicated-admin naming standard (daily-use account?)' }
-        else { $sev = 'Low'; $how = 'direct member of a Tier 0 group through a dedicated admin account (expected - review hygiene in LM15)' }
+        elseif ($hidden) { $sev = 'High'; $how = "is a nested member of a Tier 0-classified group ($($u.T0Hops) hops); review whether this membership is intended" }
+        elseif (-not $u.AdminNamed) { $sev = 'Medium'; $how = 'is a direct Tier 0 group member whose name does not match the configured admin-account pattern; account purpose is unverified' }
+        else { $sev = 'Low'; $how = 'is a direct Tier 0 group member whose name matches the configured admin-account pattern; confirm account purpose and review hygiene in LM15' }
+        $knownTier0 = Test-LmKnownTier0Path $u $nodes $catalog
+        if (-not $knownTier0 -and $script:LmSeverityRank[$sev] -gt 3) { $sev = 'Medium' }
         if (-not $u.Enabled -and $sev -ne 'Information') { $sev = 'Low'; $how = "DISABLED account that still reaches Tier 0 ($how); re-enabling restores the privilege" }
-        $detail = "$($u.Sam) ($($u.Name)) $how. Tier 0 groups reached: $($targets -join ', '). Transitive groups in token: $($u.TransGroupsUp)."
+        $detail = "$($u.Sam) ($($u.Name)) $how. Groups reached: $($targets -join ', '). Transitive security-group memberships: $($u.TransGroupsUp). $(if ($knownTier0) { 'The path includes a SID-identified high-impact privileged group; membership is confirmed, while authorization and actual use require review.' } else { 'Tier classification comes from names or declared scope; effective privileged permissions were not collected.' })"
         Add-LmFinding -Data $Data -RuleId 'LM02' -Severity $sev -Subject $u -Target $(if ($u.NextHopT0 -ge 0) { $nodes[$u.NextHopT0] } else { $null }) -Kind 'principal' `
             -Path $u.T0Path -Detail $detail | Out-Null
     }
@@ -1362,6 +1448,8 @@ function Invoke-LmFindings {
             'contact'  { "Contact object '$($p.Name)' (no SID, grants nothing - but indicates a mistaken membership)"; $sev = 'Low' }
             default    { "Unresolved object '$($p.Name)' (could not be read)"; $sev = 'Low' }
         }
+        if ($sev -eq 'Critical' -and -not (Test-LmKnownTier0Path $p $nodes $catalog)) { $sev = 'High'; $kindTxt += '; effective high-impact permissions are unverified' }
+        if (-not $p.Enabled -and $p.Type -in @('computer','gmsa','msa')) { $sev = 'Low'; $kindTxt += '; account is disabled, so review retained membership before re-enabling' }
         $tnames = @($relevant | ForEach-Object { $_.Name } | Sort-Object -Unique)
         Add-LmFinding -Data $Data -RuleId 'LM03' -Severity $sev -Subject $p -Target $relevant[0] -Kind 'principal' -Path $p.T0Path `
             -Detail "$kindTxt. Privileged groups reached: $($tnames -join ', ')." | Out-Null
@@ -1379,9 +1467,10 @@ function Invoke-LmFindings {
         $gnode = $null
         if ($Data.BySid.TryGetValue("$($Data.DomainSid)-$($p.PrimaryGroupId)", [ref]$gid)) { $gnode = $nodes[$gid]; $gname = $gnode.Name }
         $priv = $gnode -and (($gnode.WkTier -eq 0) -or ($gnode.WkTier -eq 'P') -or ($gnode.EffTier -eq 0))
-        $sev = if ($priv) { 'Critical' } else { 'Low' }
+        $sev = if ($priv -and (Test-LmKnownTier0Path $gnode $nodes $catalog)) { 'Critical' } elseif ($priv) { 'Medium' } else { 'Low' }
+        if (-not $p.Enabled) { $sev = 'Low' }
         Add-LmFinding -Data $Data -RuleId 'LM04' -Severity $sev -Subject $p -Target $gnode -Kind 'principal' -Path "$($p.Sam) -> $gname (primaryGroupID)" `
-            -Detail "$($p.Sam) has primaryGroupID=$($p.PrimaryGroupId) ($gname). The membership is not stored in the group's member attribute and is invisible to Get-ADGroupMember / ADUC member lists.$(if ($priv) { ' The group is privileged - treat as a potential persistence technique.' })" `
+            -Detail "$($p.Sam) has primaryGroupID=$($p.PrimaryGroupId) ($gname). The membership is not stored in the group's member attribute and is invisible to Get-ADGroupMember / ADUC member lists.$(if ($priv -and (Test-LmKnownTier0Path $gnode $nodes $catalog)) { ' The path reaches a SID-identified high-impact group; investigate whether this unusual primary membership is authorized.' } elseif ($priv) { ' Tier classification is inferred or declared; verify actual privileges before assigning an exposure level.' })" `
             -Fix "Add-ADGroupMember -Identity 'Domain Users' -Members '$($p.Sam)'; Set-ADUser -Identity '$($p.Sam)' -Replace @{primaryGroupID=513}; then review the account's remaining memberships and who changed the attribute (event 5136 / 4738)." | Out-Null
     }
 
@@ -1392,13 +1481,12 @@ function Invoke-LmFindings {
             if ($members.Count -eq 0) { continue }
             $sev = 'Medium'
             if ($members | Where-Object { $_.ReachesT0 -or $_.AdminIsh -or $_.WkTier -eq 0 -or $_.WkTier -eq 'P' }) { $sev = 'High' }
-            # A loop that carries administrative memberships is one big admin group: every
-            # member of the smallest group in it is administrator everywhere the loop reaches.
+            # A loop is an observed membership/design issue. Name-matched admin reach
+            # does not establish local administrator rights on any particular system.
             $loopAdm = ($members | ForEach-Object { $_.AdminReach } | Measure-Object -Maximum).Maximum
-            if ($loopAdm -ge 5 -or ($members | Where-Object { $_.ReachesT0 })) { $sev = 'Critical' }
             $names = @($members | ForEach-Object { $_.Name })
             Add-LmFinding -Data $Data -RuleId 'LM05' -Severity $sev -Subject $members[0] -Kind 'cycle' -Path (($names + $names[0]) -join ' -> ') `
-                -Detail "Groups in a membership loop: $($names -join ', '). They are functionally one group; every member of any of them has the union of all their rights$(if ($loopAdm -ge 2) { " - including administrative access on $loopAdm system(s)" })." | Out-Null
+                -Detail "Groups in a membership loop: $($names -join ', '). Their transitive memberships overlap$(if ($loopAdm -ge 2) { " and reach $loopAdm groups matching the configured administrative-name pattern" }). Review the loop and actual permissions assigned to these groups; no host administrator rights were tested." | Out-Null
         }
     }
 
@@ -1415,9 +1503,10 @@ function Invoke-LmFindings {
             if (Test-LmApproved -P $pn -C $b) { continue }
             if (-not $b.WellKnown -and $b.DeclTier -ne 0 -and ($pn.WkTier -eq 0 -or $pn.WkTier -eq 'P' -or $pn.DeclTier -eq 0)) { continue }   # LM01 reports this edge; LM06 adds nothing
             $sev = 'Medium'; $why = 'the parent is a role / aggregation group - everyone now inherits whatever it is nested into'
-            if ($pn.ReachesT0 -or $pn.WkTier -eq 0 -or $pn.WkTier -eq 'P' -or $pn.DeclTier -eq 0) { $sev = 'Critical'; $why = 'the parent reaches a Tier 0 / privileged group - everyone is effectively privileged' }
-            elseif ($pn.AdminIsh) { $sev = 'Critical'; $why = 'the parent grants administrative access by name - everyone in the domain is an administrator there' }
-            elseif ($pn.Scope -eq 'DomainLocal') { $sev = 'High'; $why = 'the parent is a resource group - every account in the domain gets that resource access' }
+            if (Test-LmKnownTier0Path $pn $nodes $catalog) { $sev = 'Critical'; $why = 'the broad membership reaches a SID-identified high-impact privileged group' }
+            elseif ($pn.ReachesT0 -or $pn.WkTier -eq 0 -or $pn.WkTier -eq 'P' -or $pn.DeclTier -eq 0) { $sev = 'High'; $why = 'the parent is classified as privileged; verify its effective permissions and whether this broad membership is approved' }
+            elseif ($pn.AdminIsh) { $sev = 'High'; $why = 'the parent name suggests administrative use; broad membership is confirmed, but target-system permissions are unverified' }
+            elseif ($pn.Scope -eq 'DomainLocal') { $sev = 'Medium'; $why = 'the parent is a domain-local group; verify where it grants access and whether that access should be broad' }
             Add-LmFinding -Data $Data -RuleId 'LM06' -Severity $sev -Subject $b -Target $pn -Kind 'edge' -EdgeP $pn.Id -EdgeC $b.Id -Path "$($b.Name) -> $($pn.Name)" `
                 -Detail "Broad group $($b.Name) ($($b.BroadReason)) is a member of $(Get-LmGroupLabel $pn): $why." `
                 -Fix "Remove-ADGroupMember -Identity '$($pn.Sam)' -Members '$($b.Sam)'. Replace with a maintained role group that lists the people who need '$($pn.Name)', or grant read access inside the application instead." | Out-Null
@@ -1485,7 +1574,7 @@ function Invoke-LmFindings {
             -Detail "$(Get-LmGroupLabel $g) aggregates $($g.DirectGroups) groups ($($nested -join ', '))$(if ($onward.Count) { " and is itself nested onward into $($onward -join ', ')" })$(if ($resourceish) { ' and its name suggests it stands in ACLs' }). It behaves as role and resource at the same time$(if ($g.ReachesT0) { " and reaches Tier 0 ($($g.T0Path))" })." | Out-Null
     }
 
-    # ---- LM22: groups that are administrator on many systems through their memberOf chain
+    # ---- LM22: observed group reach; target permissions are inferred from names only
     $admGroupNames = { param($Node) @($Data.UpClosure[$Node.Id] | ForEach-Object { $nodes[$_] } | Where-Object { $_.AdminIsh -and -not $_.WellKnown } | ForEach-Object { $_.Name } | Sort-Object) }
     foreach ($gid in $Data.GroupIds) {
         $g = $nodes[$gid]
@@ -1493,17 +1582,17 @@ function Invoke-LmFindings {
         if ($g.AdminReach -lt 2) { continue }
         $reached = @(& $admGroupNames $g)
         if ($reached.Count -lt 2) { continue }
-        $sev = if ($reached.Count -ge 10) { 'Critical' } elseif ($reached.Count -ge 5) { 'High' } else { 'Medium' }
+        $sev = 'Medium' # Group-name matches alone cannot establish high-impact host access.
         if ($g.TransUsers -eq 0 -and $g.TransComputers -eq 0) { $sev = 'Low' }   # dormant: nobody holds it yet
         $pl = $null; $firstHop = @()
         if ($parents.TryGetValue($gid, [ref]$pl)) { $firstHop = @($pl | ForEach-Object { $nodes[$_] } | Where-Object { $_.Type -eq 'group' -and $_.Security -and -not $_.WellKnown -and ($_.AdminIsh -or $_.AdminReach -gt 0) } | Sort-Object -Property @{ Expression = 'AdminReach'; Descending = $true } | Select-Object -First 3 | ForEach-Object { $_.Name }) }
         Add-LmFinding -Data $Data -RuleId 'LM22' -Severity $sev -Subject $g -Kind 'group' `
-            -Path "$($g.Name) -> $(if ($firstHop.Count) { ($firstHop -join ' / ') + ' -> ' })$($reached.Count) administrative groups" `
-            -Detail "$(Get-LmGroupLabel $g) is a transitive member of $($reached.Count) administrative group(s): $(($reached | Select-Object -First 15) -join ', ')$(if ($reached.Count -gt 15) { " ... (+$($reached.Count - 15) more)" }). Its $($g.TransUsers) transitive user(s)$(if ($g.TransComputers) { " and $($g.TransComputers) computer(s)" }) are administrators on every one of those systems$(if ($g.InCycle) { ' (the group is part of a membership loop - see LM05)' })." `
-            -Fix "Remove '$($g.Name)' from $(if ($firstHop.Count) { "'$($firstHop[0])'" } else { 'the group that carries the administrative memberships' }) (Remove-ADGroupMember) and grant server administration through a dedicated server-admin role group with reviewed, direct members." | Out-Null
+            -Path "$($g.Name) -> $(if ($firstHop.Count) { ($firstHop -join ' / ') + ' -> ' })$($reached.Count) potentially administrative groups" `
+            -Detail "$(Get-LmGroupLabel $g) is a transitive member of $($reached.Count) groups matched by the configured administrative-name pattern: $(($reached | Select-Object -First 15) -join ', ')$(if ($reached.Count -gt 15) { " ... (+$($reached.Count - 15) more)" }). Its $($g.TransUsers) transitive user(s)$(if ($g.TransComputers) { " and $($g.TransComputers) computer(s)" }) inherit these group memberships$(if ($g.InCycle) { ' (the group is part of a membership loop - see LM05)' }). The number of systems, effective permissions and approved purpose were not verified." `
+            -Fix "Verify the actual permissions of the listed groups and the approved purpose of '$($g.Name)'. If access is unnecessary, remove the relevant membership edge after reviewing dependencies; use dedicated administration roles where required." | Out-Null
     }
 
-    # ---- LM23: accounts that are administrator on many systems
+    # ---- LM23: enabled accounts reaching name-matched administrative groups
     foreach ($prId in $Data.PrincipalIds) {
         $u = $nodes[$prId]
         if ($u.Type -ne 'user' -or $u.ReachesT0 -or $u.AdminReach -lt 5 -or -not $u.Enabled) { continue }   # Tier 0 accounts are LM02/LM14/LM15
@@ -1511,10 +1600,10 @@ function Invoke-LmFindings {
         if ($parents.TryGetValue($prId, [ref]$pl)) { foreach ($g in $pl) { if ($nodes[$g].Type -eq 'group' -and $nodes[$g].Security) { [void]$set.Add($g); $cs = $null; if ($Data.UpClosure.TryGetValue($g, [ref]$cs)) { $set.UnionWith($cs) } } } }
         $reached = @($set | ForEach-Object { $nodes[$_] } | Where-Object { $_.AdminIsh -and -not $_.WellKnown } | ForEach-Object { $_.Name } | Sort-Object)
         if ($reached.Count -lt 5) { continue }
-        $sev = if ($reached.Count -ge 10) { if ($u.AdminNamed) { 'Medium' } else { 'High' } } else { if ($u.AdminNamed) { 'Low' } else { 'Medium' } }
+        $sev = 'Medium' # Account names do not prove daily-use or dedicated-admin behavior.
         $direct = @($pl | ForEach-Object { $nodes[$_] } | Where-Object { $_.Type -eq 'group' -and $_.AdminIsh -and -not $_.WellKnown }).Count
-        Add-LmFinding -Data $Data -RuleId 'LM23' -Severity $sev -Subject $u -Kind 'principal' -Path "$($u.Sam) -> $($reached.Count) administrative groups ($direct direct, $($reached.Count - $direct) through nesting)" `
-            -Detail "$($u.Sam) ($($u.Name)) holds administrative membership on $($reached.Count) system(s)$(if (-not $u.AdminNamed) { ' with an account that does not look like a dedicated admin account' }): $(($reached | Select-Object -First 15) -join ', ')$(if ($reached.Count -gt 15) { " ... (+$($reached.Count - 15) more)" }). $($reached.Count - $direct) of them come through group nesting and are not visible on the account's member-of tab as administrative groups." | Out-Null
+        Add-LmFinding -Data $Data -RuleId 'LM23' -Severity $sev -Subject $u -Kind 'principal' -Path "$($u.Sam) -> $($reached.Count) potentially administrative groups ($direct direct, $($reached.Count - $direct) through nesting)" `
+            -Detail "$($u.Sam) ($($u.Name)) is a member of $($reached.Count) groups matched by the configured administrative-name pattern: $(($reached | Select-Object -First 15) -join ', ')$(if ($reached.Count -gt 15) { " ... (+$($reached.Count - 15) more)" }). $($reached.Count - $direct) of them come through group nesting. These are group counts; effective system permissions, logon rights and account purpose were not verified." | Out-Null
     }
 
     # ---- LM11: temporary / legacy groups still granting access
@@ -1597,8 +1686,8 @@ function Invoke-LmFindings {
         # LM15
         $issues = New-Object System.Collections.Generic.List[string]
         $sevs = New-Object System.Collections.Generic.List[string]
-        if ($u.HasSpn -and -not $u.IsKrbtgt) { $issues.Add("has $($u.Spns) SPN(s) - Kerberoastable Tier 0 credential"); $sevs.Add('Critical') }
-        if (($u.Uac -band 0x400000) -ne 0) { $issues.Add('Kerberos pre-authentication disabled - AS-REP roastable'); $sevs.Add('Critical') }
+        if ($u.Enabled -and $u.HasSpn -and -not $u.IsKrbtgt) { $issues.Add("has $($u.Spns) SPN(s) - service-ticket password exposure; actual crackability is not established"); $sevs.Add($(if (Test-LmKnownTier0Path $u $nodes $catalog) { 'Critical' } else { 'High' })) }
+        if ($u.Enabled -and ($u.Uac -band 0x400000) -ne 0) { $issues.Add('Kerberos pre-authentication disabled - AS-REP roastable'); $sevs.Add('Critical') }
         if ($u.Enabled) {
             if (($u.Uac -band 0x10000) -ne 0) { $issues.Add('password never expires'); $sevs.Add('High') }
             if ($u.PwdLastSet -is [datetime] -and ($now - $u.PwdLastSet).TotalDays -gt $PasswordAgeDays) { $issues.Add("password last set $($u.PwdLastSet.ToString('yyyy-MM-dd')) ($([int]($now - $u.PwdLastSet).TotalDays) days)"); $sevs.Add('Medium') }
@@ -1613,7 +1702,7 @@ function Invoke-LmFindings {
         }
         if ($issues.Count -gt 0) {
             Add-LmFinding -Data $Data -RuleId 'LM15' -Severity (Get-LmMaxSeverity $sevs.ToArray()) -Subject $u -Kind 'principal' -Path $u.T0Path `
-                -Detail "$($u.Sam) ($(if ($u.T0DirectMember) { 'direct' } else { 'nested' }) Tier 0): $($issues -join '; ')." | Out-Null
+                -Detail "$($u.Sam) ($(if ($u.T0DirectMember) { 'direct' } else { 'nested' }) Tier 0-classified membership): $($issues -join '; ')." | Out-Null
         }
     }
 
@@ -1697,7 +1786,8 @@ function Invoke-LmFindings {
                     [void]$curKeys.Add($key)
                     if ($baseKeys.Contains($key)) { continue }
                     $sev = 'Medium'
-                    if ($p.WkTier -eq 0 -or $p.DeclTier -eq 0 -or $p.ReachesT0 -or $p.AdminIsh) { $sev = 'Critical' }
+                    if (Test-LmKnownTier0Path $p $nodes $catalog) { $sev = if ($c.Broad) { 'Critical' } else { 'High' } }
+                    elseif ($p.WkTier -eq 0 -or $p.DeclTier -eq 0 -or $p.ReachesT0) { $sev = 'High' }
                     elseif ($p.WkTier -eq 'P' -or $p.Scope -eq 'DomainLocal') { $sev = 'High' }
                     $added.Add([pscustomobject]@{ Change='Added'; ParentSam=$p.Sam; ChildSam=$c.Sam; Severity=$sev })
                     Add-LmFinding -Data $Data -RuleId 'LM19' -Severity $sev -Subject $c -Target $p -Kind 'edge' -EdgeP $p.Id -EdgeC $c.Id -Path "$($c.Name) -> $($p.Name)" `
@@ -2796,6 +2886,9 @@ function Write-LmHtmlReport {
     [void]$sb.AppendLine('<body>')
     [void]$sb.AppendLine('<div class="container">')
     if ($nav) { [void]$sb.AppendLine($nav) }
+    if (Get-Command -Name 'Get-ADAuditCloneNotice' -ErrorAction SilentlyContinue) {
+        [void]$sb.AppendLine((Get-ADAuditCloneNotice))
+    }
     [void]$sb.AppendLine($script:LmHtmlBody)
     [void]$sb.AppendLine("<div class=""footer"">Generated by AD Audit - Invoke-LateralMovementCheck.ps1 v$($script:LmVersion) &mdash; $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Read-only analysis of group nesting; see lateral_movement.txt and the CSV files next to it for the full evidence.</div>")
     [void]$sb.AppendLine('</div>')
@@ -2824,92 +2917,102 @@ function Invoke-LmMain {
         [int]$HtmlUserLimit, [bool]$NoHtml, [string]$ScriptLine
     )
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $script:LmRules = Get-LmRuleCatalog
-    $script:LmNotAssessed.Clear()
-    Write-LmLog "    [*] Lateral movement analysis (group nesting) v$($script:LmVersion)$(if ($script:LmIntegrated) { ' - integrated with AdAudit-PS7' } else { ' - standalone' })"
+    try {
+        Write-LmProgress -Activity 'Lateral movement: initialization' -Status 'Preparing directory collection' -PercentComplete -1
+        $script:LmRules = Get-LmRuleCatalog
+        $script:LmNotAssessed.Clear()
+        Write-LmLog "    [*] Lateral movement analysis (group nesting) v$($script:LmVersion)$(if ($script:LmIntegrated) { ' - integrated with AdAudit-PS7' } else { ' - standalone' })"
 
-    if (-not (Get-Command -Name 'Get-ADObject' -ErrorAction SilentlyContinue)) {
+        if (-not (Get-Command -Name 'Get-ADObject' -ErrorAction SilentlyContinue)) {
+            try {
+                if (Get-Command -Name 'Import-ADAuditModule' -ErrorAction SilentlyContinue) { Import-ADAuditModule -Name ActiveDirectory -Required | Out-Null }
+                else { Import-Module ActiveDirectory -ErrorAction Stop }
+            } catch {
+                Register-LmNotAssessed -Reason "ActiveDirectory PowerShell module is not available ($($_.Exception.Message)). Install RSAT: Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"
+                Write-LmLog '    [!] Lateral movement check skipped - ActiveDirectory module missing.'
+                return $null
+            }
+        }
+
+        $dirs = Get-LmOutputDirs -OutputRoot $OutputRoot
+        $data = $null
         try {
-            if (Get-Command -Name 'Import-ADAuditModule' -ErrorAction SilentlyContinue) { Import-ADAuditModule -Name ActiveDirectory -Required | Out-Null }
-            else { Import-Module ActiveDirectory -ErrorAction Stop }
+            $data = Get-LmDirectoryData -Server $Server -SearchBase $SearchBase -Catalog (Get-LmWellKnownCatalog) `
+                -Tier0Groups $Tier0Groups -Tier1Groups $Tier1Groups -Tier2Groups $Tier2Groups `
+                -AdminGroupPattern $AdminGroupPattern -AdminAccountPattern $AdminAccountPattern -TierTagPattern $TierTagPattern -TemporaryGroupPattern $TemporaryGroupPattern
         } catch {
-            Register-LmNotAssessed -Reason "ActiveDirectory PowerShell module is not available ($($_.Exception.Message)). Install RSAT: Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"
-            Write-LmLog '    [!] Lateral movement check skipped - ActiveDirectory module missing.'
+            Register-LmNotAssessed -Reason "Directory enumeration failed: $($_.Exception.Message)" -Target $(if ($Server) { $Server } else { 'default DC' })
+            Write-LmLog "    [!] Lateral movement check could not enumerate the directory: $($_.Exception.Message)"
             return $null
         }
-    }
-
-    $dirs = Get-LmOutputDirs -OutputRoot $OutputRoot
-    $data = $null
-    try {
-        $data = Get-LmDirectoryData -Server $Server -SearchBase $SearchBase -Catalog (Get-LmWellKnownCatalog) `
-            -Tier0Groups $Tier0Groups -Tier1Groups $Tier1Groups -Tier2Groups $Tier2Groups `
-            -AdminGroupPattern $AdminGroupPattern -AdminAccountPattern $AdminAccountPattern -TierTagPattern $TierTagPattern -TemporaryGroupPattern $TemporaryGroupPattern
-    } catch {
-        Register-LmNotAssessed -Reason "Directory enumeration failed: $($_.Exception.Message)" -Target $(if ($Server) { $Server } else { 'default DC' })
-        Write-LmLog "    [!] Lateral movement check could not enumerate the directory: $($_.Exception.Message)"
-        return $null
-    }
-    if ($data.GroupIds.Count -eq 0) {
-        Register-LmNotAssessed -Reason 'No groups were returned by the directory query - nothing to analyse.' -Target $data.DomainDns
-        return $null
-    }
-
-    Invoke-LmGraphAnalysis -Data $data -MaxDepth $MaxDepth -BroadGroupPercent $BroadGroupPercent
-    Invoke-LmFindings -Data $data -ApprovedNestings $ApprovedNestings -StaleDays $StaleDays -PasswordAgeDays $PasswordAgeDays -DeepNestingLevels $DeepNestingLevels -BaselinePath $BaselinePath
-    $summary = Get-LmSummary -Data $data
-
-    Write-LmLog "    [*] Writing evidence to $($dirs.Lm) ..."
-    $csv = Write-LmCsvOutputs -Data $data -Dirs $dirs
-    $htmlPath = ''
-    if (-not $NoHtml) {
-        try { $htmlPath = Write-LmHtmlReport -Data $data -Summary $summary -Dirs $dirs -HtmlUserLimit $HtmlUserLimit }
-        catch { Write-LmLog "    [!] HTML map could not be written: $($_.Exception.Message)"; Register-LmNotAssessed -Reason "HTML map not written: $($_.Exception.Message)" }
-    }
-    $txtPath = Write-LmTextReport -Data $data -Summary $summary -Dirs $dirs -HtmlPath $htmlPath -ScriptLine $ScriptLine
-
-    # Nessus export (only when integrated): one item per rule with findings, severity = worst finding
-    $kbByRule = @{}
-    $i = 1
-    foreach ($rid in $script:LmRules.Keys) { $kbByRule[$rid] = 'KB14{0:D2}' -f $i; $i++ }
-    foreach ($rid in $script:LmRules.Keys) {
-        $r = $summary.ByRule[$rid]
-        if ($r.Count -eq 0) { continue }
-        $items = @($data.Findings | Where-Object { $_.RuleId -eq $rid } | Sort-Object -Property @{ Expression = { $script:LmSeverityRank[$_.Severity] }; Descending = $true } | Select-Object -First 60)
-        $text = New-Object System.Text.StringBuilder
-        [void]$text.AppendLine("$rid $($script:LmRules[$rid].Title) - $($r.Count) finding(s), worst severity $($r.Max)")
-        [void]$text.AppendLine($script:LmRules[$rid].Why)
-        [void]$text.AppendLine('')
-        foreach ($f in $items) { [void]$text.AppendLine("[$($f.Severity)] $($f.Subject): $($f.Detail)") }
-        if ($r.Count -gt 60) { [void]$text.AppendLine("... $($r.Count - 60) more in lateral_movement_findings.csv") }
-        Write-LmNessusFinding -Name "LateralMovement_$rid" -Kb $kbByRule[$rid] -Text $text.ToString() -Severity $r.Max
-    }
-    if ($data.Findings.Count -gt 0) {
-        $head = @(Get-Content -LiteralPath $txtPath -TotalCount 120) -join [Environment]::NewLine
-        Write-LmNessusFinding -Name 'LateralMovementSummary' -Kb 'KB1400' -Text ($head + [Environment]::NewLine + '... full report in lateral_movement.txt') -Severity $summary.Overall
-    }
-
-    $sw.Stop()
-    $bs = $summary.BySeverity
-    if ($data.Findings.Count -eq 0) {
-        Write-LmLog "    [+] No lateral movement findings: no group nesting reaches a Tier 0 group and no AGDLP violations were detected ($($data.Stats.Groups) groups, $($data.Stats.Users) users)."
-    } else {
-        Write-LmLog "    [!] Lateral movement findings: $($data.Findings.Count) (Critical $($bs.Critical), High $($bs.High), Medium $($bs.Medium), Low $($bs.Low), Info $($bs.Information)) - overall $($summary.Overall)"
-        Write-LmLog "    [!] Effectively Tier 0: $($summary.Tier0Users) user account(s), $($summary.Tier0UsersHidden) of them only through nesting; $($summary.Tier0ReachingGroups) group(s) reach Tier 0 through nesting"
-        foreach ($f in ($data.Findings | Where-Object { $_.Severity -eq 'Critical' } | Sort-Object RuleId, Subject | Select-Object -First 12)) {
-            Write-LmLog "        - [$($f.RuleId)] $($f.Subject)$(if ($f.Target) { " -> $($f.Target)" })"
+        if ($data.GroupIds.Count -eq 0) {
+            Register-LmNotAssessed -Reason 'No groups were returned by the directory query - nothing to analyse.' -Target $data.DomainDns
+            return $null
         }
-        if ($bs.Critical -gt 12) { Write-LmLog "        ... $($bs.Critical - 12) more Critical findings in lateral_movement.txt" }
-    }
-    Write-LmLog "        - TXT : $(Split-Path -Leaf $txtPath)"
-    Write-LmLog "        - CSV : LateralMovement\lateral_movement_findings.csv, _users.csv, _groups.csv, _edges.csv (baseline), _tier0_paths.csv"
-    if ($htmlPath) { Write-LmLog "        - HTML: $(Split-Path -Leaf $htmlPath)" }
-    Write-LmLog "    [*] Lateral movement analysis finished in $([int]$sw.Elapsed.TotalSeconds) s"
 
-    return [pscustomobject]@{
-        Domain = $data.DomainDns; Overall = $summary.Overall; Findings = $data.Findings; Summary = $summary; Stats = $data.Stats
-        Nodes = $data.Nodes; Edges = $data.Edges; TextReport = $txtPath; HtmlReport = $htmlPath; Csv = $csv; EvidenceDir = $dirs.Lm
-        NotAssessed = $script:LmNotAssessed.ToArray()
+        Invoke-LmGraphAnalysis -Data $data -MaxDepth $MaxDepth -BroadGroupPercent $BroadGroupPercent
+        Write-LmProgress -Activity 'Lateral movement: rule evaluation' -Status 'Evaluating collected graph and account evidence' -PercentComplete -1
+        Invoke-LmFindings -Data $data -ApprovedNestings $ApprovedNestings -StaleDays $StaleDays -PasswordAgeDays $PasswordAgeDays -DeepNestingLevels $DeepNestingLevels -BaselinePath $BaselinePath
+        $summary = Get-LmSummary -Data $data
+
+        Write-LmLog "    [*] Writing evidence to $($dirs.Lm) ..."
+        Write-LmProgress -Activity 'Lateral movement: CSV evidence' -Status 'Writing graph and finding tables' -PercentComplete -1
+        $csv = Write-LmCsvOutputs -Data $data -Dirs $dirs
+        $htmlPath = ''
+        if (-not $NoHtml) {
+            Write-LmProgress -Activity 'Lateral movement: HTML map' -Status 'Rendering report and embedded graph' -PercentComplete -1
+            try { $htmlPath = Write-LmHtmlReport -Data $data -Summary $summary -Dirs $dirs -HtmlUserLimit $HtmlUserLimit }
+            catch { Write-LmLog "    [!] HTML map could not be written: $($_.Exception.Message)"; Register-LmNotAssessed -Reason "HTML map not written: $($_.Exception.Message)" }
+        }
+        Write-LmProgress -Activity 'Lateral movement: summary export' -Status 'Writing text summary and scanner findings' -PercentComplete -1
+        $txtPath = Write-LmTextReport -Data $data -Summary $summary -Dirs $dirs -HtmlPath $htmlPath -ScriptLine $ScriptLine
+
+        # Nessus export (only when integrated): one item per rule with findings, severity = worst finding
+        $kbByRule = @{}
+        $i = 1
+        foreach ($rid in $script:LmRules.Keys) { $kbByRule[$rid] = 'KB14{0:D2}' -f $i; $i++ }
+        foreach ($rid in $script:LmRules.Keys) {
+            $r = $summary.ByRule[$rid]
+            if ($r.Count -eq 0) { continue }
+            $items = @($data.Findings | Where-Object { $_.RuleId -eq $rid } | Sort-Object -Property @{ Expression = { $script:LmSeverityRank[$_.Severity] }; Descending = $true } | Select-Object -First 60)
+            $text = New-Object System.Text.StringBuilder
+            [void]$text.AppendLine("$rid $($script:LmRules[$rid].Title) - $($r.Count) finding(s), worst severity $($r.Max)")
+            [void]$text.AppendLine($script:LmRules[$rid].Why)
+            [void]$text.AppendLine('')
+            foreach ($f in $items) { [void]$text.AppendLine("[$($f.Severity)] $($f.Subject): $($f.Detail)") }
+            if ($r.Count -gt 60) { [void]$text.AppendLine("... $($r.Count - 60) more in lateral_movement_findings.csv") }
+            Write-LmNessusFinding -Name "LateralMovement_$rid" -Kb $kbByRule[$rid] -Text $text.ToString() -Severity $r.Max
+        }
+        if ($data.Findings.Count -gt 0) {
+            $head = @(Get-Content -LiteralPath $txtPath -TotalCount 120) -join [Environment]::NewLine
+            Write-LmNessusFinding -Name 'LateralMovementSummary' -Kb 'KB1400' -Text ($head + [Environment]::NewLine + '... full report in lateral_movement.txt') -Severity $summary.Overall
+        }
+
+        $sw.Stop()
+        $bs = $summary.BySeverity
+        if ($data.Findings.Count -eq 0) {
+            Write-LmLog "    [+] No lateral movement findings: no group nesting reaches a Tier 0 group and no AGDLP violations were detected ($($data.Stats.Groups) groups, $($data.Stats.Users) users)."
+        } else {
+            Write-LmLog "    [!] Lateral movement findings: $($data.Findings.Count) (Critical $($bs.Critical), High $($bs.High), Medium $($bs.Medium), Low $($bs.Low), Info $($bs.Information)) - overall $($summary.Overall)"
+            Write-LmLog "    [!] Effectively Tier 0: $($summary.Tier0Users) user account(s), $($summary.Tier0UsersHidden) of them only through nesting; $($summary.Tier0ReachingGroups) group(s) reach Tier 0 through nesting"
+            foreach ($f in ($data.Findings | Where-Object { $_.Severity -eq 'Critical' } | Sort-Object RuleId, Subject | Select-Object -First 12)) {
+                Write-LmLog "        - [$($f.RuleId)] $($f.Subject)$(if ($f.Target) { " -> $($f.Target)" })"
+            }
+            if ($bs.Critical -gt 12) { Write-LmLog "        ... $($bs.Critical - 12) more Critical findings in lateral_movement.txt" }
+        }
+        Write-LmLog "        - TXT : $(Split-Path -Leaf $txtPath)"
+        Write-LmLog "        - CSV : LateralMovement\lateral_movement_findings.csv, _users.csv, _groups.csv, _edges.csv (baseline), _tier0_paths.csv"
+        if ($htmlPath) { Write-LmLog "        - HTML: $(Split-Path -Leaf $htmlPath)" }
+        Write-LmLog "    [*] Lateral movement analysis finished in $([int]$sw.Elapsed.TotalSeconds) s"
+
+        return [pscustomobject]@{
+            Domain = $data.DomainDns; Overall = $summary.Overall; Findings = $data.Findings; Summary = $summary; Stats = $data.Stats
+            Nodes = $data.Nodes; Edges = $data.Edges; TextReport = $txtPath; HtmlReport = $htmlPath; Csv = $csv; EvidenceDir = $dirs.Lm
+            NotAssessed = $script:LmNotAssessed.ToArray()
+        }
+    } finally {
+        $sw.Stop()
+        Write-LmProgress -Activity 'Lateral movement' -Completed
     }
 }
 

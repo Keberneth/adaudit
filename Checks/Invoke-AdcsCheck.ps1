@@ -1,163 +1,116 @@
-<#
-    .SYNOPSIS
-        ADAudit check: Check for ADCS Vulnerabilities
+<# Read-only AD CS configuration review. No enrollment, relay, or credential use. #>
+function Get-ADAuditTemplateAssessment {
+    param($Template, [string[]]$PublishedBy = @(), [string[]]$EnrollTrustees = @(), [string[]]$WriteTrustees = @())
+    $ekus = @($Template.pKIExtendedKeyUsage | Where-Object { $null -ne $_ -and [string]$_ } | ForEach-Object { [string]$_ })
+    $approval = (([int]$Template.'msPKI-Enrollment-Flag' -band 2) -ne 0)
+    $signatures = [int]$Template.'msPKI-RA-Signature'
+    $suppliesSubject = (([int]$Template.'msPKI-Certificate-Name-Flag' -band 1) -ne 0)
+    $anyPurpose = ($ekus.Count -eq 0 -or '2.5.29.37.0' -in $ekus)
+    $authentication = $anyPurpose -or [bool]@($ekus | Where-Object { $_ -in @('1.3.6.1.5.5.7.3.2','1.3.6.1.4.1.311.20.2.2','1.3.6.1.5.2.3.4') }).Count
+    $candidateRules = @()
+    if ($suppliesSubject -and $authentication -and $EnrollTrustees.Count -gt 0) { $candidateRules += 'ESC1' }
+    if ($anyPurpose -and $EnrollTrustees.Count -gt 0) { $candidateRules += 'ESC2' }
+    if ('1.3.6.1.4.1.311.20.2.1' -in $ekus -and $EnrollTrustees.Count -gt 0) { $candidateRules += 'ESC3' }
+    if ($WriteTrustees.Count -gt 0) { $candidateRules += 'ESC4' }
+    if (-not $candidateRules) { $candidateRules = @('TemplateReview') }
+    foreach ($rule in $candidateRules) {
+        $exposed = $PublishedBy.Count -gt 0 -and ($rule -eq 'ESC4' -or (-not $approval -and $signatures -eq 0)) -and $rule -ne 'TemplateReview'
+        [pscustomobject]@{
+            Template = $Template.Name
+            PublishedBy = $PublishedBy -join '; '
+            Rule = $rule
+            Status = if ($exposed) { 'PotentialExposure' } elseif ($rule -eq 'TemplateReview') { 'NoBroadExposureDetected' } else { 'Review' }
+            Severity = if ($exposed) { 'High' } else { 'Info' }
+            Trustees = $(if ($rule -eq 'ESC4') { $WriteTrustees } else { $EnrollTrustees }) -join '; '
+            Detail = "Published=$($PublishedBy.Count -gt 0); manager approval=$approval; authorized signatures=$signatures; EKUs=$($ekus -join ','). Static broad-group allow-ACE assessment only; deny/group access, CA enrollment permissions, enrollment-agent restrictions and certificate mapping need validation. No exploitation attempted."
+        }
+    }
+}
 
-    .DESCRIPTION
-        Part of AdAudit-PS7.ps1 (switch -adcs). This file defines the functions of the
-        check and is dot-sourced by the runner, which supplies the shared helpers from
-        Library\ADAudit.Common.ps1 (output folders, logging, failure / not-assessed tracking,
-        Nessus export) and builds the HTML reports afterwards.
+function Get-ADAuditAdcsEndpointAssessment {
+    param([Nullable[int]]$HttpStatus, [string]$Authentication, [string]$ErrorText)
+    if ($ErrorText -or $null -eq $HttpStatus) { return [pscustomobject]@{Status='NotAssessed'; Detail="Endpoint could not be assessed: $ErrorText"} }
+    if ($HttpStatus -eq 404) { return [pscustomobject]@{Status='Review'; Detail='This URL returned 404; other enrollment services and HTTPS configuration are not excluded.'} }
+    [pscustomobject]@{Status='Review'; Detail="HTTP response $HttpStatus; advertised authentication=$Authentication. Verify NTLM, HTTPS requirement and EPA on CA Web Enrollment and Certificate Enrollment Web Service. This response does not prove ESC8 or its absence."}
+}
 
-        Run this check on its own (same output folders and reports as the full audit):
-            .\Checks\Invoke-AdcsCheck.ps1 [any AdAudit-PS7.ps1 option]
-        which is the same as:
-            .\AdAudit-PS7.ps1 -select adcs [options]
-
-    .NOTES
-        Entry point: Invoke-AdcsCheck (called by the runner through Invoke-AuditCheck).
-        The check functions were moved verbatim from AdAudit-PS7.ps1 v9.0 when the toolkit was
-        split into Library / Checks files. Required modules: ActiveDirectory.
-#>
-Function Get-ADCSVulns {
-    #Check for ADCS Vulnerabiltiies, ESC1,2,3,4 and 8. ESC8 will output to a different issues mapped to Nessus. 
-    $certutil_output = certutil -v -template 2>&1
-    $certutilExit = $LASTEXITCODE
-    $certutil_text = ($certutil_output | Out-String)
-    # If certutil could not produce template data (no reachable Enterprise CA / AD CS
-    # config from this host), do NOT silently report "no ESC vulnerabilities" - that is
-    # a false all-clear. Record it as could-not-assess and stop.
-    if ($certutilExit -ne 0 -or [string]::IsNullOrWhiteSpace($certutil_text) -or $certutil_text -notmatch 'Template\[') {
-        Register-ADAuditNotAssessed -Name 'Get-ADCSVulns' -Switch 'adcs' -RequiresRemotePS -Reason "certutil -v -template returned no usable certificate-template data (exit code $certutilExit). AD CS / Enterprise CA configuration could not be read from this host, so ESC1-4 were NOT assessed (this is not 'no ADCS template vulnerabilities')."
+function Get-ADCSVulns {
+    $templateRows = [System.Collections.Generic.List[object]]::new()
+    $endpointRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($name in @('vulnerable_templates.txt','web_enrollment.txt')) { Remove-Item -LiteralPath (Get-EvidencePath $name) -ErrorAction SilentlyContinue }
+    try {
+        $config = (Get-ADRootDSE -ErrorAction Stop).configurationNamingContext
+        $cas = @(Get-ADObject -SearchBase "CN=Enrollment Services,CN=Public Key Services,CN=Services,$config" -LDAPFilter '(objectClass=pKIEnrollmentService)' -Properties dNSHostName,certificateTemplates -ErrorAction Stop)
+        $templates = @(Get-ADObject -SearchBase "CN=Certificate Templates,CN=Public Key Services,CN=Services,$config" -LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties pKIExtendedKeyUsage,msPKI-Certificate-Name-Flag,msPKI-Enrollment-Flag,msPKI-RA-Signature,nTSecurityDescriptor -ErrorAction Stop)
+    } catch {
+        Register-ADAuditNotAssessed -Name 'AD CS inventory' -Switch 'adcs' -Reason "CA/template LDAP inventory failed: $($_.Exception.Message)"
         return
     }
-    $certutil_lines = $certutil_text.Trim().Split("`n")
-    $templates = @()
-    $current_template = ""
-
-    function ConvertFrom-CertutilTemplateBlock {
-        param([string]$Block)
-        if (-not $Block) { return $null }
-        $template_unparsed = $Block.TrimEnd(",").Split(",")
-        $SuppliesSubjectCheck = $false
-        $ClientAuthCheck = $false
-        $AllowEnrollCheck = $false
-        $AnyPurposeCheck = $false
-        $AllowWriteCheck = $false
-        $AllowFullControl = $false
-        $CertificateRequestAgentCheck = $false
-        $TemplatePropCommonName = $null
-
-        foreach ($detail in $template_unparsed) {
-            if ($detail -like "*TemplatePropCommonName =*") { $TemplatePropCommonName = $detail.Split("=")[1].Trim() }
-            if ($detail -like "*CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT -- 1*") { $SuppliesSubjectCheck = $true }
-            if ($detail -like "*Client Authentication*") { $ClientAuthCheck = $true }
-            if ($detail -match "^\s*Allow Enroll\s+.*\\Authenticated Users\s*$|^\s*Allow Enroll\s+.*\\Domain Users\s*$") { $AllowEnrollCheck = $true }
-            if ($detail -like "*2.5.29.37.0 Any Purpose*") { $AnyPurposeCheck = $true }
-            if ($detail -match "^\s*Allow Write\s+.*\\Authenticated Users\s*$|^\s*Allow Write\s+.*\\Domain Users\s*$") { $AllowWriteCheck = $true }
-            if ($detail -match "^\s*Allow Full Control\s+.*\\Authenticated Users\s*$|^\s*Allow Full Control\s+.*\\Domain Users\s*$") { $AllowFullControl = $true }
-            if ($detail -like "*Certificate Request Agent (1.3.6.1.4.1.311.20.2.1)*") { $CertificateRequestAgentCheck = $true }
-        }
-
-        return [pscustomobject]@{
-            SuppliesSubjectCheck         = $SuppliesSubjectCheck
-            ClientAuthCheck              = $ClientAuthCheck
-            AllowEnrollCheck             = $AllowEnrollCheck
-            AnyPurposeCheck              = $AnyPurposeCheck
-            AllowWriteCheck              = $AllowWriteCheck
-            AllowFullControl             = $AllowFullControl
-            TemplatePropCommonName       = $TemplatePropCommonName
-            CertificateRequestAgentCheck = $CertificateRequestAgentCheck
-        }
-    }
-
-    foreach ($line in $certutil_lines) {
-        if ($line.StartsWith("Template[")) {
-            if ($current_template) {
-                $templates += ConvertFrom-CertutilTemplateBlock $current_template
+    foreach ($template in $templates) {
+        $published = @($cas | Where-Object { $template.Name -in @($_.certificateTemplates) } | Select-Object -ExpandProperty Name)
+        try {
+            $acl = $template.nTSecurityDescriptor
+            if ($null -eq $acl) { throw 'Template security descriptor was not returned.' }
+            $enroll = [System.Collections.Generic.List[string]]::new()
+            $write = [System.Collections.Generic.List[string]]::new()
+            foreach ($ace in $acl.Access) {
+                if ([string]$ace.AccessControlType -ne 'Allow' -or [string]$ace.PropagationFlags -match 'InheritOnly') { continue }
+                $sid = Get-ADAuditAceSid $ace
+                if ($sid -notin @('S-1-1-0','S-1-5-11','S-1-5-32-545') -and $sid -notmatch '^S-1-5-21-(\d+-){3}(513|515)$') { continue }
+                $rights = [int]$ace.ActiveDirectoryRights
+                $objectGuid = [string]$ace.ObjectType
+                $all = (-not $objectGuid -or $objectGuid -eq [guid]::Empty.ToString())
+                if (($rights -band 983551) -eq 983551 -or (($rights -band 256) -ne 0 -and ($all -or $objectGuid -eq '0e10c968-78fb-11d2-90d4-00c04f79dc55'))) { $enroll.Add($sid) }
+                if (($rights -band 983551) -eq 983551 -or ($rights -band 262144) -ne 0 -or ($rights -band 524288) -ne 0 -or (($rights -band 32) -ne 0 -and $all)) { $write.Add($sid) }
             }
-            $current_template = $line + ","
-        } else {
-            $current_template += $line + ","
+            foreach ($row in @(Get-ADAuditTemplateAssessment -Template $template -PublishedBy $published -EnrollTrustees @($enroll) -WriteTrustees @($write))) { $templateRows.Add($row) }
+        } catch {
+            Register-ADAuditNotAssessed -Name 'AD CS template' -Switch 'adcs' -Target $template.DistinguishedName -Reason "Template ACL evaluation failed: $($_.Exception.Message)"
+            $templateRows.Add([pscustomobject]@{Template=$template.Name; PublishedBy=$published -join '; '; Rule='TemplateReview'; Status='NotAssessed'; Severity='Info'; Trustees=''; Detail=$_.Exception.Message})
         }
     }
-    # Flush the final template. The loop only parses a template when it reaches the
-    # NEXT 'Template[' header, so without this trailing flush the last template in the
-    # certutil output was silently dropped (false negative for ESC1/2/3/4).
-    if ($current_template) {
-        $templates += ConvertFrom-CertutilTemplateBlock $current_template
+    Export-ADAuditSecurityCsv -Rows $templateRows -Columns @('Template','PublishedBy','Rule','Status','Severity','Trustees','Detail') -Path (Get-EvidencePath 'adcs_templates.csv')
+    $exposures = @($templateRows | Where-Object Status -eq 'PotentialExposure')
+    if ($exposures.Count -gt 0) {
+        $exposures | ForEach-Object { "Potential $($_.Rule) exposure: $($_.Template) | CAs: $($_.PublishedBy) | Trustees: $($_.Trustees) | $($_.Detail)" } | Set-Content -Encoding UTF8 -Path (Get-EvidencePath 'vulnerable_templates.txt')
+        Write-Nessus-Finding 'Potential AD CS template exposure (static assessment)' 'KB1096' ([IO.File]::ReadAllText((Get-EvidencePath 'vulnerable_templates.txt'))) 'High'
     }
-
-    # Check for ESC1
-    # ESC1 = CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 1 and  Client Authentication and ( enroll or full control )
-
-    $ESC1 = @()
-    $ESC1e = $templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowEnrollCheck }
-    $ESC1f = $templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowFullControl }
-    $ESC1w = $templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowWriteCheck }
-    $ESC1 += $ESC1e
-    $ESC1 += $ESC1f
-    $ESC1 += $ESC1w
-    # Remove duplicates
-    $ESC1 = $ESC1 | Select-Object -Property TemplatePropCommonName -unique
-    $ESC2 = $templates | Where-Object { $_.AnyPurposeCheck -and $_.AllowEnrollCheck }
-    $ESC3 = $templates | Where-Object { $_.CertificateRequestAgentCheck -and $_.AllowEnrollCheck }
-    $ESC4 = $templates | Where-Object { $_.AllowWriteCheck -or $_.AllowFullControl }
-
-    $template_path = Get-EvidencePath 'vulnerable_templates.txt'
-    $web_enrollment_path = Get-EvidencePath 'web_enrollment.txt'
-
-    foreach ($template in $ESC1) {
-        $ESC1line = "ESC1 Vulnerable Templates:" + $template.TemplatePropCommonName
-        Add-Content -Path $template_path -Value $ESC1line
-        Write-Both "    [!] $ESC1line"
+    Write-Both "    [*] AD CS: $($cas.Count) enterprise CA object(s), $($templates.Count) template(s), $($exposures.Count) potential broad-group template exposure(s). Custom trustee groups and CA-side configuration require review."
+    if ($cas.Count -eq 0) {
+        Write-Both '    [*] No enterprise CA objects discovered. Standalone CAs and external enrollment endpoints were not inventoried.'
+        return
     }
-    foreach ($template in $ESC2) {
-        $ESC2line = "ESC2 Vulnerable Templates:" + $template.TemplatePropCommonName
-        Add-Content -Path $template_path -Value $ESC2line
-        Write-Both "    [!] $ESC2line"
-    }
-    foreach ($template in $ESC3) {
-        $ESC3line = "ESC3 Vulnerable Templates:" + $template.TemplatePropCommonName
-        Add-Content -Path $template_path -Value $ESC3line
-        Write-Both "    [!] $ESC3line"
-    }
-    foreach ($template in $ESC4) {
-        $ESC4line = "ESC4 Vulnerable Templates:" + $template.TemplatePropCommonName
-        Add-Content -Path $template_path -Value $ESC4line
-        Write-Both "    [!] $ESC4line"
-    }
-    # ESC8 Check, If error 401 and response is unauthorized, then vulnerable
-    try {
-        $certInfo = & certutil
-        $serverName = ($certInfo | Select-String 'Server:' | Select-Object -First 1).ToString().Split(':')[1].Trim().Replace('"', '')
-        $response = Invoke-WebRequest -Uri ("http://$serverName/certsrv/") -ErrorAction Stop
-        $response
-    }
-    catch {
-        # If error and response is unauthorised, then vulnerable
-        if ($_.Exception.Response.StatusCode -eq 401) {
-            Add-Content -Path $web_enrollment_path -Value "ESC8 Vulnerable: Endpoint located at http://$serverName/certsrv/"
-            Write-Both "    [!] ESC8 Vulnerable: Endpoint located at http://$serverName/certsrv/"
+    foreach ($ca in $cas) {
+        $server = [string]$ca.dNSHostName
+        if ([string]::IsNullOrWhiteSpace($server)) {
+            Register-ADAuditNotAssessed -Name 'AD CS enrollment endpoint' -Switch 'adcs' -Target $ca.Name -Reason 'CA object has no DNS host name; web endpoints cannot be inferred.'
+            continue
         }
-        else {
-            Write-Both "    [+] ESC8 not vulnerable"
+        if ($script:ADAuditIsolatedClone -and -not (Test-ADAuditLocalComputer -ComputerName $server)) {
+            Register-ADAuditNotAssessed -Name 'AD CS enrollment endpoint' -Switch 'adcs' -Target $server -Reason 'Remote enrollment endpoints are outside isolated-clone scope. Template configuration was read from the copied directory.'
+            $endpointRows.Add([pscustomobject]@{CA=$ca.Name; Endpoint=$server; Status='NotAssessed'; HttpStatus=$null; Authentication=''; Detail='Not probed: remote endpoint outside isolated-clone scope.'})
+            continue
         }
+        foreach ($scheme in @('http','https')) {
+            $url = "${scheme}://$server/certsrv/"
+            $status = $null; $auth = ''; $failure = ''
+            try {
+                # Never send audit credentials or follow redirects to undiscovered hosts.
+                $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 0 -TimeoutSec 10 -SkipHttpErrorCheck -ErrorAction Stop
+                $status = [int]$response.StatusCode
+                $auth = [string]($response.Headers['WWW-Authenticate'] -join ', ')
+            } catch { $failure = $_.Exception.Message }
+            $assessment = Get-ADAuditAdcsEndpointAssessment -HttpStatus $status -Authentication $auth -ErrorText $failure
+            $endpointRows.Add([pscustomobject]@{CA=$ca.Name; Endpoint=$url; Status=$assessment.Status; HttpStatus=$status; Authentication=$auth; Detail=$assessment.Detail})
+            if ($assessment.Status -eq 'NotAssessed') { Register-ADAuditNotAssessed -Name 'AD CS enrollment endpoint' -Switch 'adcs' -Target $url -Reason $assessment.Detail }
+        }
+        Register-ADAuditNotAssessed -Name 'AD CS ESC8 configuration' -Switch 'adcs' -Target $ca.Name -Reason 'Endpoint reachability is inventory only. IIS authentication/EPA/SSL settings, CES roles on other hosts, and CA-side issuance permissions were not collected; ESC8 is not concluded.'
     }
-    if (Test-Path (Get-EvidencePath 'web_enrollment.txt')) {
-        Write-Nessus-Finding "Active Directory Certificate Service Web Enrollment Enabled in HTTP" "KB1095" ([System.IO.File]::ReadAllText((Get-EvidencePath 'web_enrollment.txt')))
-    }
-    if (Test-Path (Get-EvidencePath 'vulnerable_templates.txt')) {
-        Write-Nessus-Finding "Active Directory Certificate Service Vulnerable Templates" "KB1096" ([System.IO.File]::ReadAllText((Get-EvidencePath 'vulnerable_templates.txt')))
-    }
+    $endpointRows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'adcs_endpoints.csv')
+    $endpointRows | ForEach-Object { "$($_.Status): $($_.Endpoint) | $($_.Detail)" } | Set-Content -Encoding UTF8 -Path (Get-EvidencePath 'adcs_endpoint_review.txt')
 }
 
-function Invoke-AdcsCheck {
-    Get-ADCSVulns
-}
-
-# ---- Standalone launch --------------------------------------------------------------------
-# Dot-sourced by AdAudit-PS7.ps1 this file only defines functions. Started directly it hands
-# over to the runner so the output folders, Nessus export and HTML reports are identical.
+function Invoke-AdcsCheck { Get-ADCSVulns }
 if ($MyInvocation.InvocationName -ne '.') {
     & (Join-Path (Split-Path -Parent $PSScriptRoot) 'AdAudit-PS7.ps1') -select adcs @args
 }

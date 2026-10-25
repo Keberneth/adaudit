@@ -25,11 +25,11 @@ Function Get-OldBoxes {
     $totalcount = ($oldboxes | Measure-Object | Select-Object Count).count
     foreach ($machine in $oldboxes) {
         if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for unsupported OS devices joined to the domain..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
+        Write-ADAuditProgress -Activity "Searching for unsupported OS devices joined to the domain..." -Status "Currently identified $count" -PercentComplete ($count / $totalcount * 100)
         Add-Content -Path (Get-EvidencePath 'machines_old.txt') -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersion), $($machine.IPv4Address)"
         $count++
     }
-    Write-Progress -Activity "Searching for unsupported OS devices joined to the domain..." -Status "Ready" -Completed
+    Write-ADAuditProgress -Activity "Searching for unsupported OS devices joined to the domain..." -Status "Ready" -Completed
     if ($count -gt 0) {
         Write-Both "    [!] $count machines are running an OS older than Windows Server 2019 (some, such as Server 2016 or Windows 10, may still be in extended support - verify each against the Microsoft product lifecycle). See machines_old.txt (KB259)"
         Write-Nessus-Finding "OldBoxes" "KB259" ([System.IO.File]::ReadAllText((Get-EvidencePath 'machines_old.txt')))
@@ -37,7 +37,12 @@ Function Get-OldBoxes {
 }
 
 function Invoke-OldBoxesCheck {
-    Get-OldBoxes
+    Write-ADAuditProgress -Activity 'Legacy operating systems' -Status 'Starting collection' -PercentComplete -1
+    try {
+        Get-OldBoxes
+    } finally {
+        Write-ADAuditProgress -Activity 'Legacy operating systems' -Completed
+    }
 }
 
 # ---- Standalone launch --------------------------------------------------------------------

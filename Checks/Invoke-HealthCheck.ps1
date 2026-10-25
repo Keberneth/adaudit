@@ -18,6 +18,42 @@
         The check functions were moved verbatim from AdAudit-PS7.ps1 v9.0 when the toolkit was
         split into Library / Checks files. Required modules: ActiveDirectory.
 #>
+function Get-ADAuditHostUtcTime {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ComputerName)
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $ComputerName
+    if (Test-ADAuditLocalComputer $ComputerName) { return [DateTime]::UtcNow }
+    $clock = Get-ADAuditCimInstance -ComputerName $ComputerName -ClassName Win32_UTCTime -UseWsmanFallback -ErrorAction Stop
+    if ($null -eq $clock.Year) { throw 'The UTC clock provider returned no sample.' }
+    [DateTime]::new([int]$clock.Year, [int]$clock.Month, [int]$clock.Day, [int]$clock.Hour, [int]$clock.Minute, [int]$clock.Second, [DateTimeKind]::Utc)
+}
+
+function Get-ADAuditNtdsStorage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ComputerName)
+    $key = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+    $database = Get-ADAuditRemoteRegistryValue -ComputerName $ComputerName -SubKey $key -ValueName 'DSA Database file' -ValueType String -UseWsmanFallback
+    $logs = Get-ADAuditRemoteRegistryValue -ComputerName $ComputerName -SubKey $key -ValueName 'Database log files path' -ValueType String -UseWsmanFallback
+    if (-not $database.Success -or -not $logs.Success -or -not $database.Value -or -not $logs.Value) { throw "NTDS database/log paths unavailable. $($database.Error) $($logs.Error)" }
+    $ditPath = [string]$database.Value
+    $logPath = [string]$logs.Value
+    $drive = Split-Path -Path $logPath -Qualifier
+    if (-not $drive) { throw 'The NTDS log path did not identify a local volume.' }
+    if (Test-ADAuditLocalComputer $ComputerName) {
+        $size = (Get-Item -LiteralPath $ditPath -ErrorAction Stop).Length
+        $free = (Get-PSDrive -Name $drive.TrimEnd(':') -ErrorAction Stop).Free
+    } else {
+        # Exact Name filtering prevents an expensive filesystem-wide WMI scan.
+        $escapedPath = $ditPath.Replace('\','\\').Replace("'","\'")
+        $file = Get-ADAuditCimInstance -ComputerName $ComputerName -ClassName CIM_DataFile -Filter "Name='$escapedPath'" -Property FileSize -UseWsmanFallback -ErrorAction Stop
+        $disk = Get-ADAuditCimInstance -ComputerName $ComputerName -ClassName Win32_LogicalDisk -Filter "DeviceID='$drive'" -Property FreeSpace -UseWsmanFallback -ErrorAction Stop
+        $size = $file.FileSize
+        $free = $disk.FreeSpace
+    }
+    if ($null -eq $size -or $null -eq $free) { throw 'Database size or log-volume free space was unavailable.' }
+    [pscustomobject]@{DatabasePath=$ditPath; LogPath=$logPath; DatabaseBytes=[long]$size; LogFreeBytes=[long]$free}
+}
+
 Function Get-ADHealth {
     <#
     .SYNOPSIS
@@ -41,6 +77,13 @@ Function Get-ADHealth {
     $findings = New-Object System.Collections.Generic.List[object]
     $tests    = New-Object System.Collections.Generic.List[object]
     $weights  = @{ Critical = 25; High = 12; Medium = 5; Low = 1; Info = 0 }
+    $healthGaps = @{}
+    function _HUnknown {
+        param([string]$Path, [string]$Target, [string]$Reason)
+        if (-not $healthGaps.ContainsKey($Path)) { $healthGaps[$Path] = 0 }
+        $healthGaps[$Path]++
+        Register-ADAuditNotAssessed -Name ('AD Health: ' + [IO.Path]::GetFileNameWithoutExtension($Path)) -Switch 'adhealth' -Target $Target -Reason $Reason
+    }
 
     function _Add-HFinding {
         param([string]$Category,[string]$Severity,[string]$Title,[string]$Evidence,[string]$Source)
@@ -62,12 +105,18 @@ Function Get-ADHealth {
             [string]$Detail,
             [string]$EvidencePath
         )
+        $gapCount = if ($healthGaps.ContainsKey($EvidencePath)) { $healthGaps[$EvidencePath] } else { 0 }
+        if ($gapCount -gt 0) {
+            if ($Status -ne 'Fail') { $Status = 'Partial' }
+            $Detail = "$Detail; $gapCount collection gap(s) - coverage incomplete"
+        }
         $tests.Add([pscustomobject]@{
             Title        = $Title
             Subtitle     = $Subtitle
             Status       = $Status
             Detail       = $Detail
             EvidencePath = $EvidencePath
+            NotAssessedCount = $gapCount
         }) | Out-Null
     }
 
@@ -75,6 +124,7 @@ Function Get-ADHealth {
         Import-ADAuditModule -Name ActiveDirectory -Required | Out-Null
     } catch {
         Write-Both "    [!] AD Health check skipped: ActiveDirectory module not available."
+        Register-ADAuditNotAssessed -Name 'AD Health' -Switch 'adhealth' -Reason 'ActiveDirectory module unavailable.'
         return
     }
 
@@ -82,7 +132,25 @@ Function Get-ADHealth {
         $dcs = @(Get-ADDomainController -Filter * -ErrorAction Stop | Sort-Object Name)
     } catch {
         Write-Both "    [!] AD Health check skipped: could not enumerate DCs ($($_.Exception.Message))."
+        Register-ADAuditNotAssessed -Name 'AD Health' -Switch 'adhealth' -Reason $_.Exception.Message
         return
+    }
+    if ($dcs.Count -eq 0) {
+        Register-ADAuditNotAssessed -Name 'AD Health' -Switch 'adhealth' -Reason 'No domain controllers returned.'
+        return
+    }
+    $inventoryDcs = $dcs
+    if ($script:ADAuditIsolatedClone) {
+        foreach ($dc in $dcs) {
+            if (-not (Test-ADAuditLocalComputer $dc.HostName)) {
+                Register-ADAuditNotAssessed -Name 'AD Health: isolated-clone scope' -Switch 'adhealth' -Target $dc.HostName -Reason 'Remote DC intentionally excluded from local clone collection; current production state is not assessed.'
+            }
+        }
+        $dcs = @($dcs | Where-Object { Test-ADAuditLocalComputer $_.HostName })
+        if ($dcs.Count -eq 0) {
+            Register-ADAuditNotAssessed -Name 'AD Health' -Switch 'adhealth' -Reason 'Isolated-clone mode found no directory DC identity matching this computer; no remote targets were contacted.'
+            return
+        }
     }
 
     $domain = ''
@@ -96,9 +164,15 @@ Function Get-ADHealth {
     $replSb   = New-Object System.Text.StringBuilder
     $replFailed = 0
     $replLingeringErr = $false
+    Write-ADAuditProgress -Activity 'AD Health' -Status 'Replication evidence' -PercentComplete 0
+    if ($script:ADAuditIsolatedClone) {
+        _HUnknown $replPath 'Production replication' 'Isolated-clone mode: replication commands are skipped because peer availability and old replication metadata cannot establish current production health.'
+        [void]$replSb.AppendLine('Replication collection skipped in isolated-clone mode. Local snapshot data is not a production replication assessment.')
+    } else {
     [void]$replSb.AppendLine('=== repadmin /replsummary ===')
     try {
         $replSummary = (repadmin /replsummary 2>&1) | Out-String
+        if ($LASTEXITCODE -ne 0) { _HUnknown $replPath 'repadmin /replsummary' "Command exited with $LASTEXITCODE; see evidence." }
         [void]$replSb.AppendLine($replSummary)
         # repadmin /replsummary table format:
         #     Source DSA          largest delta    fails/total %%   error
@@ -113,33 +187,38 @@ Function Get-ADHealth {
         # and once in the "Destination DSA" table. Count rows from the Source table only,
         # otherwise every failure is double-counted.
         $inSourceTable = $false
+        $replParsedRows = 0
         foreach ($line in ($replSummary -split "`r?`n")) {
             if ($line -match 'Source DSA')      { $inSourceTable = $true;  continue }
             if ($line -match 'Destination DSA') { $inSourceTable = $false; continue }
             if (-not $inSourceTable) { continue }
             if ($line -match '^\s*\S+\s+.+?(\d+)\s*/\s*\d+\s+\d+(\s|$)') {
                 $f = [int]$matches[1]
+                $replParsedRows++
                 if ($f -gt 0) { $replFailed += $f }
             }
         }
-    } catch { [void]$replSb.AppendLine("repadmin /replsummary failed: $($_.Exception.Message)") }
+        if ($replParsedRows -eq 0) { _HUnknown $replPath 'repadmin /replsummary' 'No source-summary rows could be interpreted; empty/localized output is not proof of successful replication.' }
+    } catch { _HUnknown $replPath 'repadmin /replsummary' $_.Exception.Message; [void]$replSb.AppendLine("repadmin /replsummary failed: $($_.Exception.Message)") }
 
     [void]$replSb.AppendLine('')
     [void]$replSb.AppendLine('=== repadmin /showrepl /csv (per-DC, may be truncated) ===')
     try {
         $showrepl = (repadmin /showrepl /csv 2>&1) | Out-String
+        if ($LASTEXITCODE -ne 0) { _HUnknown $replPath 'repadmin /showrepl' "Command exited with $LASTEXITCODE." }
         if ($showrepl.Length -gt 32000) { $showrepl = $showrepl.Substring(0,32000) + "`n... (truncated) ..." }
         [void]$replSb.AppendLine($showrepl)
-    } catch { [void]$replSb.AppendLine("repadmin /showrepl failed: $($_.Exception.Message)") }
+    } catch { _HUnknown $replPath 'repadmin /showrepl' $_.Exception.Message; [void]$replSb.AppendLine("repadmin /showrepl failed: $($_.Exception.Message)") }
 
     [void]$replSb.AppendLine('')
     [void]$replSb.AppendLine('=== repadmin /queue (per-DC) ===')
     foreach ($dc in $dcs) {
         try {
             $q = (repadmin /queue $dc.HostName 2>&1) | Out-String
+            if ($LASTEXITCODE -ne 0) { _HUnknown $replPath $dc.HostName "repadmin /queue exited with $LASTEXITCODE." }
             [void]$replSb.AppendLine("--- $($dc.HostName) ---")
             [void]$replSb.AppendLine($q)
-        } catch { [void]$replSb.AppendLine("$($dc.HostName): $($_.Exception.Message)") }
+        } catch { _HUnknown $replPath $dc.HostName $_.Exception.Message; [void]$replSb.AppendLine("$($dc.HostName): $($_.Exception.Message)") }
     }
 
     [void]$replSb.AppendLine('')
@@ -153,16 +232,17 @@ Function Get-ADHealth {
         if ($LASTEXITCODE -ne 0) { $replLingeringErr = $true }
     } catch { $replLingeringErr = $true; [void]$replSb.AppendLine($_.Exception.Message) }
 
+    }
     Set-Content -LiteralPath $replPath -Value $replSb.ToString() -Encoding UTF8
 
     if ($replFailed -gt 0) {
         _Add-HFinding -Category 'Replication' -Severity 'High' -Title 'Replication failures detected' -Evidence "Total replication failures across DCs: $replFailed" -Source $replPath
         _Add-HTest -Title 'Replication health' -Subtitle 'repadmin /replsummary, /showrepl, /queue, lingering objects' -Status 'Fail' -Detail "$replFailed failure(s)" -EvidencePath $replPath
     } elseif ($replLingeringErr) {
-        _Add-HFinding -Category 'Replication' -Severity 'Low' -Title 'Lingering-object advisory scan could not complete' -Evidence 'repadmin advisory probe errored out (often DNS lookup or RPC reachability). Lingering state is unverified, not necessarily present.' -Source $replPath
-        _Add-HTest -Title 'Replication health' -Subtitle 'repadmin /replsummary, /showrepl, /queue, lingering objects' -Status 'Pass' -Detail '1 Low (advisory only)' -EvidencePath $replPath
+        _HUnknown $replPath 'repadmin /showrepl /errorsonly' 'Advisory command failed; replication-error state was not assessed.'
+        _Add-HTest -Title 'Replication health' -Subtitle 'repadmin summary, partner details and queue' -Status 'Partial' -Detail 'Advisory collection incomplete' -EvidencePath $replPath
     } else {
-        _Add-HTest -Title 'Replication health' -Subtitle 'repadmin /replsummary, /showrepl, /queue, lingering objects' -Status 'Pass' -Detail 'No issues' -EvidencePath $replPath
+        _Add-HTest -Title 'Replication health' -Subtitle 'repadmin /replsummary, /showrepl, /queue, lingering objects' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $replPath
     }
 
     # ============================================================
@@ -201,13 +281,14 @@ Function Get-ADHealth {
     [void]$icSb.AppendLine("Probed from: $env:COMPUTERNAME ($localFqdn)")
     [void]$icSb.AppendLine("Total DCs in domain: $totalDCs")
     [void]$icSb.AppendLine('Tests per DC: DNS resolve | TCP 389 (LDAP) | TCP 445 (SMB) | replication metadata freshness')
-    [void]$icSb.AppendLine('A DC is flagged "Isolated" when it is NOT this host AND both LDAP+SMB probes fail.')
+    [void]$icSb.AppendLine('The Isolated field means unreachable from this auditing host only; it does not establish a replication partition.')
     [void]$icSb.AppendLine('')
 
     $dcReachRows = @()
     foreach ($dc in $dcs) {
         $dcHost = $dc.HostName
-        $isLocalDC = ($dcHost.ToLowerInvariant() -eq $localFqdn) -or ($dcHost.ToLowerInvariant().Split('.')[0] -eq $env:COMPUTERNAME.ToLowerInvariant())
+        Write-ADAuditProgress -Activity 'AD Health' -Status "DC reachability: $dcHost" -PercentComplete 8
+        $isLocalDC = Test-ADAuditLocalComputer $dcHost
 
         $dnsOk = $false
         try { if (Resolve-DnsName -Name $dcHost -Type A -ErrorAction Stop) { $dnsOk = $true } } catch { }
@@ -221,6 +302,7 @@ Function Get-ADHealth {
         $replOk = $null
         $lastRepl = $null
         try {
+            if ($script:ADAuditIsolatedClone) { throw 'Replication freshness is not assessed from an isolated snapshot.' }
             $partners = Get-ADReplicationPartnerMetadata -Target $dcHost -Scope Server -ErrorAction Stop
             if ($partners) {
                 $stale = $false
@@ -230,7 +312,10 @@ Function Get-ADHealth {
                 }
                 $replOk = -not $stale
             }
-        } catch { $replOk = $false }
+        } catch {
+            _HUnknown $icPath $dcHost ("Replication metadata unavailable: " + $_.Exception.Message)
+            $replOk = $null
+        }
 
         $isolated = (-not $isLocalDC) -and (-not $ldapOk) -and (-not $smbOk)
 
@@ -259,51 +344,24 @@ Function Get-ADHealth {
     $isolatedCount = $isolatedRows.Count
     $reachableCount = $totalDCs - $isolatedCount
 
-    # Severity scaling
+    # A management-host reachability failure cannot establish a partition
+    # between DCs. Keep observed replication failures separate from reachability.
     $icSeverity = 'Pass'
     $icDetail = "All $totalDCs DC(s) reachable"
     $icOverallSev = $null
     if ($isolatedCount -gt 0) {
-        if ($totalDCs -le 1) {
-            $icDetail = "Only 1 DC; nothing to partition"
-        } elseif ($totalDCs -eq 2) {
-            $icOverallSev = 'Critical'
-            $icSeverity = 'Fail'
-            $icDetail = "$isolatedCount/$totalDCs DC(s) isolated - Critical (no redundancy)"
-        } elseif ($totalDCs -eq 3 -and $isolatedCount -eq 1) {
-            $icOverallSev = 'High'
-            $icSeverity = 'Fail'
-            $icDetail = "1/$totalDCs DC isolated - High"
-        } elseif ($totalDCs -ge 4 -and $isolatedCount -eq 1) {
-            $icOverallSev = 'Medium'
-            $icSeverity = 'Warn'
-            $icDetail = "1/$totalDCs DC isolated - Medium"
-        } else {
-            # Multiple isolated - severity scales by remaining redundancy
-            if ($reachableCount -lt 2) {
-                $icOverallSev = 'Critical'; $icSeverity = 'Fail'
-            } elseif ($reachableCount -lt 3) {
-                $icOverallSev = 'High'; $icSeverity = 'Fail'
-            } else {
-                $icOverallSev = 'Medium'; $icSeverity = 'Warn'
-            }
-            $icDetail = "$isolatedCount/$totalDCs DC(s) isolated - $icOverallSev"
+        $icSeverity = 'Partial'
+        $icDetail = "$isolatedCount/$totalDCs DC(s) not reachable from the auditing host; DC-to-DC connectivity is not established by these probes"
+        foreach ($iso in $isolatedRows) {
+            _HUnknown $icPath $iso.Host 'LDAP and SMB were not reachable from the auditing host. This does not prove a DC outage or replication failure; confirm from approved DC-to-DC paths.'
         }
     }
 
-    if ($icOverallSev) {
-        $title = if ($isolatedCount -eq 1) { 'Domain controller cannot reach replication partners' }
-                 else                       { 'Multiple domain controllers cannot reach replication partners' }
-        $isolatedNames = ($isolatedRows | ForEach-Object { $_.Host }) -join ', '
-        $evidenceText = "$isolatedCount of $totalDCs DC(s) isolated ($reachableCount reachable). Unreachable DC(s) from $env:COMPUTERNAME: $isolatedNames"
-        _Add-HFinding -Category 'DC Interconnect' -Severity $icOverallSev -Title $title -Evidence $evidenceText -Source $icPath
-
-        # Each isolated DC is itself in Critical state (its replication is dead
-        # from this host's perspective, regardless of how many DCs the rest of
-        # the forest can still talk to).
-        foreach ($iso in $isolatedRows) {
-            _Add-HFinding -Category 'DC Interconnect' -Severity 'Critical' -Title 'DC unreachable - replication broken with this peer' -Evidence "DC $($iso.Host) is unreachable on LDAP (389) and SMB (445) from $env:COMPUTERNAME. Replication with this DC is not happening - directory state will diverge. Possible causes: powered off, network partition, firewall, cloned VM on isolated network, decommissioned but not removed from AD." -Source $icPath
-        }
+    $staleReplication = @($dcReachRows | Where-Object { $null -ne $_.ReplFresh -and -not $_.ReplFresh })
+    if ($staleReplication.Count -gt 0) {
+        $icSeverity = 'Fail'
+        $icDetail = "$($staleReplication.Count) DC(s) with stale observed replication metadata"
+        _Add-HFinding -Category 'DC Interconnect' -Severity 'High' -Title 'Stale inbound replication metadata' -Evidence "No recent success for one or more recorded partners on: $(($staleReplication.Host) -join ', '). Validate against site schedules and the replication report." -Source $icPath
     }
 
     Set-Content -LiteralPath $icPath -Value $icSb.ToString() -Encoding UTF8
@@ -321,6 +379,11 @@ Function Get-ADHealth {
         $dcHost = $dc.HostName
         [void]$dcdiagSb.AppendLine("===== dcdiag on $dcHost =====")
         foreach ($t in $dcdiagTests) {
+            Write-ADAuditProgress -Activity 'AD Health' -Status "dcdiag $t on $dcHost" -PercentComplete 16
+            if ($script:ADAuditIsolatedClone -and $t -notin @('Services','Advertising','NetLogons','SysVolCheck')) {
+                _HUnknown $dcdiagPath "$dcHost/$t" 'Isolated-clone mode: replication, FSMO and peer-dependent diagnostics are skipped.'
+                continue
+            }
             try {
                 $out = (dcdiag /s:$dcHost /test:$t 2>&1) | Out-String
                 [void]$dcdiagSb.AppendLine($out)
@@ -328,8 +391,11 @@ Function Get-ADHealth {
                     $dcdiagFailedTests++
                     if (-not $dcdiagBreakdown.ContainsKey($dcHost)) { $dcdiagBreakdown[$dcHost] = 0 }
                     $dcdiagBreakdown[$dcHost] = $dcdiagBreakdown[$dcHost] + 1
+                } elseif ($LASTEXITCODE -ne 0 -or $out -notmatch ('(?im)\bpassed\s+test\s+' + [regex]::Escape($t) + '\b')) {
+                    _HUnknown $dcdiagPath "$dcHost/$t" 'No successful test result could be interpreted (command failure, missing or localized output).'
                 }
             } catch {
+                _HUnknown $dcdiagPath "$dcHost/$t" $_.Exception.Message
                 [void]$dcdiagSb.AppendLine("dcdiag $t on $dcHost threw: $($_.Exception.Message)")
             }
         }
@@ -341,44 +407,50 @@ Function Get-ADHealth {
         _Add-HFinding -Category 'DC Diagnostics' -Severity 'Medium' -Title 'dcdiag tests failing on one or more DCs' -Evidence "Failed tests: $dcdiagFailedTests | DC breakdown: $brk" -Source $dcdiagPath
         _Add-HTest -Title 'DC diagnostics (dcdiag)' -Subtitle 'Services, Replications, Advertising, FsmoCheck, KCCEvent, NetLogons, SysVolCheck, RidManager, DFSREvent, Intersite' -Status 'Warn' -Detail '1 Medium' -EvidencePath $dcdiagPath
     } else {
-        _Add-HTest -Title 'DC diagnostics (dcdiag)' -Subtitle 'Services, Replications, Advertising, FsmoCheck, KCCEvent, NetLogons, SysVolCheck, RidManager, DFSREvent, Intersite' -Status 'Pass' -Detail 'No issues' -EvidencePath $dcdiagPath
+        _Add-HTest -Title 'DC diagnostics (dcdiag)' -Subtitle 'Services, Replications, Advertising, FsmoCheck, KCCEvent, NetLogons, SysVolCheck, RidManager, DFSREvent, Intersite' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $dcdiagPath
     }
 
     # ============================================================
-    # 3) SYSVOL / DFSR backlog
+    # 3) SYSVOL / DFSR availability (backlog is not measured)
     # ============================================================
     $sysvolPath = Join-Path $rawDir 'health_sysvol_dfsr.txt'
     $sysvolSb   = New-Object System.Text.StringBuilder
     $sysvolBacklog = 0
     foreach ($dc in $dcs) {
         $dcHost = $dc.HostName
+        Write-ADAuditProgress -Activity 'AD Health' -Status "SYSVOL and DFSR: $dcHost" -PercentComplete 25
         [void]$sysvolSb.AppendLine("--- $dcHost ---")
         try {
             $share = "\\$dcHost\SYSVOL"
-            if (Test-Path -LiteralPath $share) {
+            if (Test-ADAuditLocalComputer $dcHost) {
+                $localShare = Get-ADAuditCimInstance -ComputerName $dcHost -ClassName Win32_Share -Filter "Name='SYSVOL'" -ErrorAction Stop
+                if (-not $localShare.Path) { throw 'Local SYSVOL share path was not returned by the share provider.' }
+                $share = [string]$localShare.Path
+            }
+            if (Test-Path -LiteralPath $share -ErrorAction Stop) {
                 [void]$sysvolSb.AppendLine("SYSVOL share reachable: $share")
             } else {
                 [void]$sysvolSb.AppendLine("SYSVOL share NOT reachable: $share")
-                $sysvolBacklog++
+                _HUnknown $sysvolPath $dcHost 'SYSVOL is not reachable from the audit host; share absence or a replication failure was not established.'
             }
         } catch {
             [void]$sysvolSb.AppendLine("Could not reach SYSVOL on ${dcHost}: $($_.Exception.Message)")
-            $sysvolBacklog++
+            _HUnknown $sysvolPath $dcHost $_.Exception.Message
         }
         try {
-            $dfsr = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $dcHost -Filter "Name='DFSR'" -ErrorAction SilentlyContinue
+            $dfsr = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $dcHost -Filter "Name='DFSR'" -ErrorAction Stop
             if ($dfsr) {
                 [void]$sysvolSb.AppendLine("DFSR state: $($dfsr.State) / start: $($dfsr.StartMode)")
                 if ($dfsr.State -ne 'Running') { $sysvolBacklog++ }
-            }
-        } catch { }
+            } else { _HUnknown $sysvolPath $dcHost 'DFSR service was not returned; legacy FRS and migration state were not assessed.' }
+        } catch { _HUnknown $sysvolPath $dcHost $_.Exception.Message }
     }
     Set-Content -LiteralPath $sysvolPath -Value $sysvolSb.ToString() -Encoding UTF8
     if ($sysvolBacklog -gt 0) {
         _Add-HFinding -Category 'SYSVOL/DFSR' -Severity 'Medium' -Title 'SYSVOL or DFSR issue detected' -Evidence "DCs with SYSVOL/DFSR concerns: $sysvolBacklog" -Source $sysvolPath
-        _Add-HTest -Title 'SYSVOL / DFSR backlog' -Subtitle 'DFSR backlog and content consistency between DCs' -Status 'Warn' -Detail "$sysvolBacklog issue(s)" -EvidencePath $sysvolPath
+        _Add-HTest -Title 'SYSVOL / DFSR availability' -Subtitle 'SYSVOL share reachability and DFSR service state; backlog not measured' -Status 'Warn' -Detail "$sysvolBacklog issue(s)" -EvidencePath $sysvolPath
     } else {
-        _Add-HTest -Title 'SYSVOL / DFSR backlog' -Subtitle 'DFSR backlog and content consistency between DCs' -Status 'Pass' -Detail 'No issues' -EvidencePath $sysvolPath
+        _Add-HTest -Title 'SYSVOL / DFSR availability' -Subtitle 'SYSVOL share reachability and DFSR service state; backlog not measured' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $sysvolPath
     }
 
     # ============================================================
@@ -394,6 +466,7 @@ Function Get-ADHealth {
     # authoritative external time source.
     # ============================================================
     $fsmoPath = Join-Path $rawDir 'health_fsmo.txt'
+    Write-ADAuditProgress -Activity 'AD Health' -Status 'FSMO role inventory' -PercentComplete 33
     $fsmoSb   = New-Object System.Text.StringBuilder
     $fsmoCritical = 0   # Critical findings -> Fail card
     $fsmoHigh     = 0   # High findings     -> Fail card
@@ -404,9 +477,8 @@ Function Get-ADHealth {
     [void]$fsmoSb.AppendLine('  Per-domain  : PDCEmulator, RIDMaster, InfrastructureMaster')
     [void]$fsmoSb.AppendLine('Co-locating roles on one DC (e.g. RID + PDC) is normal and supported,')
     [void]$fsmoSb.AppendLine('and is reported as informational only - never failed on its own.')
-    [void]$fsmoSb.AppendLine('A role is flagged when its holder is missing, unresolvable in DNS, an')
-    [void]$fsmoSb.AppendLine('RODC, unreachable on LDAP/ADWS, not replicating, or (forest-root PDC)')
-    [void]$fsmoSb.AppendLine('has no authoritative external time source.')
+    [void]$fsmoSb.AppendLine('Observed ownership, RODC, stale replication and time-source issues are findings.')
+    [void]$fsmoSb.AppendLine('Failed audit-host lookups and probes reduce coverage; they do not establish an outage.')
     [void]$fsmoSb.AppendLine('')
 
     $fsmoRoles      = New-Object System.Collections.Generic.List[object]
@@ -419,25 +491,29 @@ Function Get-ADHealth {
         $rootDomainName = [string]$fsmoForest.RootDomain
         foreach ($domName in $fsmoForest.Domains) {
             try {
-                $fsmoDom = Get-ADDomain -Server $domName -ErrorAction Stop
+                if ($script:ADAuditIsolatedClone) {
+                    if ($domName -ne $domain) { throw 'Other-domain FSMO inventory is not queried in isolated-clone mode.' }
+                    $fsmoDom = Get-ADDomain -ErrorAction Stop
+                } else { $fsmoDom = Get-ADDomain -Server $domName -ErrorAction Stop }
                 if ($domName -eq $rootDomainName) { $forestRootPdc = [string]$fsmoDom.PDCEmulator }
                 $fsmoRoles.Add([pscustomobject]@{ Scope=$domName; Role='PDCEmulator';          Holder=[string]$fsmoDom.PDCEmulator })          | Out-Null
                 $fsmoRoles.Add([pscustomobject]@{ Scope=$domName; Role='RIDMaster';            Holder=[string]$fsmoDom.RIDMaster })            | Out-Null
                 $fsmoRoles.Add([pscustomobject]@{ Scope=$domName; Role='InfrastructureMaster'; Holder=[string]$fsmoDom.InfrastructureMaster }) | Out-Null
             } catch {
                 [void]$fsmoSb.AppendLine("[!] Could not query domain '$domName' (PDC/RID/Infrastructure not validated): $($_.Exception.Message)")
-                _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title 'Per-domain FSMO holders could not be determined' -Evidence "Get-ADDomain -Server $domName failed: $($_.Exception.Message). PDC/RID/Infrastructure roles for this domain were not validated." -Source $fsmoPath
-                $fsmoWarn++
+                _HUnknown $fsmoPath $domName $_.Exception.Message
             }
         }
         $fsmoEnumerated = $true
     } catch {
         [void]$fsmoSb.AppendLine("[!] Could not query the forest for FSMO holders: $($_.Exception.Message)")
-        _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title 'FSMO role holders could not be enumerated' -Evidence "Get-ADForest failed: $($_.Exception.Message). FSMO inventory and validation were skipped - run from a domain-joined host with AD reachable." -Source $fsmoPath
-        $fsmoWarn++
+        _HUnknown $fsmoPath 'Forest FSMO inventory' $_.Exception.Message
     }
 
-    if ($fsmoEnumerated -and $fsmoRoles.Count -gt 0) {
+    if ($script:ADAuditIsolatedClone) {
+        _HUnknown $fsmoPath 'FSMO operational validation' 'Isolated-clone mode: role owners are snapshot inventory only; live holder reachability, replication and time-source validation are skipped.'
+        foreach ($roleRow in $fsmoRoles) { [void]$fsmoSb.AppendLine(("  {0} [{1}] -> {2} (snapshot inventory only)" -f $roleRow.Role,$roleRow.Scope,$roleRow.Holder)) }
+    } elseif ($fsmoEnumerated -and $fsmoRoles.Count -gt 0) {
         # --- Probe each unique holder once (a single DC can hold several roles) ---
         $holderProbe = @{}
         foreach ($h in (@($fsmoRoles | ForEach-Object { $_.Holder } | Where-Object { $_ } | Sort-Object -Unique))) {
@@ -445,20 +521,23 @@ Function Get-ADHealth {
             $found = $false; $isRodc = $null; $site = $null; $ipv4 = $null
             try {
                 $hdc = Get-ADDomainController -Identity $h -ErrorAction Stop
+                if (-not $hdc) { throw 'No DC object returned.' }
                 $found = $true; $isRodc = [bool]$hdc.IsReadOnly; $site = [string]$hdc.Site; $ipv4 = [string]$hdc.IPv4Address
             } catch {
                 try {
                     $hdc = Get-ADDomainController -Identity $h -Server $h -ErrorAction Stop
+                    if (-not $hdc) { throw 'No DC object returned.' }
                     $found = $true; $isRodc = [bool]$hdc.IsReadOnly; $site = [string]$hdc.Site; $ipv4 = [string]$hdc.IPv4Address
-                } catch { }
+                } catch { _HUnknown $fsmoPath $h ("DC object lookup failed: " + $_.Exception.Message) }
             }
             $dnsOk = $false
-            try { if (Resolve-DnsName -Name $h -Type A -ErrorAction Stop) { $dnsOk = $true } } catch { }
+            try { if (Resolve-DnsName -Name $h -ErrorAction Stop) { $dnsOk = $true } } catch { _HUnknown $fsmoPath $h ("DNS lookup failed from the audit host: " + $_.Exception.Message) }
             $ldapOk = $false; $adwsOk = $false
             if ($dnsOk -or $found) {
                 $ldapOk = _Test-DCTcp -Target $h -Port 389
                 $adwsOk = _Test-DCTcp -Target $h -Port 9389
             }
+            if (-not $ldapOk -or -not $adwsOk) { _HUnknown $fsmoPath $h 'LDAP or ADWS could not be reached from the audit host. This does not establish an FSMO outage.' }
             # $replOk: $true = fresh, $false = CONFIRMED stale (partners returned but
             # older than 24h), $null = could NOT verify (single DC with no partners,
             # or a cross-domain/RPC-restricted holder we cannot query). Only the
@@ -471,8 +550,13 @@ Function Get-ADHealth {
                     $stale = $false
                     foreach ($p in $rp) { $lastRepl = $p.LastReplicationSuccess; if (-not $lastRepl -or $lastRepl -lt (Get-Date).AddDays(-1)) { $stale = $true } }
                     $replOk = -not $stale
+                } elseif (@($fsmoForest.Domains).Count -eq 1 -and $dcs.Count -eq 1 -and $h -eq $dcs[0].HostName) {
+                    $replOk = $true
+                    [void]$fsmoSb.AppendLine("  $h has no partners in the verified single-DC forest; inbound partner checks are not applicable.")
+                } else {
+                    _HUnknown $fsmoPath $h 'No replication partner metadata returned; replication health could not be established.'
                 }
-            } catch { $replOk = $null }
+            } catch { $replOk = $null; _HUnknown $fsmoPath $h ("Replication metadata lookup failed: " + $_.Exception.Message) }
             $holderProbe[$hKey] = [pscustomobject]@{ Holder=$h; Found=$found; IsRODC=$isRodc; DNS=$dnsOk; LDAP=$ldapOk; ADWS=$adwsOk; ReplFresh=$replOk; LastRepl=$lastRepl; Site=$site; IPv4=$ipv4 }
         }
 
@@ -486,11 +570,6 @@ Function Get-ADHealth {
 
         foreach ($fr in $fsmoRoles) {
             $role = $fr.Role; $holder = $fr.Holder
-            # Reachability impact: PDC and RID are the highest-impact operations
-            # masters (password/lockout/time, and SID-pool issuance). The others
-            # degrade to Warning when unreachable.
-            $reachSev = if ($role -in @('PDCEmulator','RIDMaster')) { 'Critical' } else { 'Medium' }
-
             if (-not $holder) {
                 [void]$fsmoSb.AppendLine("  $role [$($fr.Scope)] -> HOLDER UNASSIGNED")
                 _Add-HFinding -Category 'FSMO' -Severity 'Critical' -Title "FSMO role $role has no holder" -Evidence "The $role role ($($fr.Scope)) has no assigned owner. Operations that depend on this role will fail until it is seized to a healthy writable DC." -Source $fsmoPath
@@ -509,16 +588,8 @@ Function Get-ADHealth {
                 [void]$fsmoSb.AppendLine(("      Read-only (RODC) : {0}" -f $pr.IsRODC))
                 [void]$fsmoSb.AppendLine(("      Replication fresh: {0} (last success: {1})" -f $pr.ReplFresh, $(if ($pr.LastRepl) { $pr.LastRepl } else { 'unknown' })))
 
-                if (-not $pr.DNS) {
-                    _Add-HFinding -Category 'FSMO' -Severity $reachSev -Title "FSMO holder does not resolve in DNS" -Evidence "The $role holder '$holder' ($($fr.Scope)) has no A record / DNS resolution failed. DCs and clients locate the role owner via DNS; an unresolvable holder makes $role unreachable. Common causes: the holder was decommissioned without transferring the role, or its DNS record was removed." -Source $fsmoPath
-                    if ($reachSev -eq 'Critical') { $fsmoCritical++ } else { $fsmoWarn++ }
-                } elseif (-not $pr.LDAP) {
-                    _Add-HFinding -Category 'FSMO' -Severity $reachSev -Title "FSMO holder unreachable on LDAP (389)" -Evidence "The $role holder '$holder' resolves in DNS but is not reachable on TCP 389 (LDAP) from $env:COMPUTERNAME. An offline/firewalled operations master blocks role-dependent operations (PDC: password changes, lockouts, GPO targeting, forest time; RID: new-object SID pools)." -Source $fsmoPath
-                    if ($reachSev -eq 'Critical') { $fsmoCritical++ } else { $fsmoWarn++ }
-                }
-                if ($pr.DNS -and -not $pr.ADWS) {
-                    _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title "FSMO holder unreachable on ADWS (9389)" -Evidence "The $role holder '$holder' is not reachable on TCP 9389 (Active Directory Web Services). FSMO operations themselves do not require ADWS, but PowerShell/RSAT management of this DC and discovery tooling will fail against it." -Source $fsmoPath
-                    $fsmoWarn++
+                if (-not $pr.DNS -or -not $pr.LDAP -or -not $pr.ADWS) {
+                    [void]$fsmoSb.AppendLine('      Audit-host connectivity is incomplete. Validate DNS and source/target firewall scope before concluding that role-dependent operations are affected.')
                 }
                 if ($pr.Found -and $pr.IsRODC -eq $true) {
                     _Add-HFinding -Category 'FSMO' -Severity 'Critical' -Title "Operations-master role held by a read-only DC (RODC)" -Evidence "The $role holder '$holder' is an RODC. RODCs hold a read-only replica and cannot perform operations-master writes - this role must be moved to a writable DC." -Source $fsmoPath
@@ -560,9 +631,8 @@ Function Get-ADHealth {
             try {
                 $pdcSource = (w32tm /query /source /computer:$forestRootPdc 2>&1 | Out-String).Trim()
                 [void]$fsmoSb.AppendLine("  w32tm source   : $pdcSource")
-                if ($pdcSource -match '(?i)0x800706BA|error|RPC server is unavailable') {
-                    _Add-HFinding -Category 'FSMO' -Severity 'Medium' -Title 'Forest-root PDC time source could not be queried' -Evidence "w32tm /query /source against the forest-root PDC emulator '$forestRootPdc' failed ($pdcSource). The forest-root PDC is the authoritative time source for the entire forest - confirm W32Time and RPC are reachable on it." -Source $fsmoPath
-                    $fsmoWarn++
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($pdcSource) -or $pdcSource -match '(?i)0x800706BA|error|RPC server is unavailable') {
+                    _HUnknown $fsmoPath $forestRootPdc ("Time source query failed: " + $pdcSource)
                 } elseif ($pdcSource -match '(?i)Local CMOS Clock|Free-running System Clock') {
                     _Add-HFinding -Category 'FSMO' -Severity 'High' -Title 'Forest-root PDC has no authoritative external time source' -Evidence "The forest-root PDC emulator '$forestRootPdc' is syncing from '$pdcSource' rather than an external/hardware NTP source. Every clock in the forest chains to this PDC; with no real upstream source the whole forest can drift and break Kerberos (auth fails at >5 min skew)." -Source $fsmoPath
                     $fsmoHigh++
@@ -571,6 +641,7 @@ Function Get-ADHealth {
                 }
             } catch {
                 [void]$fsmoSb.AppendLine("  w32tm source   : query failed ($($_.Exception.Message))")
+                _HUnknown $fsmoPath $forestRootPdc $_.Exception.Message
             }
             [void]$fsmoSb.AppendLine('')
         }
@@ -586,7 +657,7 @@ Function Get-ADHealth {
     } elseif ($fsmoWarn -gt 0) {
         _Add-HTest -Title 'FSMO role holders' -Subtitle $fsmoSubtitle -Status 'Warn' -Detail "$fsmoWarn issue(s)" -EvidencePath $fsmoPath
     } else {
-        _Add-HTest -Title 'FSMO role holders' -Subtitle $fsmoSubtitle -Status 'Pass' -Detail 'All FSMO holders healthy' -EvidencePath $fsmoPath
+        _Add-HTest -Title 'FSMO role holders' -Subtitle $fsmoSubtitle -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $fsmoPath
     }
 
     # ============================================================
@@ -597,23 +668,18 @@ Function Get-ADHealth {
     $ntdsIssues = 0
     foreach ($dc in $dcs) {
         $dcHost = $dc.HostName
+        Write-ADAuditProgress -Activity 'AD Health' -Status "NTDS storage: $dcHost" -PercentComplete 42
         [void]$ntdsSb.AppendLine("--- $dcHost ---")
         try {
-            $ntdsParams = Invoke-Command -ComputerName $dcHost -ScriptBlock {
-                $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
-                Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
-            } -ErrorAction Stop
-            $ditPath = $ntdsParams.'DSA Database file'
-            $logPath = $ntdsParams.'Database log files path'
+            $storage = Get-ADAuditNtdsStorage -ComputerName $dcHost
+            $ditPath = $storage.DatabasePath
+            $logPath = $storage.LogPath
             [void]$ntdsSb.AppendLine("ntds.dit: $ditPath")
             [void]$ntdsSb.AppendLine("logs:     $logPath")
+            $dbInfo = $storage.DatabaseBytes
+            $logVolFree = $storage.LogFreeBytes
 
-            $dbInfo = Invoke-Command -ComputerName $dcHost -ScriptBlock {
-                param($p) if ($p -and (Test-Path -LiteralPath $p)) { (Get-Item -LiteralPath $p).Length } else { -1 }
-            } -ArgumentList $ditPath -ErrorAction SilentlyContinue
-            $logVolFree = Invoke-Command -ComputerName $dcHost -ScriptBlock {
-                param($p) if ($p) { $drv = (Split-Path -Path $p -Qualifier); if ($drv) { (Get-PSDrive -Name $drv.TrimEnd(':') -ErrorAction SilentlyContinue).Free } else { -1 } } else { -1 }
-            } -ArgumentList $logPath -ErrorAction SilentlyContinue
+            if ($null -eq $dbInfo -or $null -eq $logVolFree -or $dbInfo -lt 0 -or $logVolFree -lt 0) { throw 'Database size or log-volume free space was unavailable.' }
 
             if ($dbInfo -ge 0)     { [void]$ntdsSb.AppendLine(("ntds.dit size: {0:N0} bytes" -f $dbInfo)) }
             if ($logVolFree -ge 0) { [void]$ntdsSb.AppendLine(("log volume free: {0:N0} bytes" -f $logVolFree)) }
@@ -622,15 +688,16 @@ Function Get-ADHealth {
                 [void]$ntdsSb.AppendLine("  [!] log volume has < 1 GB free")
             }
         } catch {
-            [void]$ntdsSb.AppendLine("Could not read NTDS info via remoting on ${dcHost}: $($_.Exception.Message)")
+            [void]$ntdsSb.AppendLine("Could not read NTDS info via local/CIM collection on ${dcHost}: $($_.Exception.Message)")
+            _HUnknown $ntdsPath $dcHost $_.Exception.Message
         }
     }
     Set-Content -LiteralPath $ntdsPath -Value $ntdsSb.ToString() -Encoding UTF8
     if ($ntdsIssues -gt 0) {
         _Add-HFinding -Category 'NTDS Database' -Severity 'High' -Title 'NTDS database log volume low on free space' -Evidence "$ntdsIssues DC(s) with low free space on the database log volume" -Source $ntdsPath
-        _Add-HTest -Title 'NTDS database' -Subtitle 'ntds.dit size, log volume free space, fragmentation' -Status 'Fail' -Detail "$ntdsIssues issue(s)" -EvidencePath $ntdsPath
+        _Add-HTest -Title 'NTDS database' -Subtitle 'ntds.dit size and log volume free space' -Status 'Fail' -Detail "$ntdsIssues issue(s)" -EvidencePath $ntdsPath
     } else {
-        _Add-HTest -Title 'NTDS database' -Subtitle 'ntds.dit size, log volume free space, fragmentation' -Status 'Pass' -Detail 'No issues' -EvidencePath $ntdsPath
+        _Add-HTest -Title 'NTDS database' -Subtitle 'ntds.dit size and log volume free space' -Status 'Pass' -Detail 'No low-space finding in collected evidence' -EvidencePath $ntdsPath
     }
 
     # ============================================================
@@ -642,20 +709,23 @@ Function Get-ADHealth {
     $samples = @()
     foreach ($dc in $dcs) {
         $dcHost = $dc.HostName
+        Write-ADAuditProgress -Activity 'AD Health' -Status "UTC clock sample: $dcHost" -PercentComplete 50
         try {
             # Bracket the remote call with local UTC readings and compare the remote clock
             # against the MIDPOINT of the local window. Comparing raw sequentially-sampled
-            # clocks would fold WinRM round-trip latency (and time blocked on a slow/hung DC)
+            # clocks would fold collection round-trip latency (and time blocked on a slow/hung DC)
             # into the result and report it as false clock skew.
             $localBefore = [DateTime]::UtcNow
-            $nowUtc = Invoke-Command -ComputerName $dcHost -ScriptBlock { (Get-Date).ToUniversalTime() } -ErrorAction Stop
+            $nowUtc = Get-ADAuditHostUtcTime -ComputerName $dcHost
             $localAfter = [DateTime]::UtcNow
+            if (($localAfter - $localBefore).TotalSeconds -gt 30) { throw 'Clock sample collection took more than 30 seconds; timing uncertainty is too high.' }
             $localMid = $localBefore.AddTicks([long]((($localAfter - $localBefore).Ticks) / 2))
             $offset = ($nowUtc - $localMid).TotalSeconds
             $samples += [pscustomobject]@{ Host = $dcHost; Offset = $offset }
             [void]$timeSb.AppendLine(("{0} UTC: {1:o}  (offset vs auditor host: {2:N1} sec)" -f $dcHost, $nowUtc, $offset))
         } catch {
             [void]$timeSb.AppendLine("$dcHost UTC: unavailable ($($_.Exception.Message))")
+            _HUnknown $timePath $dcHost $_.Exception.Message
         }
     }
     if ($samples.Count -ge 2) {
@@ -667,12 +737,13 @@ Function Get-ADHealth {
             }
         }
     }
+    if ($samples.Count -lt 2) { _HUnknown $timePath 'DC clock comparison' 'Fewer than two DC clock samples; pairwise clock agreement cannot be assessed.' }
     Set-Content -LiteralPath $timePath -Value $timeSb.ToString() -Encoding UTF8
     if ($timeIssues -gt 0) {
         _Add-HFinding -Category 'Time Sync' -Severity 'High' -Title 'DC clock skew greater than 5 minutes (Kerberos breaks)' -Evidence "Skewed pairs: $timeIssues" -Source $timePath
         _Add-HTest -Title 'Time synchronization' -Subtitle 'Pairwise skew between DCs (Kerberos breaks at >5 min skew)' -Status 'Fail' -Detail "$timeIssues skewed pair(s)" -EvidencePath $timePath
     } else {
-        _Add-HTest -Title 'Time synchronization' -Subtitle 'Pairwise skew between DCs (Kerberos breaks at >5 min skew)' -Status 'Pass' -Detail 'No issues' -EvidencePath $timePath
+        _Add-HTest -Title 'Time synchronization' -Subtitle 'Pairwise skew between DCs (Kerberos breaks at >5 min skew)' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $timePath
     }
 
     # ============================================================
@@ -683,8 +754,8 @@ Function Get-ADHealth {
     # ============================================================
     $svcPath = Join-Path $rawDir 'health_dc_services.txt'
     $svcSb   = New-Object System.Text.StringBuilder
-    $svcCritical = @('NTDS','Netlogon','KDC','DNS','DFSR','ADWS','W32Time')
-    $svcOptional = @('KPSSVC')
+    $svcCritical = @('NTDS','Netlogon','KDC','DFSR','ADWS','W32Time')
+    $svcOptional = @('KPSSVC','DNS')
     $svcAllNames = $svcCritical + $svcOptional
     $svcCriticalIssues = 0
     $svcInfoIssues     = 0
@@ -692,20 +763,25 @@ Function Get-ADHealth {
         $dcHost = $dc.HostName
         [void]$svcSb.AppendLine("--- $dcHost ---")
         foreach ($s in $svcAllNames) {
+            Write-ADAuditProgress -Activity 'AD Health' -Status "Service $s on $dcHost" -PercentComplete 58
             try {
-                $svc = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $dcHost -Filter "Name='$s'" -ErrorAction SilentlyContinue
+                $svc = Get-ADAuditCimInstance -ClassName Win32_Service -ComputerName $dcHost -Filter "Name='$s'" -ErrorAction Stop
                 if (-not $svc) {
                     [void]$svcSb.AppendLine("  $s : NOT INSTALLED")
                     if ($s -in $svcCritical) {
                         # DFSR may be replaced by NTFRS on legacy domains; tolerate that case
-                        if ($s -ne 'DFSR') { $svcCriticalIssues++ }
+                        if ($s -ne 'DFSR') {
+                            $svcCriticalIssues++
+                            _Add-HFinding -Category 'DC Services' -Severity 'High' -Title 'Required AD service missing' -Evidence "DC $dcHost service $s was not returned by a successful service query." -Source $svcPath
+                        }
                     }
                     continue
                 }
                 $state = [string]$svc.State
                 [void]$svcSb.AppendLine("  $s : $state")
                 if ($state -ne 'Running') {
-                    if ($s -in $svcOptional) {
+                    # DNS may be absent, but an installed DNS role must run.
+                    if ($s -eq 'KPSSVC') {
                         $svcInfoIssues++
                         _Add-HFinding -Category 'DC Services' -Severity 'Info' -Title 'Optional AD service not running (informational)' -Evidence "DC $dcHost service $s state: $state - $s is optional and frequently left stopped." -Source $svcPath
                     } else {
@@ -715,6 +791,7 @@ Function Get-ADHealth {
                 }
             } catch {
                 [void]$svcSb.AppendLine("  $s : check failed - $($_.Exception.Message)")
+                _HUnknown $svcPath "$dcHost/$s" $_.Exception.Message
             }
         }
     }
@@ -724,7 +801,7 @@ Function Get-ADHealth {
     } elseif ($svcInfoIssues -gt 0) {
         _Add-HTest -Title 'Core AD services' -Subtitle 'NTDS, Netlogon, KDC, DNS, DFSR, ADWS, W32Time, KPSSVC' -Status 'Pass' -Detail 'No critical issues (KPSSVC info only)' -EvidencePath $svcPath
     } else {
-        _Add-HTest -Title 'Core AD services' -Subtitle 'NTDS, Netlogon, KDC, DNS, DFSR, ADWS, W32Time, KPSSVC' -Status 'Pass' -Detail 'No issues' -EvidencePath $svcPath
+        _Add-HTest -Title 'Core AD services' -Subtitle 'NTDS, Netlogon, KDC, DNS, DFSR, ADWS, W32Time, KPSSVC' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $svcPath
     }
 
     # ============================================================
@@ -745,9 +822,12 @@ Function Get-ADHealth {
         $dcHost = $dc.HostName
         [void]$evtSb.AppendLine("--- $dcHost ---")
         foreach ($logName in $badIds.Keys) {
+            Write-ADAuditProgress -Activity 'AD Health' -Status "Event log $logName on $dcHost" -PercentComplete 67
             $ids = $badIds[$logName]
             try {
-                $hits = Get-WinEvent -ComputerName $dcHost -FilterHashtable @{ LogName = $logName; Id = $ids; StartTime = $cutoff } -ErrorAction Stop
+                $eventParams = @{FilterHashtable=@{ LogName = $logName; Id = $ids; StartTime = $cutoff }; ErrorAction='Stop'}
+                if (-not (Test-ADAuditLocalComputer $dcHost)) { $eventParams.ComputerName = $dcHost }
+                $hits = Get-WinEvent @eventParams
                 if ($hits) {
                     [void]$evtSb.AppendLine("  ${logName}: $($hits.Count) bad event(s)")
                     $evtIssues += $hits.Count
@@ -761,6 +841,7 @@ Function Get-ADHealth {
                 if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
                     [void]$evtSb.AppendLine("  ${logName}: query failed - $($_.Exception.Message)")
                     $evtQueryFailures++
+                    _HUnknown $evtPath "$dcHost/$logName" $_.Exception.Message
                 }
             }
         }
@@ -772,19 +853,20 @@ Function Get-ADHealth {
     } elseif ($evtQueryFailures -gt 0) {
         _Add-HTest -Title 'Event log scrape (72h)' -Subtitle 'Directory Service / DNS / DFSR / System logs, known bad IDs' -Status 'Warn' -Detail "$evtQueryFailures log query failure(s)" -EvidencePath $evtPath
     } else {
-        _Add-HTest -Title 'Event log scrape (72h)' -Subtitle 'Directory Service / DNS / DFSR / System logs, known bad IDs' -Status 'Pass' -Detail 'No issues' -EvidencePath $evtPath
+        _Add-HTest -Title 'Event log scrape (72h)' -Subtitle 'Directory Service / DNS / DFSR / System logs, known bad IDs' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $evtPath
     }
 
     # ============================================================
     # 9) Sites and subnets
     # ============================================================
     $sitePath = Join-Path $rawDir 'health_sites_subnets.txt'
+    Write-ADAuditProgress -Activity 'AD Health' -Status 'Site GC inventory' -PercentComplete 75
     $siteSb   = New-Object System.Text.StringBuilder
     $siteIssues = 0
     try {
         $sites = Get-ADReplicationSite -Filter * -ErrorAction Stop
         foreach ($site in $sites) {
-            $gcs = $dcs | Where-Object { $_.IsGlobalCatalog -and $_.Site -eq $site.Name }
+            $gcs = $inventoryDcs | Where-Object { $_.IsGlobalCatalog -and $_.Site -eq $site.Name }
             if (-not $gcs) {
                 [void]$siteSb.AppendLine("Site $($site.Name): NO GC present")
                 $siteIssues++
@@ -792,19 +874,20 @@ Function Get-ADHealth {
                 [void]$siteSb.AppendLine("Site $($site.Name): $($gcs.Count) GC(s)")
             }
         }
-    } catch { [void]$siteSb.AppendLine("Site enumeration failed: $($_.Exception.Message)") }
+    } catch { _HUnknown $sitePath 'Sites' $_.Exception.Message; [void]$siteSb.AppendLine("Site enumeration failed: $($_.Exception.Message)") }
     Set-Content -LiteralPath $sitePath -Value $siteSb.ToString() -Encoding UTF8
     if ($siteIssues -gt 0) {
         _Add-HFinding -Category 'Sites/Subnets' -Severity 'Medium' -Title 'Site without a Global Catalog' -Evidence "Sites lacking GC: $siteIssues" -Source $sitePath
-        _Add-HTest -Title 'Sites and subnets' -Subtitle 'GC placement, NETLOGON.log unmapped subnets' -Status 'Warn' -Detail "$siteIssues site(s)" -EvidencePath $sitePath
+        _Add-HTest -Title 'Site GC placement' -Subtitle 'Global Catalog placement; subnet mapping not assessed' -Status 'Warn' -Detail "$siteIssues site(s)" -EvidencePath $sitePath
     } else {
-        _Add-HTest -Title 'Sites and subnets' -Subtitle 'GC placement, NETLOGON.log unmapped subnets' -Status 'Pass' -Detail 'No issues' -EvidencePath $sitePath
+        _Add-HTest -Title 'Site GC placement' -Subtitle 'Global Catalog placement; subnet mapping not assessed' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $sitePath
     }
 
     # ============================================================
     # 10) AD Recycle Bin
     # ============================================================
     $rbPath = Join-Path $rawDir 'health_recyclebin.txt'
+    Write-ADAuditProgress -Activity 'AD Health' -Status 'Recycle Bin configuration' -PercentComplete 83
     $rbSb   = New-Object System.Text.StringBuilder
     $rbIssue = $false
     try {
@@ -816,19 +899,21 @@ Function Get-ADHealth {
         if (-not $enabled) { $rbIssue = $true }
     } catch {
         [void]$rbSb.AppendLine("Recycle Bin probe failed: $($_.Exception.Message)")
+        _HUnknown $rbPath 'Recycle Bin' $_.Exception.Message
     }
     Set-Content -LiteralPath $rbPath -Value $rbSb.ToString() -Encoding UTF8
     if ($rbIssue) {
         _Add-HFinding -Category 'Recycle Bin' -Severity 'Low' -Title 'AD Recycle Bin not enabled' -Evidence 'Restoring deleted AD objects with full attributes will not be possible.' -Source $rbPath
-        _Add-HTest -Title 'AD Recycle Bin' -Subtitle 'Lifetime alignment, recoverable backlog' -Status 'Warn' -Detail '1 Low' -EvidencePath $rbPath
+        _Add-HTest -Title 'AD Recycle Bin' -Subtitle 'Forest Recycle Bin enablement' -Status 'Warn' -Detail '1 Low' -EvidencePath $rbPath
     } else {
-        _Add-HTest -Title 'AD Recycle Bin' -Subtitle 'Lifetime alignment, recoverable backlog' -Status 'Pass' -Detail 'No issues' -EvidencePath $rbPath
+        _Add-HTest -Title 'AD Recycle Bin' -Subtitle 'Forest Recycle Bin enablement' -Status 'Pass' -Detail 'No issues observed in collected evidence' -EvidencePath $rbPath
     }
 
     # ============================================================
     # 11) Group Hygiene
     # ============================================================
     $ghPath = Join-Path $rawDir 'health_group_hygiene.txt'
+    Write-ADAuditProgress -Activity 'AD Health' -Status 'Group inventory' -PercentComplete 92
     $ghSb   = New-Object System.Text.StringBuilder
     $ghTotal = 0
     $ghEmpty = 0
@@ -849,11 +934,12 @@ Function Get-ADHealth {
         [void]$ghSb.AppendLine("Total groups: $ghTotal | Empty: $ghEmpty | Excluded built-in primaryGroupID-backed: $ghBuiltinPg")
     } catch {
         [void]$ghSb.AppendLine("Group enumeration failed: $($_.Exception.Message)")
+        _HUnknown $ghPath 'Groups' $_.Exception.Message
     }
     Set-Content -LiteralPath $ghPath -Value $ghSb.ToString() -Encoding UTF8
     if ($ghEmpty -gt 0) {
         $sev = if ($ghEmpty -gt 100) { 'Medium' } else { 'Low' }
-        _Add-HFinding -Category 'Group Hygiene' -Severity $sev -Title 'Empty security groups detected' -Evidence "Total groups: $ghTotal | Empty: $ghEmpty | Excluded built-in primaryGroupID-backed: $ghBuiltinPg" -Source $ghPath
+        _Add-HFinding -Category 'Group Hygiene' -Severity $sev -Title 'Empty groups for lifecycle review' -Evidence "Total groups: $ghTotal | Empty: $ghEmpty | Excluded built-in primaryGroupID-backed: $ghBuiltinPg" -Source $ghPath
         _Add-HTest -Title 'Group hygiene' -Subtitle 'Empty groups, primaryGroupID-backed exclusion' -Status 'Warn' -Detail "$ghEmpty empty" -EvidencePath $ghPath
     } else {
         _Add-HTest -Title 'Group hygiene' -Subtitle 'Empty groups, primaryGroupID-backed exclusion' -Status 'Pass' -Detail 'No empty groups' -EvidencePath $ghPath
@@ -863,7 +949,14 @@ Function Get-ADHealth {
     # Build AD_Health.html
     # ============================================================
     $htmlPath = Join-Path $htmlDir 'AD_Health.html'
+    if ($findings.Count -gt 0) {
+        $findings | Export-Csv -LiteralPath (Join-Path $rawDir 'health_findings.csv') -NoTypeInformation -Encoding UTF8
+    } else {
+        '"Category","Severity","Title","Evidence","Score","Source"' | Set-Content -LiteralPath (Join-Path $rawDir 'health_findings.csv') -Encoding UTF8
+    }
+    $tests | Export-Csv -LiteralPath (Join-Path $rawDir 'health_tests.csv') -NoTypeInformation -Encoding UTF8
     Write-ADHealthReport -OutputPath $htmlPath -Findings $findings -Tests $tests -Domain $domain -RunBy $runBy
+    Write-ADAuditProgress -Activity 'AD Health' -Status 'Health evidence written' -PercentComplete 100 -Completed
     Write-Both "    [+] AD Health report saved to HTML Reports\AD_Health.html"
 }
 
@@ -871,8 +964,8 @@ Function Write-ADHealthReport {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)][string]$OutputPath,
-        [Parameter(Mandatory=$true)][System.Collections.Generic.List[object]]$Findings,
-        [Parameter(Mandatory=$true)][System.Collections.Generic.List[object]]$Tests,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Tests,
         [string]$Domain,
         [string]$RunBy
     )
@@ -894,10 +987,12 @@ Function Write-ADHealthReport {
     $score = (25 * $cCrit) + (12 * $cHigh) + (5 * $cMed) + (1 * $cLow)
     if ($score -gt 100) { $score = 100 }
     $totalScore = 100 - $score   # higher is better display
+    $incompleteTests = @($Tests | Where-Object { $_.Status -in @('Partial','NotAssessed','Skipped','NotRun') -or $_.NotAssessedCount -gt 0 }).Count
+    if ($incompleteTests -gt 0 -or $Tests.Count -eq 0) { $totalScore = 'N/A' }
 
     $bandLabel = 'Healthy'
     $bandColor = '#2e7d32'
-    $bandText  = 'No major operational issues detected from this run.'
+    $bandText  = 'No operational findings in the collected evidence.'
     if ($cCrit -gt 0) {
         $bandLabel = 'Critical'; $bandColor = '#c62828'; $bandText = 'Critical issues detected - act now.'
     } elseif ($cHigh -gt 0 -or $score -ge 60) {
@@ -906,6 +1001,10 @@ Function Write-ADHealthReport {
         $bandLabel = 'Medium'; $bandColor = '#d97706'; $bandText = 'Some configuration drift or operational warnings - plan remediation.'
     } elseif ($cLow -gt 0) {
         $bandLabel = 'Low'; $bandColor = '#65a30d'; $bandText = 'Minor advisories only - address during routine maintenance.'
+    }
+    if ($incompleteTests -gt 0 -or $Tests.Count -eq 0) {
+        if ($totalFindings -eq 0) { $bandLabel = 'Incomplete'; $bandColor = '#64748b' }
+        $bandText += " Assessment incomplete: $incompleteTests test(s) have collection gaps. Unchecked targets are unknown, not healthy."
     }
 
     # Needle angle: 0=healthy (left), 100=critical (right)
@@ -921,6 +1020,9 @@ Function Write-ADHealthReport {
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $nxStr = $needleX.ToString('F2', $invariant)
     $nyStr = $needleY.ToString('F2', $invariant)
+    $gaugeScore = $score
+    $gaugeNeedle = "<line class='hg-needle' x1='200' y1='180' x2='$nxStr' y2='$nyStr'/><circle class='hg-hub' cx='200' cy='180' r='9'/>"
+    if ($incompleteTests -gt 0 -or $Tests.Count -eq 0) { $gaugeScore = 'N/A'; $gaugeNeedle = '' }
 
     # Pass/Warn/Fail counts
     $tPass = ($Tests | Where-Object { $_.Status -eq 'Pass' }).Count
@@ -928,10 +1030,12 @@ Function Write-ADHealthReport {
     $tFail = ($Tests | Where-Object { $_.Status -eq 'Fail' }).Count
     $tSkip = ($Tests | Where-Object { $_.Status -eq 'Skipped' }).Count
     $tNone = ($Tests | Where-Object { $_.Status -eq 'NotRun' }).Count
+    $tPartial = ($Tests | Where-Object { $_.Status -in @('Partial','NotAssessed') }).Count
     $tTotal = $Tests.Count
 
     $css = Get-ADAuditReportCss
     $nav = Get-ADAuditPrimaryNav -Active 'health'
+    $cloneNotice = Get-ADAuditCloneNotice
 
     $themeBlock = @'
 <style>
@@ -1032,12 +1136,11 @@ html[data-theme="light"] {
     </defs>
     <path class='hg-arc hg-track' d='M 70 180 A 130 130 0 0 1 330 180'/>
     <path class='hg-arc' d='M 70 180 A 130 130 0 0 1 330 180' stroke='url(#hg-grad)'/>
-    <text class='hg-tick' x='42'  y='205' text-anchor='middle'>Healthy</text>
-    <text class='hg-tick' x='200' y='34'  text-anchor='middle'>Medium</text>
-    <text class='hg-tick' x='358' y='205' text-anchor='middle'>Critical</text>
-    <line class='hg-needle' x1='200' y1='180' x2='$nxStr' y2='$nyStr'/>
-    <circle class='hg-hub' cx='200' cy='180' r='9'/>
-    <text class='hg-score'  x='200' y='148'>$score</text>
+    <text class='hg-tick' x='42'  y='205' text-anchor='middle'>0</text>
+    <text class='hg-tick' x='200' y='34'  text-anchor='middle'>50</text>
+    <text class='hg-tick' x='358' y='205' text-anchor='middle'>100</text>
+    $gaugeNeedle
+    <text class='hg-score'  x='200' y='148'>$gaugeScore</text>
     <text class='hg-suffix' x='200' y='168'>RISK / 100</text>
   </svg>
   <div class='hg-summary'>
@@ -1051,7 +1154,7 @@ html[data-theme="light"] {
       <div style='background:rgba(101,163,13,.08)'><span class='num' style='color:#65a30d'>$cLow</span><span class='lbl'>Low</span></div>
     </div>
     <div class='hg-formula'>
-      Score = <code>min(100, 25*Critical + 12*High + 5*Medium + 1*Low)</code>. Computed across $tTotal Health checks. Information findings are excluded.
+      Index = <code>min(100, 25*Critical + 12*High + 5*Medium + 1*Low)</code>. Information findings are excluded; the index is unavailable when collection is incomplete. The headline reflects the highest finding severity as well as the index.
     </div>
   </div>
 </div>
@@ -1083,6 +1186,7 @@ html[data-theme="light"] {
             'Fail'    { 'ht-fail';    break }
             'Warn'    { 'ht-warn';    break }
             'Pass'    { 'ht-pass';    break }
+            'Partial' { 'ht-skipped'; break }
             'Skipped' { 'ht-skipped'; break }
             default   { 'ht-notrun' }
         }
@@ -1121,6 +1225,7 @@ html[data-theme="light"] {
     <span style='background:rgba(220,38,38,.15);color:#dc2626'>$tFail Fail</span>
     <span style='background:rgba(107,114,128,.15);color:#6b7280'>$tSkip Skipped</span>
     <span style='background:rgba(156,163,175,.15);color:#9ca3af'>$tNone Not run</span>
+    <span style='background:rgba(107,114,128,.15);color:#64748b'>$tPartial Incomplete</span>
   </div>
   <div class='ht-grid'>
 $($testRowsSb.ToString())
@@ -1184,9 +1289,9 @@ $($testRowsSb.ToString())
         }
         'DC interconnect' = @{
             Summary    = 'Verifies every DC in the domain is actually reachable on the network from this host. For each DC: DNS A-record, TCP 389 (LDAP), TCP 445 (SMB), and last successful replication time via Get-ADReplicationPartnerMetadata.'
-            WhyMatters = 'A DC that exists in AD but is not reachable on the wire is a partition: cloned/restored to an isolated network, firewalled off, powered off, or decommissioned without being removed from AD. Replication silently diverges, password changes go missing, FSMO transfers fail, and clients in different segments authenticate against different copies of the directory. Severity scales with how much redundancy is left - a 2-DC domain with one DC isolated has zero failover and is Critical; a 4-DC domain with one isolated is Medium for the domain but still Critical for that specific DC.'
+            WhyMatters = 'These probes establish reachability only from the auditing host. Management network segmentation may intentionally block them. Replication health must be established from partner metadata, replication diagnostics and the actual DC-to-DC paths.'
             LookFor    = 'In the evidence file, look at the "Isolated: True" lines and the "Replication fresh" column. An isolated DC has both LDAP and SMB unreachable. A reachable DC with stale replication (LastReplicationSuccess > 1 day) is also a problem, just a different one.'
-            HowToFix   = 'For each isolated DC: 1) Verify the DC is supposed to exist - if it was decommissioned, demote it cleanly with `dcpromo /forceremoval` (last resort) or use `ntdsutil "metadata cleanup"` to remove the AD record from a healthy DC. 2) If it should be online, restore network reachability (firewall rules, routing, VPN, VLAN), then verify with `Test-NetConnection <DC> -Port 389/445` from each remaining DC. 3) Once reachable, force convergence with `repadmin /syncall /AdePq`. 4) For cloned VMs put on isolated networks: do not let them rejoin the production domain - clones must be either properly demoted or fully isolated (different domain), otherwise USN rollback can corrupt the directory.'
+            HowToFix   = 'Validate the expected management-host and DC-to-DC paths with the AD and network owners. Inspect replication diagnostics on a reachable DC. Do not demote a DC, clean metadata or seize roles solely because an audit-host TCP probe failed.'
             RerunCmd   = 'foreach ($dc in (Get-ADDomainController -Filter *)) { [pscustomobject]@{ DC=$dc.HostName; LDAP=(Test-NetConnection $dc.HostName -Port 389 -InformationLevel Quiet); SMB=(Test-NetConnection $dc.HostName -Port 445 -InformationLevel Quiet) } }'
         }
         'DC diagnostics (dcdiag)' = @{
@@ -1196,8 +1301,8 @@ $($testRowsSb.ToString())
             HowToFix   = 'Each test has its own remediation. Common patterns: missing SRV records (re-register with `nltest /dsregdns`), Netlogon/Kdc stopped (`Start-Service Netlogon,Kdc`), FSMO holder offline (transfer or seize roles), DNS not resolving the DC FQDN, or > 5 min time skew (see Time synchronization).'
             RerunCmd   = 'dcdiag /v /s:<DC-FQDN> /test:Replications /test:Advertising /test:FsmoCheck /test:NetLogons /test:SysVolCheck'
         }
-        'SYSVOL / DFSR backlog' = @{
-            Summary    = 'Verifies the SYSVOL share is reachable on each DC and the DFSR (or NTFRS) replication service is running.'
+        'SYSVOL / DFSR availability' = @{
+            Summary    = 'Verifies the SYSVOL share is reachable on each DC and the DFSR service state where present. This check does not measure backlog or file consistency.'
             WhyMatters = 'SYSVOL hosts every GPO and login script. If DFSR stops or backlog builds, GPO content drifts between DCs - clients get inconsistent policy depending on which DC they bind to.'
             LookFor    = "In the evidence file: 'SYSVOL share NOT reachable' lines, DFSR service state != Running, or NTFRS service in use on a domain that should have migrated."
             HowToFix   = 'Start DFSR (`Start-Service DFSR`). Inspect backlog cross-DC: `dfsrdiag backlog /sm:<source> /rm:<receiving> /rfn:"SYSVOL Share"`. Compare DFS Replication event log on each DC. If migration from FRS is incomplete, complete it before further changes.'
@@ -1215,19 +1320,19 @@ $($testRowsSb.ToString())
             WhyMatters = 'A full log volume halts AD writes - clients cannot authenticate, Group Policy cannot apply, and replication backs up. ntds.dit growth past expected baselines is also an early signal of an unbounded object explosion.'
             LookFor    = 'In the evidence file: log-volume free space below 1 GB, or ntds.dit size that has grown unexpectedly between runs.'
             HowToFix   = 'Free space on the log volume (clear stale logs from other apps, expand the volume) or move the database log path to a larger volume after a maintenance window. Schedule offline defrag (`ntdsutil "activate instance ntds" "files" "compact to <path>"`) only during planned downtime.'
-            RerunCmd   = 'Invoke-Command -ComputerName <DC> -ScriptBlock { Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters"; Get-PSDrive | Where-Object Free -lt 1GB }'
+            RerunCmd   = '.\AdAudit-PS7.ps1 -adhealth  # local reads on the DC; CIM/DCOM for remote storage'
         }
         'Time synchronization' = @{
             Summary    = 'Compares wall-clock UTC across all DCs and reports any pair drifted more than 5 minutes.'
             WhyMatters = 'Kerberos ticket validation requires < 5 min skew between client and KDC. Once a DC drifts past that window, clients silently fail to authenticate and authentication failures get blamed on credentials.'
-            LookFor    = 'In the evidence file: "Skew ... > 300 sec" lines and DCs that returned "unavailable" (likely WinRM blocked).'
+            LookFor    = 'In the evidence file: "Skew ... > 300 sec" lines and DCs that returned "unavailable". Remote clock samples use CIM/DCOM; missing samples do not establish clock drift.'
             HowToFix   = 'On the PDC emulator, point W32Time at an external authoritative source: `w32tm /config /manualpeerlist:"time.windows.com,0x9" /syncfromflags:manual /reliable:yes /update; Restart-Service W32Time`. On other DCs, force resync: `w32tm /resync /rediscover`.'
-            RerunCmd   = 'Invoke-Command -ComputerName <each-DC> -ScriptBlock { (Get-Date).ToUniversalTime() }; w32tm /monitor'
+            RerunCmd   = '.\AdAudit-PS7.ps1 -adhealth  # local UTC or the Win32_UTCTime provider over CIM/DCOM'
         }
         'Core AD services' = @{
             Summary    = 'Verifies NTDS, Netlogon, KDC, DNS, DFSR, ADWS, W32Time and KPSSVC on every DC. KPSSVC is reported as informational only - it is optional and frequently left stopped on purpose.'
             WhyMatters = 'Each service maps to a discrete capability: NTDS = directory engine, Netlogon = domain auth + secure channels, KDC = Kerberos issuer, DNS = name resolution that AD itself depends on, DFSR = SYSVOL replication, ADWS = PowerShell/RSAT module endpoint, W32Time = Kerberos clock.'
-            LookFor    = "In the evidence file: lines that read '`<service>` : Stopped' or '`<service>` : NOT INSTALLED' (DFSR vs NTFRS migration is OK; missing NTDS/Netlogon/KDC/DNS/ADWS is not)."
+            LookFor    = "In the evidence file: lines that read '`<service>` : Stopped' or '`<service>` : NOT INSTALLED' (DFSR vs NTFRS migration is OK; missing NTDS/Netlogon/KDC/ADWS needs investigation; DNS is an optional role)."
             HowToFix   = 'Start the failed service: `Start-Service <Name> -ComputerName <DC>`. If it will not stay running, check the System and Directory Service event logs on that DC for the underlying error. KPSSVC stopped is expected unless you are intentionally publishing the KDC Proxy.'
             RerunCmd   = "Get-Service NTDS,Netlogon,KDC,DNS,DFSR,ADWS,W32Time,KPSSVC -ComputerName <DC>"
         }
@@ -1238,11 +1343,11 @@ $($testRowsSb.ToString())
             HowToFix   = 'Resolution depends on the ID. 5774/5781 = SRV/A record registration broken (`nltest /dsregdns`), 1311 = KCC routing problem (review site links), 4015 = DNS service-side error (often AD-integrated zone replication), 40961 = LSASS could not establish secure channel (Netlogon / DNS).'
             RerunCmd   = "Get-WinEvent -ComputerName <DC> -FilterHashtable @{ LogName='Directory Service','DNS Server','DFS Replication','System'; Id=1311,1865,1925,4000,4013,4015,5008,5014,5016,5774,5781,40961; StartTime=(Get-Date).AddHours(-72) }"
         }
-        'Sites and subnets' = @{
+        'Site GC placement' = @{
             Summary    = 'Walks every AD replication site and confirms at least one Global Catalog DC is present. Sites without a GC are flagged.'
             WhyMatters = 'Universal-group expansion at logon, cross-domain searches and Exchange/Outlook lookups all require a GC. Without a local GC, that traffic falls back across site links and adds latency to every authentication.'
             LookFor    = 'In the evidence file: lines that read "Site `<name>`: NO GC present". Cross-check with subnet coverage (NETLOGON.log on a DC tells you which subnets have no site mapping).'
-            HowToFix   = 'Promote a DC at the affected site to GC: `Set-ADDomainController -Identity <DC> -GlobalCatalog $true`. Add any unmapped subnets to AD Sites and Services.'
+            HowToFix   = 'Review local GC requirements, universal group membership caching and connectivity to other sites. Where a local GC is required, enable Global Catalog on the NTDS Settings object in Active Directory Sites and Services and verify replication.'
             RerunCmd   = 'Get-ADReplicationSite -Filter * | ForEach-Object { [pscustomobject]@{ Site = $_.Name; GCs = (Get-ADDomainController -Filter * | Where-Object { $_.IsGlobalCatalog -and $_.Site -eq $_.Name }).Count } }'
         }
         'AD Recycle Bin' = @{
@@ -1267,6 +1372,7 @@ $($testRowsSb.ToString())
             'Fail'    { 'td-fail';    break }
             'Warn'    { 'td-warn';    break }
             'Pass'    { 'td-pass';    break }
+            'Partial' { 'td-skip'; break }
             'Skipped' { 'td-skip';    break }
             default   { 'td-notrun' }
         }
@@ -1428,6 +1534,7 @@ $css
 <div class="container">
 $themeBlock
 $nav
+$cloneNotice
 $heroHtml
 $gaugeCss
 $gaugeHtml

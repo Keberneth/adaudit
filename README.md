@@ -16,11 +16,11 @@ Checks\Invoke-LateralMovementCheck.ps1  Lateral movement analysis (self-containe
 Password Audit\             Invoke-PwnedPasswordCheck.ps1, Invoke-SamePasswordCheck.ps1, PasswordAuditCommon.psm1 (separate from the audit run)
 ```
 
-Always copy the whole folder. The runner and the GUI refuse to start when `Library\` or `Checks\` are missing. Results are written to `<COMPUTERNAME>\` next to the scripts.
+Always copy the whole folder. The runner and the GUI refuse to start when `Library\` or `Checks\` are missing. Each standard audit writes to `<COMPUTERNAME>\yyyy-MM-dd_HH-mm-ss\` next to the scripts, using the audit host's local time (for example, `2026-10-25_11-28-24`). A collision adds `_02`, `_03`, etc.; existing evidence is never reused. The unique run ID, local time with UTC offset, UTC time, and time-zone ID are retained in the run metadata.
 
 ## Password Audit
 Two separate scripts in `Password Audit\` check accounts with the same NTLM hash (same passwords) and check Active Directory account NTLM hashes against the
-https://api.pwnedpasswords.com service using a k-anonymity range query. They need replication rights (DSInternals `Get-ADReplAccount`) and are therefore **never part of `-all`**: start them from the GUI (section "Password Audit") or directly:
+https://api.pwnedpasswords.com service using a k-anonymity range query. These scripts remain a **separate paid add-on**, never part of `-all`, with their own replication permissions and connectivity requirements. The existing DSInternals password-quality and duplicate-password checks remain in the standard audit and also require replication rights. Start the add-on from the GUI (section "Password Audit") or directly:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
@@ -47,6 +47,19 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 This runs every available audit check and produces a full security report. It is the recommended way to use this tool.
 
+The console shows how many checks were selected out of the available checks, how many were skipped, and the current check number. Overall progress counts completed checks; it is not an estimate of remaining time. Within a check, phases with known totals show counts and percentages. Directory requests and other operations without a known total show their current stage instead of a made-up percentage. Progress is cleared on success or failure, and report generation has its own stages. A blocking external command may not emit updates until it returns.
+
+### Auditing an isolated DC clone
+
+For an isolated copy of a domain controller, select **Isolated DC clone** in the GUI or run:
+
+```powershell
+.\AdAudit-PS7.ps1 -all -IsolatedClone
+# If the actual clone date is known, also supply -SnapshotDate yyyy-MM-dd.
+```
+
+This mode identifies the reports as an assessment of an isolated copy. It skips remote DC operational probes and production replication validation, retains local and directory-based checks, and records excluded coverage. It is not a network-disconnection mechanism: directory access and any separately selected password breach lookup still need their normal connectivity. `-SnapshotDate` is optional context; it does not rewind the audit clock. On an old clone, inactivity, password age, recent changes, and other time-based observations may reflect the age of the copy. Verify them against production before remediation. These reports do not establish the current production environment's health or risk.
+
 **Run a single check** either through the runner or by starting its file; both give the same output folders and reports:
 
 ```powershell
@@ -65,7 +78,7 @@ To also install optional dependencies (DSInternals for password quality analysis
 
 - **PowerShell 7.x** on Windows (`pwsh.exe`)
 - **ActiveDirectory** PowerShell module (installed with RSAT tools)
-- Run as a user with sufficient AD read permissions (Domain Admin recommended for full results)
+- Use an audit identity with the permissions required by the selected checks: directory reads, applicable remote registry/event/service access, and replication rights for DSInternals password analysis. Missing access is reported as incomplete coverage.
 - NuGet and DSInternals modules from PowerShell Gallery
 <br>
 https://www.powershellgallery.com/packages/NuGet/
@@ -86,24 +99,34 @@ Choose Manual Download. You will get two .nupkg files. Place them in the ADAudit
 
 If an optional module is not available, those specific checks will be skipped and the rest of the audit will continue normally.
 
+### Remote collection and WinRM
+
+WinRM is optional for most collection. The audit reads its own host locally and uses CIM over DCOM, registry RPC, event-log RPC, or SMB where the particular check supports them. CIM collection can fall back to WSMan if available. These alternatives still require the relevant permissions, services, and firewall access; they do not bypass a blocked network.
+
+Probing connectivity from another DC requires executing a probe on that DC, so the cross-DC port matrix still uses WinRM for remote origins. If that access is unavailable, the remote-origin portion is marked **Not assessed** while probes from the audit host remain available. An unavailable management interface alone is not treated as a security weakness. The script does not enable WinRM or alter firewall rules. In isolated-clone mode it avoids remote origins entirely.
+
 ## Output
 
-Results are written to a folder named after the host (e.g. `<COMPUTERNAME>\HTML Reports\` and `<COMPUTERNAME>\Raw Data\Source\`) in the script directory. The six primary HTML reports share a top navigation bar so you can move between them in the browser; everything else (companion wrappers, intermediate `.source.html` files, the GPO export HTML, the dangerous-ACL HTML, the high-risk baseline index, the DNS audit / recommendations HTML) is removed at the end of the run so the output folder stays focused.
+Results are written under `<COMPUTERNAME>\<run date and time>\HTML Reports\` and `<COMPUTERNAME>\<run date and time>\Raw Data\`. Each report describes only its own run; the audit does not load previous reports or automatically label issues resolved. The six primary HTML reports share a navigation bar. Intermediate companion HTML is consolidated during final cleanup; source evidence remains in Raw Data. HTML reports, including the separate Password Audit reports, support offline dark/light themes with a saved preference and operating-system default.
 
 Primary HTML reports (in `HTML Reports\`):
 
 - **ADAudit-Results.html** - the main audit report. Severity-grouped findings (Critical / High / Medium / Low / Information), filterable, with per-finding "Why it matters" / "Recommended action" / source-link / result preview panels. Includes the new **Domain Admins membership review (size-adjusted)** and **Built-in domain Administrator (RID-500) hygiene** findings.
 - **Risk-Report.html** - executive risk summary with overall score, score-band matrix, top findings, and links back into ADAudit-Results.html.
-- **AD_Health.html** - AD platform health: replication, DC diagnostics (dcdiag), DC interconnect (network reachability between DCs with severity scaled by remaining redundancy), SYSVOL/DFSR backlog, NTDS database, time synchronization, core AD services (KPSSVC is informational, not High), event-log scrape (last 72h), sites and subnets, AD Recycle Bin, group hygiene. Hero gauge, "Tests Performed" status grid, and a "Test Details" section with one collapsible card per test (summary / why it matters / what to look for / how to fix / source link / copy-paste rerun command).
+- **AD_Health.html** - replication, DC diagnostics (dcdiag), observed replication partners and reachability, SYSVOL/DFSR availability, NTDS file size/free space, time synchronization, services, recent event logs, site/GC placement, AD Recycle Bin enablement, and group hygiene. Collection gaps are visible per test; incomplete collection cannot produce a perfect health score. DFSR backlog, database fragmentation, and complete subnet mapping are not measured by these checks.
 - **overlapping_group_memberships.html** - users who reach the same target group via multiple direct group memberships.
 - **multiple_nested_paths.html** - users who reach the same target group via multiple nesting chains from a single direct group (group-nesting complexity, not necessarily duplicate effective permissions).
 - **Lateral-Movement.html** - interactive, offline map of group nesting (member / memberOf). Privilege overview with Tier 0 groups on top and every group that reaches them below, hop-by-hop focus view for any user or group (who gets in / where it leads), filters for severity, scope, tier, OU and name, per-node details with every path to Tier 0, findings and fixes, plus sortable tables (findings, accounts, groups, Tier 0 paths) and a rules & guidance tab. Generated by `Invoke-LateralMovementCheck.ps1` (see below).
 
 Other output:
 
+- **Raw Data\report_findings.csv** - current finding register with rule ID, severity, evidence, score, and evidence-file reference.
+- **Raw Data\report_summary.json** - current-run scope, coverage, methodology version, severity counts, and risk index for manual comparison.
+- **Raw Data\ReportDownloads\** - derived tables used by report download links, kept separate so rendering a text preview can never overwrite a collected CSV with the same basename.
+- **Raw Data\Source\audit_run.json** and **audit_check_status.csv** - run identity and selected, omitted, completed, partial, or failed checks. Completed means execution finished without recorded gaps; it does not mean every security control passed.
 - **Nessus-compatible** XML file (`adaudit.nessus`)
 - **Raw Data\Source\\** - per-check evidence files (more detail than the HTML reports), including `health_*.txt` for AD Health, `domain_admins_scaled.txt` / `domain_admin_builtin_rid500.txt` for the Domain Admins review and `lateral_movement.txt` + `LateralMovement\*.csv` (findings, users, groups, edges = baseline for the next run, Tier 0 paths) for the lateral movement analysis
-- **Raw Data\GPOReports\\** - GPO XML/HTML exports when the GroupPolicy module is available (the GPOReport HTML in HTML Reports is removed by the final cleanup; the XML export and the per-GPO HTML files in Raw Data are kept)
+- **Raw Data\GPOReports\\** - GPO XML/HTML exports when the GroupPolicy module is available; linked companion reports are retained by final cleanup.
 
 ## Audit Checks
 
@@ -113,9 +136,9 @@ Other output:
 | `-domainaudit` | Audit AD functional level, delegation, spooler, SMB signing, tombstone |
 | `-trusts` | Check domain trust relationships |
 | `-accounts` | Identify account issues (expired, disabled, gMSA, overlapping groups, etc.). Also runs the **Domain Admins membership review (size-adjusted)** and **Built-in domain Administrator (RID-500) hygiene** checks. |
-| `-InactiveComputers` | Find inactive computer objects (>90 days) |
+| `-InactiveComputers` | Identify computer activity review candidates using creation, replicated logon, and machine-password timestamps (>90 days); does not assert that a server is unused |
 | `-passwordpolicy` | Review password policy and password quality (requires DSInternals) |
-| `-oldboxes` | Find machines running unsupported OS (older than Server 2019) |
+| `-oldboxes` | Review legacy operating-system names recorded in AD; verify actual OS version and support entitlement before remediation |
 | `-gpo` | Export GPOs in XML and HTML format, check SYSVOL for passwords |
 | `-ouperms` | Check for generic OU permission issues |
 | `-laps` | Check if LAPS is deployed |
@@ -123,17 +146,17 @@ Other output:
 | `-insecurednszone` | Detect DNS zones allowing insecure/unauthenticated updates |
 | `-dnszone` | Generate DNS zone posture report |
 | `-recentchanges` | Check for newly created users and groups (last 30 days) |
-| `-adcs` | Check for ADCS vulnerabilities (ESC1-4, ESC8) |
+| `-adcs` | Review AD CS template publication, flags, enrollment ACLs, and web enrollment endpoints for potential exposures requiring verification |
 | `-spn` | Find kerberoastable high-value accounts |
 | `-asrep` | Find accounts vulnerable to AS-REP roasting |
-| `-acl` | Check for dangerous ACL permissions on computers, users, and groups |
+| `-acl` | Review dangerous Allow permissions on computers, users, groups, and domain-root replication delegations; no replication is performed by this check |
 | `-ldapsecurity` | Check LDAP security configuration |
 | `-dataextract` | Export raw AD audit data |
 | `-delegatedpermissions` | Generate AD delegated permissions report |
 | `-highrisk` | Generate high-risk AD baseline report |
 | `-overlappinggroups` | Check for overlapping group memberships |
-| `-portconnectivity` | Probe every DC on the canonical AD port set (DNS 53, Kerberos 88, RPC EPM 135, LDAP 389, SMB 445, kpasswd 464, LDAPS 636, GC 3268/3269, ADWS 9389, WinRM 5985/5986, NetBIOS 139, sample dynamic RPC). Also runs a cross-DC TCP probe via WinRM when reachable. Aliases: `-dcports`, `-dc-ports`, `-portcheck`. |
-| `-adhealth` | AD platform health check: replication, DC diagnostics, DC interconnect (severity scales with remaining redundancy - 2 DCs / 1 isolated = Critical, 3 / 1 = High, 4+ / 1 = Medium), SYSVOL/DFSR, NTDS, time sync, services, event logs, sites/subnets, Recycle Bin, group hygiene. Writes `AD_Health.html`. Aliases: `-ad-health`, `-health`. |
+| `-portconnectivity` | Test selected DC TCP endpoints from this host and, when WinRM permits, between DCs. GC applicability follows the DC role; DNS, LDAPS, and management endpoints are contextual inventory. TCP reachability does not verify UDP, dynamic RPC, LDAP signing, or encryption. Aliases: `-dcports`, `-dc-ports`, `-portcheck`. |
+| `-adhealth` | AD platform health and explicit per-test coverage: replication, dcdiag, SYSVOL/DFSR availability, NTDS size/free space, time, services, events, site/GC placement, Recycle Bin, group hygiene. Writes `AD_Health.html`. Aliases: `-ad-health`, `-health`. |
 | `-lateralmovement` | Lateral movement analysis of group nesting (runs `Checks\Invoke-LateralMovementCheck.ps1`): every nesting path into a Tier 0 / privileged built-in group, every account that is Tier 0 only through a chain, AGDLP violations (role in role, resource in resource, users directly in resource groups, role+resource hubs), broad "all employees" groups used for access, circular and deep nesting, dormant privileged paths, hidden membership via primaryGroupID, computers / gMSAs / foreign principals in privileged groups, Tier 0 account hygiene, tier boundary crossings (T0/T1/T2 tags) and optional baseline drift. Risk per finding, per user and per group (Critical / High / Medium / Low / Information). Writes `Lateral-Movement.html`. Aliases: `-lateral`, `-lateral-movement`, `-lm`. |
 
 ## Switches
@@ -151,7 +174,9 @@ Other output:
 
 | Switch | Description |
 |---|---|
-| `-KeepLegacyArtifacts` | Preserve raw data and evidence files in legacy locations |
+| `-KeepLegacyArtifacts` | Retain legacy evidence layout inside this run's folder; never reuse earlier-run evidence |
+| `-IsolatedClone` | Assess an isolated DC copy, skip remote DC operational probes, and identify snapshot limitations in reports |
+| `-SnapshotDate yyyy-MM-dd` | Optional known clone date; requires `-IsolatedClone` and cannot be in the future |
 | `-DnsZoneOutputRoot <path>` | Custom output directory for DNS zone reports |
 | `-DnsIncludeRecordCounts` | Include record counts in DNS zone report |
 | `-DnsIncludeSystemZones` | Include system DNS zones in the report |
@@ -197,7 +222,7 @@ Install dependencies and run everything:
 .\Checks\Invoke-LateralMovementCheck.ps1 -OutputRoot D:\Audit\CORP -Tier0Groups 'PAM-T0-Admins','ADFS-Admins' -ApprovedNestings 'GRP-All-IT|GRP-Helpdesk' -BaselinePath .\baseline\lateral_movement_edges.csv
 ```
 
-How it reasons: `memberOf` is followed transitively ("I am memberOf X" = "I inherit the rights of X"), every group is classified (well-known Tier 0 / privileged built-in, declared tier by `T0`/`T1`/`T2` name tags or parameters, Global = role, Domain Local = resource, admin-ish by name, broad, temporary) and 21 rules (LM01-LM21, documented in the report) produce findings with an explanation and a fix. Only AD group nesting is visible to the script - local Administrators groups, GPO Restricted Groups, share/SQL permissions and ACL attack paths are not; use the Dangerous ACL / Delegated-permissions reports and BloodHound for those. Keep `lateral_movement_edges.csv` of each approved state and pass it as `-BaselinePath` next time: new group-to-group edges are the one signal that catches every chain early.
+How it reasons: the analysis follows direct and nested group membership and classifies groups using known privileged SIDs, declared tiers, group scope, and naming hints. The 23 rules (LM01-LM23, documented in the report) identify privilege paths and review candidates with supporting evidence. Naming hints do not prove administrator rights on any host. Only AD group nesting is visible to this analysis; local Administrators membership, applied GPO rights, share/SQL permissions, and ACL attack paths need separate checks. Optional `-BaselinePath` compares group-to-group edges when a previous export is explicitly supplied; ordinary audits do not need a baseline.
 
 ## GUI
 
@@ -214,7 +239,7 @@ The GUI provides:
 - **Run All Checks** toggle (enabled by default, recommended)
 - **Exclude** specific checks when running all
 - **Individual check selection** when Run All is unchecked
-- **Advanced options** for DNS zone, delegated permissions and lateral movement (baseline CSV, extra Tier 0 groups) configuration
+- **Advanced options** for isolated DC clones (optional snapshot date), DNS zone, delegated permissions and lateral movement (baseline CSV, extra Tier 0 groups) configuration
 - **Command preview** showing the exact command that will be executed
 - **Online/Offline dependency installation**
 
@@ -227,12 +252,40 @@ The output is intended to provide visibility into potential risks, misconfigurat
 <br><br>
 
 ## Risk Report
-The management report is an HTML file that provides a more presentable summary of the audit, including an overall security score.<br>
-The further a finding deviates from the defined baseline, the higher the risk score becomes. For example, Critical risks start at 12 points, but both criticality and score increase the further the risk is from the baseline.<br>
-If the KRBTGT password has not been changed in 180 days, it is considered a Critical risk (12 points). However, if it has not been changed in 2000 days, the score increases to 31 points.<br>
-Similarly, if there are many accounts that have not been used for a long time, the risk score increases as the number of inactive accounts grows.<br>
-This scoring model helps pinpoint and prioritize security issues and highlights how neglected certain areas are. A finding with low initial criticality can become high or Critical if it deviates far enough from the baseline value.
-<br><br>
+
+The management report separates finding priority, accumulated finding points, and assessment coverage. Methodology **v2.1** keeps the v2 severity weights (Critical 12, High 8, Medium 5, Low 2) and count/baseline adjustments, while correcting informational port scoring, duplicate membership rollups, and review-only classifications. Information and disabled-account password hygiene contribute zero. Membership counts, nesting, name patterns, and password age alone do not establish a Critical credential exposure.
+
+The headline is the higher of the highest scored finding severity and the existing index threshold (50/100/150 points). It explicitly states which caused the priority. The point ranges now use neutral labels **Band 1–4**, so a Critical finding worth 12 points does not appear beside a green claim of low risk. These thresholds and weights are script-defined and have not been empirically calibrated; two audits cannot validate them. The index is not a percentage, probability of compromise, or compliance certification. Related controls can still overlap. The JSON retains legacy `ScoreBand` for compatibility and adds `IndexBand`, `HighestFindingSeverity`, `PriorityBasis`, and `IndexCalibration`.
+
+Failed, partial, and omitted checks are visible separately. Missing evidence is not a pass and does not create a security finding by itself. Counts represent grouped conditions, not unique affected accounts or the number of controls passed.
+
+Retain each delivered report for manual comparison. Compare scope, coverage, tool and methodology versions, severity counts, and the finding register together. Treat the first v2.1 report as a corrected baseline: lower points may reflect fixed detection/classification or missing coverage rather than customer remediation. An old isolated copy cannot establish current production risk. No previous report is needed or loaded.
+
+### Account evidence
+
+An account's **PasswordNotRequired** flag permits a password policy exception; it does not prove that its password is empty. A confirmed empty-password finding requires the empty NT hash. Unavailable hashes are reported as unverified evidence. Enabled accounts, disabled accounts, and unknown account status are shown separately so disabled-account cleanup does not inflate active exposure.
+
+Computer activity is assessed using multiple AD timestamps. A recent machine-password change or replicated logon suppresses a stale candidate, and newly created accounts are not treated as long inactive. Remaining candidates require owner and workload verification: interactive logons by people do not directly establish computer-account authentication, and directory timestamps alone cannot prove that a server is unused.
+
+## Offline validation
+
+Regression fixtures exercise account classification, ACL and AD CS interpretation, coverage handling, and generated reports without contacting a domain or replicating credentials. From PowerShell 7 with Pester installed:
+
+```powershell
+$testFiles = Get-ChildItem .\Tests\*.Tests.ps1 | Where-Object Name -notin @('Report.Tests.ps1','PasswordLookup.Tests.ps1','ProgressChecks.Tests.ps1','LateralSeverity.Tests.ps1')
+$result = Invoke-Pester -Script $testFiles.FullName -PassThru
+if ($result.FailedCount -gt 0) { throw 'Offline regression tests failed.' }
+pwsh -NoProfile -File .\Tests\Report.Tests.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Report integration tests failed.' }
+pwsh -NoProfile -File .\Tests\PasswordLookup.Tests.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Password lookup tests failed.' }
+pwsh -NoProfile -File .\Tests\ProgressChecks.Tests.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Check progress tests failed.' }
+pwsh -NoProfile -File .\Tests\LateralSeverity.Tests.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Lateral severity tests failed.' }
+```
+
+These tests do not replace a pilot audit in a representative AD environment.
 
 
 ### IMPORTANT

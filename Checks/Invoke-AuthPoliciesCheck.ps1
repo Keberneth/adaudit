@@ -1,110 +1,68 @@
-<#
-    .SYNOPSIS
-        ADAudit check: Check For Existence of Authentication Polices and Silos
-
-    .DESCRIPTION
-        Part of AdAudit-PS7.ps1 (switch -authpolsilos). This file defines the functions of the
-        check and is dot-sourced by the runner, which supplies the shared helpers from
-        Library\ADAudit.Common.ps1 (output folders, logging, failure / not-assessed tracking,
-        Nessus export) and builds the HTML reports afterwards.
-
-        Run this check on its own (same output folders and reports as the full audit):
-            .\Checks\Invoke-AuthPoliciesCheck.ps1 [any AdAudit-PS7.ps1 option]
-        which is the same as:
-            .\AdAudit-PS7.ps1 -select authpolsilos [options]
-
-    .NOTES
-        Entry point: Invoke-AuthPoliciesCheck (called by the runner through Invoke-AuditCheck).
-        The check functions were moved verbatim from AdAudit-PS7.ps1 v9.0 when the toolkit was
-        split into Library / Checks files. Required modules: ActiveDirectory.
-#>
-Function Get-AuthenticationPoliciesAndSilos {
-    # Authentication Policies and Silos require Domain Functional Level
-    # Windows Server 2012 R2 (the AD schema features and KDC enforcement
-    # ship at that DFL). Forest level is NOT required - only the domain.
-    # Earlier versions of this script gated on Windows2019Domain, which
-    # incorrectly skipped the check on perfectly capable estates.
-    $DomainLevel = (Get-ADDomain).DomainMode
-    $evPath = Get-EvidencePath 'auth_policies_silos.txt'
-
-    if (Test-ADAuditFunctionalLevelAtLeast -Mode $DomainLevel -MinimumMode 'Windows2012R2Domain') {
-        try {
-            $policies = @(Get-ADAuthenticationPolicy -Filter *)
-            $silos    = @(Get-ADAuthenticationPolicySilo -Filter *)
-        } catch {
-            Write-Both "    [!] Could not enumerate Authentication Policies / Silos: $($_.Exception.Message)"
+<# Read-only review of assigned authentication policy configuration for privileged users. #>
+function Get-ADAuditAuthenticationPolicyState {
+    param($Policy, $Silo, [bool]$HasAssignment)
+    if (-not $HasAssignment) { return [pscustomobject]@{Status='Missing'; Detail='No policy/silo assignment was found. Other sign-in restrictions were not evaluated.'} }
+    if ($null -eq $Policy) { return [pscustomobject]@{Status='NotAssessed'; Detail='Assigned policy could not be resolved, or the silo has no user policy.'} }
+    if (-not $Policy.Enforce -or ($null -ne $Silo -and -not $Silo.Enforce)) { return [pscustomobject]@{Status='AuditOnly'; Detail='Assigned policy or silo is not enforced; audit mode does not restrict authentication.'} }
+    if (-not $Policy.UserAllowedToAuthenticateFrom -and -not $Policy.UserAllowedToAuthenticateTo) { return [pscustomobject]@{Status='AssignedUnrestricted'; Detail='An enforced policy is assigned, but no user source/target restriction is configured. TGT lifetime alone does not prove host containment.'} }
+    [pscustomobject]@{Status='ConfiguredRestriction'; Detail='An enforced assigned policy contains a source/target restriction. Review the access-control expression, silo membership and Kerberos prerequisites; this is configuration evidence, not an end-to-end sign-in test.'}
+}
+function Get-AuthenticationPoliciesAndSilos {
+    $evidence = Get-EvidencePath 'auth_policies_silos.txt'
+    Remove-Item -LiteralPath $evidence -ErrorAction SilentlyContinue
+    try {
+        $domain = Get-ADDomain -ErrorAction Stop
+        if (-not (Test-ADAuditFunctionalLevelAtLeast -Mode $domain.DomainMode -MinimumMode 'Windows2012R2Domain')) {
+            Register-ADAuditNotAssessed -Name 'Authentication policy coverage' -Switch 'authpolsilos' -Reason "DFL $($domain.DomainMode) does not support this feature. Assess other privileged sign-in restrictions; raising DFL requires a separate compatibility plan."
             return
         }
-
-        foreach ($policy in $policies)   { Write-Both "    [+] Found Authentication Policy: $($policy.Name)" }
-        foreach ($silo   in $silos)      { Write-Both "    [+] Found Authentication Policy Silo: $($silo.Name)" }
-
-        if ($policies.Count -eq 0 -and $silos.Count -eq 0) {
-            $sb = New-Object System.Text.StringBuilder
-            [void]$sb.AppendLine('No Authentication Policies and no Authentication Policy Silos exist in this domain.')
-            [void]$sb.AppendLine('')
-            [void]$sb.AppendLine("Domain functional level: $DomainLevel (>= Windows2012R2Domain - the feature is supported).")
-            [void]$sb.AppendLine('')
-            [void]$sb.AppendLine('Why this matters:')
-            [void]$sb.AppendLine(' - Authentication Silos let you fence off Tier0 (Domain Admins, KRBTGT, the')
-            [void]$sb.AppendLine('   forest root) so those accounts can ONLY sign in to a small, controlled set')
-            [void]$sb.AppendLine('   of jump hosts and DCs. Combined with Protected Users, this is the strongest')
-            [void]$sb.AppendLine('   "no admin creds on workstations" control Microsoft ships out of the box.')
-            [void]$sb.AppendLine(' - Without silos, an attacker who phishes any admin can use that ticket from')
-            [void]$sb.AppendLine('   any compromised endpoint - there is no policy preventing it.')
-            [void]$sb.AppendLine('')
-            [void]$sb.AppendLine('How to fix:')
-            [void]$sb.AppendLine(' - Plan a Tier0 silo containing your DCs and a small number of PAW jump hosts.')
-            [void]$sb.AppendLine(' - Create a policy + silo in audit mode first, monitor for breakage, then enforce.')
-            [void]$sb.AppendLine('   Reference: https://learn.microsoft.com/windows-server/identity/ad-ds/manage/how-to-configure-protected-accounts')
-            [void]$sb.AppendLine('')
-            [void]$sb.AppendLine('Consequences if NOT fixed:')
-            [void]$sb.AppendLine(' - Admins can interactively log on to any workstation. Their tickets can be')
-            [void]$sb.AppendLine('   stolen and reused (golden ticket / silver ticket / ticket reuse paths).')
-            [void]$sb.AppendLine('')
-            [void]$sb.AppendLine('Consequences AFTER you implement (test before enforcing):')
-            [void]$sb.AppendLine(' - Accounts assigned to the silo can no longer sign in to systems outside it.')
-            [void]$sb.AppendLine('   If the silo is misconfigured admins can lock themselves out of every system,')
-            [void]$sb.AppendLine('   including the silo members. Always pilot in audit mode first.')
-            [void]$sb.AppendLine(' - Service accounts that need to authenticate from many sources usually do NOT')
-            [void]$sb.AppendLine('   belong in a Tier0 silo - put them in a separate silo or leave them out.')
-            Set-Content -LiteralPath $evPath -Value $sb.ToString() -Encoding UTF8
-            Write-Both "    [!] No Authentication Policies / Silos defined - Tier0 isolation is not enforced. See auth_policies_silos.txt for context, fix, and trade-offs."
-            Write-Nessus-Finding "AuthPoliciesSilosMissing" "KB549" ([System.IO.File]::ReadAllText($evPath))
+        $policies = @(Get-ADAuthenticationPolicy -Filter * -Properties * -ErrorAction Stop)
+        $silos = @(Get-ADAuthenticationPolicySilo -Filter * -Properties * -ErrorAction Stop)
+    } catch { Register-ADAuditNotAssessed -Name 'Authentication policy inventory' -Switch 'authpolsilos' -Reason $_.Exception.Message; return }
+    $policyMap = @{}; $siloMap = @{}
+    foreach ($p in $policies) { $policyMap[[string]$p.DistinguishedName] = $p }
+    foreach ($s in $silos) { $siloMap[[string]$s.DistinguishedName] = $s }
+    $principals = @{}
+    # Scope is stated explicitly: recursive members of DA and domain BUILTIN Administrators.
+    foreach ($groupSid in @("$($domain.DomainSID.Value)-512",'S-1-5-32-544')) {
+        try {
+            foreach ($member in @(Get-ADGroupMember -Identity $groupSid -Recursive -ErrorAction Stop)) {
+                if ($member.objectClass -eq 'user') { $principals[[string]$member.SID] = $member }
+            }
+        } catch { Register-ADAuditNotAssessed -Name 'Authentication policy privileged scope' -Switch 'authpolsilos' -Target $groupSid -Reason "Recursive membership failed: $($_.Exception.Message)" }
+    }
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($member in $principals.Values) {
+        try {
+            $user = Get-ADUser -Identity $member.DistinguishedName -Properties msDS-AssignedAuthNPolicy,msDS-AssignedAuthNPolicySilo,Enabled -ErrorAction Stop
+            $policyDN = [string]$user.'msDS-AssignedAuthNPolicy'
+            $siloDN = [string]$user.'msDS-AssignedAuthNPolicySilo'
+            $silo = $null; $policy = $null
+            if ($siloDN) {
+                $silo = $siloMap[$siloDN]
+                if (-not $silo) { throw "Assigned silo $siloDN was not resolved." }
+                $policyDN = [string]$silo.UserAuthenticationPolicy
+            }
+            if ($policyDN) { $policy = $policyMap[$policyDN] }
+            $state = Get-ADAuditAuthenticationPolicyState -Policy $policy -Silo $silo -HasAssignment ([bool]($policyDN -or $siloDN))
+            $rows.Add([pscustomobject]@{Account=$user.SamAccountName; SID=[string]$user.SID; Enabled=$user.Enabled; Policy=$policyDN; Silo=$siloDN; Status=$state.Status; Detail=$state.Detail})
+            if ($state.Status -eq 'NotAssessed') { Register-ADAuditNotAssessed -Name 'Authentication policy assignment' -Switch 'authpolsilos' -Target $user.DistinguishedName -Reason $state.Detail }
+        } catch {
+            Register-ADAuditNotAssessed -Name 'Authentication policy assignment' -Switch 'authpolsilos' -Target $member.DistinguishedName -Reason $_.Exception.Message
+            $rows.Add([pscustomobject]@{Account=$member.SamAccountName; SID=[string]$member.SID; Enabled=$null; Policy=''; Silo=''; Status='NotAssessed'; Detail=$_.Exception.Message})
         }
     }
-    else {
-        $sb = New-Object System.Text.StringBuilder
-        [void]$sb.AppendLine("Authentication Policies / Silos check SKIPPED - Domain Functional Level ($DomainLevel) is below Windows2012R2Domain.")
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine('Why this matters:')
-        [void]$sb.AppendLine(' - Authentication Policies and Silos let you fence Tier0 admins to specific,')
-        [void]$sb.AppendLine('   controlled hosts. They require DFL 2012R2 - they simply do not exist below.')
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine('How to fix:')
-        [void]$sb.AppendLine(' - Raise the Domain Functional Level (see the ProtectedUsers finding for the')
-        [void]$sb.AppendLine('   exact PowerShell). Then plan a Tier0 silo (DCs + PAW jump hosts only).')
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine('Consequences if NOT fixed:')
-        [void]$sb.AppendLine(' - No mechanism to restrict where Tier0 accounts can sign in. Pass-the-hash and')
-        [void]$sb.AppendLine('   ticket-reuse attacks against admins are not contained at the policy layer.')
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine('Consequences AFTER raising DFL (review before doing it):')
-        [void]$sb.AppendLine(' - DFL is one-way - cannot be lowered. Remove all DCs running an OS below the')
-        [void]$sb.AppendLine('   target DFL BEFORE raising. Inventory legacy clients and apps for compatibility.')
-        Set-Content -LiteralPath $evPath -Value $sb.ToString() -Encoding UTF8
-        Write-Both "    [!] Authentication Policies / Silos check skipped - DFL is $DomainLevel (need Windows2012R2Domain). See auth_policies_silos.txt for context, fix, and trade-offs."
-        Write-Nessus-Finding "AuthPoliciesSilosDflTooLow" "KB549" ([System.IO.File]::ReadAllText($evPath))
+    Export-ADAuditSecurityCsv -Rows $rows -Columns @('Account','SID','Enabled','Policy','Silo','Status','Detail') -Path (Get-EvidencePath 'auth_policy_coverage.csv')
+    $policies | Select-Object Name,DistinguishedName,Enforce,UserAllowedToAuthenticateFrom,UserAllowedToAuthenticateTo,UserTGTLifetimeMins | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'auth_policy_inventory.csv')
+    $silos | Select-Object Name,DistinguishedName,Enforce,UserAuthenticationPolicy,Members | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'auth_silo_inventory.csv')
+    $gaps = @($rows | Where-Object { $_.Enabled -eq $true -and $_.Status -in @('Missing','AuditOnly','AssignedUnrestricted') })
+    if ($gaps.Count -gt 0) {
+        @('Scope: enabled user members of Domain Admins and domain BUILTIN Administrators (recursive). This is authentication-policy configuration coverage; other sign-in controls may exist.'; $gaps | ForEach-Object { "$($_.Account): $($_.Status). $($_.Detail)" }; 'Review intended Tier 0 isolation, pilot policies in audit mode, validate allowed and rejected authentication, then enforce. Plan emergency access before changing restrictions.') | Set-Content -LiteralPath $evidence -Encoding UTF8
+        Write-Nessus-Finding 'Privileged authentication policy coverage requires review' 'KB549' ([IO.File]::ReadAllText($evidence)) 'Medium'
     }
+    Write-Both "    [*] Authentication policies=$($policies.Count); silos=$($silos.Count); privileged user assignments reviewed=$($rows.Count); enabled-user configuration gaps=$($gaps.Count). See auth_policy_coverage.csv for per-account state and scope."
 }
-
-function Invoke-AuthPoliciesCheck {
-    Get-AuthenticationPoliciesAndSilos
-}
-
-# ---- Standalone launch --------------------------------------------------------------------
-# Dot-sourced by AdAudit-PS7.ps1 this file only defines functions. Started directly it hands
-# over to the runner so the output folders, Nessus export and HTML reports are identical.
+function Invoke-AuthPoliciesCheck { Get-AuthenticationPoliciesAndSilos }
 if ($MyInvocation.InvocationName -ne '.') {
     & (Join-Path (Split-Path -Parent $PSScriptRoot) 'AdAudit-PS7.ps1') -select authpolsilos @args
 }

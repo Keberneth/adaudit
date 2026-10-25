@@ -139,6 +139,10 @@ function New-ReportsFolder {
             $true
         }
         if ($localOk) { return $env:COMPUTERNAME }
+        if ($script:ADAuditIsolatedClone) {
+            Register-ADAuditNotAssessed -Name 'DNS zone posture' -Switch 'dnszone' -Target $env:COMPUTERNAME -Reason 'Local DNS role could not be queried. Remote resolver fallback is outside isolated-clone scope.'
+            return $null
+        }
 
         $dnsIps = Safe-Get -Context "Detect: Get-DnsClientServerAddress" -Default @() -Script {
             $addrs = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop

@@ -1,123 +1,129 @@
-<#
-    .SYNOPSIS
-        ADAudit check: Check for LDAP Security Issues
+<# Read-only LDAP configuration, endpoint TLS and anonymous directory-read checks. #>
+function Get-ADAuditLdapSigningAssessment {
+    param($Value, [bool]$ModernServer, [bool]$VersionKnown)
+    if ($Value -eq 2) { return [pscustomobject]@{Status='Pass'; Detail='LDAPServerIntegrity explicitly requires signing.'} }
+    if ($null -eq $Value -or $Value -notin @(0,1,2) -or $ModernServer -or -not $VersionKnown) {
+        return [pscustomobject]@{Status='NotAssessed'; Detail='Effective signing cannot be inferred from this value alone. Windows Server 2025 enforcement policy and OS/deployment defaults can take precedence; verify effective policy and unsigned-bind rejection.'}
+    }
+    [pscustomobject]@{Status='Finding'; Detail="LDAPServerIntegrity=$Value on a pre-2025 server; signing is not required by this setting."}
+}
 
-    .DESCRIPTION
-        Part of AdAudit-PS7.ps1 (switch -ldapsecurity). This file defines the functions of the
-        check and is dot-sourced by the runner, which supplies the shared helpers from
-        Library\ADAudit.Common.ps1 (output folders, logging, failure / not-assessed tracking,
-        Nessus export) and builds the HTML reports afterwards.
+function Get-ADAuditAnonymousReadOutcome {
+    param([int]$EntryCount, [Nullable[int]]$ErrorCode, [switch]$TransportFailure)
+    if ($TransportFailure) { return 'NotAssessed' }
+    if ($null -ne $ErrorCode) {
+        # Authentication/authorization refusals demonstrate only rejection of this query.
+        if ($ErrorCode -in @(8,13,48,49,50)) { return 'Rejected' }
+        return 'NotAssessed'
+    }
+    if ($EntryCount -gt 0) { return 'Finding' }
+    return 'NoDataReturned'
+}
 
-        Run this check on its own (same output folders and reports as the full audit):
-            .\Checks\Invoke-LdapSecurityCheck.ps1 [any AdAudit-PS7.ps1 option]
-        which is the same as:
-            .\AdAudit-PS7.ps1 -select ldapsecurity [options]
+function Test-ADAuditLdapsEndpoint {
+    param([string]$ComputerName)
+    $tcp = $null; $tls = $null
+    try {
+        $tcp = [Net.Sockets.TcpClient]::new()
+        $connect = $tcp.ConnectAsync($ComputerName,636)
+        if (-not $connect.Wait(5000)) { throw 'TCP connection timeout on 636.' }
+        $connect.GetAwaiter().GetResult()
+        $tcp.ReceiveTimeout = 5000; $tcp.SendTimeout = 5000
+        $tls = [Net.Security.SslStream]::new($tcp.GetStream(), $false)
+        $tls.ReadTimeout = 5000; $tls.WriteTimeout = 5000
+        # Default validation verifies the served certificate's chain, name and validity.
+        $tls.AuthenticateAsClient($ComputerName)
+        $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($tls.RemoteCertificate)
+        try {
+            [pscustomobject]@{Status='Pass'; Detail="LDAPS handshake validated using this host's trust store; subject=$($cert.Subject); expires=$($cert.NotAfter.ToUniversalTime().ToString('o')); thumbprint=$($cert.Thumbprint). Revocation, StartTLS and GC TLS were not assessed."}
+        } finally { $cert.Dispose() }
+    } catch {
+        [pscustomobject]@{Status='NotAssessed'; Detail="LDAPS endpoint validation failed: $($_.Exception.Message). This does not prove a missing certificate or plaintext LDAP; inspect certificate trust/name/validity and connectivity. StartTLS/SASL protection on 389 was not assessed."}
+    } finally {
+        if ($tls) { $tls.Dispose() }
+        if ($tcp) { $tcp.Dispose() }
+    }
+}
 
-    .NOTES
-        Entry point: Invoke-LdapSecurityCheck (called by the runner through Invoke-AuditCheck).
-        The check functions were moved verbatim from AdAudit-PS7.ps1 v9.0 when the toolkit was
-        split into Library / Checks files. Required modules: ActiveDirectory.
-#>
 function Get-LDAPSecurity {
-    # LDAP signing, channel binding and the LDAPS certificate are PER-DC settings
-    # that live in the DC's NTDS\Parameters registry / LocalMachine cert store.
-    # Reading the LOCAL host is only valid on a DC; on a jump server the NTDS key
-    # does not exist and the old code emitted a GUARANTEED-false "LDAP signing not
-    # enabled" finding. We now target each DC and record NotAssessed (not a finding)
-    # when the DC's registry/cert store cannot be read remotely.
-    $serverAuthOid = '1.3.6.1.5.5.7.3.1'   # Server Authentication EKU
-    $ntdsKey = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
-
-    $dcList = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
-    if (-not $dcList -or $dcList.Count -eq 0) {
-        Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Reason "No domain controllers enumerated; cannot assess LDAP signing / channel binding / LDAPS."
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $evidence = Get-EvidencePath 'LDAPSecurity.txt'
+    Remove-Item -LiteralPath $evidence -ErrorAction SilentlyContinue
+    try {
+        $domainDN = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+        $dcList = @(Get-ADDomainController -Filter * -ErrorAction Stop)
+        if ($dcList.Count -eq 0) { throw 'No domain controllers enumerated.' }
+    } catch {
+        Register-ADAuditNotAssessed -Name 'LDAP security inventory' -Switch 'ldapsecurity' -Reason $_.Exception.Message
         return
     }
-
-    foreach ($dc in $dcList) {
-        # --- LDAP signing (LDAPServerIntegrity; 2 = required) ---
+    Add-Type -AssemblyName System.DirectoryServices.Protocols
+    foreach ($controller in $dcList) {
+        $dc = [string]$controller.HostName
+        Write-ADAuditProgress -Activity 'LDAP security' -Status "Assessing $dc"
+        if ($script:ADAuditIsolatedClone -and -not (Test-ADAuditLocalComputer -ComputerName $dc)) {
+            $rows.Add([pscustomobject]@{Target=$dc; Control='CloneScope'; Status='NotAssessed'; Severity='Info'; Detail='Remote DC endpoint testing is outside isolated-clone scope; directory records describe the copied environment.'})
+            continue
+        }
+        $versionKnown = [string]$controller.OperatingSystem -match 'Windows Server (2008|2012|2016|2019|2022|2025)'
+        $modern = [string]$controller.OperatingSystem -match 'Windows Server 2025'
+        $ntdsKey = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
         $sig = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $ntdsKey -ValueName 'LDAPServerIntegrity'
-        if (-not $sig.Success) {
-            Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target $dc -RequiresRemotePS -Reason "Could not read NTDS\Parameters\LDAPServerIntegrity on $dc (needs the DC's registry over CIM/DCOM/WinRM, or this host is not a DC): $($sig.Error)"
-        }
-        elseif ($sig.Value -eq 2) {
-            Write-Both "    [+] LDAP signing is required on $dc"
-        }
-        else {
-            $lvl = if ($null -eq $sig.Value) { 'not set (default 1 = negotiate, not enforced)' } else { $sig.Value }
-            Write-Both "    [!] LDAP signing is not enforced on $dc (LDAPServerIntegrity = $lvl)"
-            Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAP signing is not enforced on $dc (LDAPServerIntegrity = $lvl)"
-            Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP signing is not enforced on $dc (LDAPServerIntegrity = $lvl)"
-        }
-
-        # --- LDAP channel binding (LdapEnforceChannelBinding; 2 = always) ---
+        $signing = if ($sig.Success) { Get-ADAuditLdapSigningAssessment -Value $sig.Value -ModernServer $modern -VersionKnown $versionKnown } else { [pscustomobject]@{Status='NotAssessed'; Detail="Registry read failed: $($sig.Error)"} }
+        $rows.Add([pscustomobject]@{Target=$dc; Control='LDAPSigning'; Status=$signing.Status; Severity=$(if ($signing.Status -eq 'Finding') {'High'} else {'Info'}); Detail=$signing.Detail})
         $cb = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $ntdsKey -ValueName 'LdapEnforceChannelBinding'
-        if (-not $cb.Success) {
-            Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target $dc -RequiresRemotePS -Reason "Could not read NTDS\Parameters\LdapEnforceChannelBinding on $dc (needs the DC's registry over CIM/DCOM/WinRM): $($cb.Error)"
-        }
-        elseif ($cb.Value -eq 2) {
-            Write-Both "    [+] LDAP channel binding is enforced (always) on $dc"
-        }
-        else {
-            $lvl = if ($null -eq $cb.Value) { 'not set' } else { $cb.Value }
-            Write-Both "    [!] LDAP channel binding is not enforced on $dc (LdapEnforceChannelBinding = $lvl)"
-            Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "LDAP channel binding is not enforced on $dc (LdapEnforceChannelBinding = $lvl)"
-            Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP channel binding is not enforced on $dc (LdapEnforceChannelBinding = $lvl)"
-        }
-
-        # --- LDAPS certificate present (Server Authentication EKU in the DC's LocalMachine\My) ---
+        $cbStatus = 'NotAssessed'; $cbDetail = "Channel-binding effective state unknown: $($cb.Error)"
+        if ($cb.Success -and $null -ne $cb.Value) {
+            switch ([int]$cb.Value) {
+                2 { $cbStatus='Pass'; $cbDetail='Channel binding is explicitly set to Always.' }
+                1 { $cbStatus='Finding'; $cbDetail='Channel binding is WhenSupported: compatible clients are checked, but clients without CBT can still connect. Review compatibility before moving to Always.' }
+                0 { $cbStatus='Finding'; $cbDetail='Channel binding is explicitly set to Never.' }
+                default { $cbDetail="Unrecognized channel-binding value $($cb.Value); effective behavior requires verification." }
+            }
+        } elseif ($cb.Success) { $cbDetail='Channel-binding value is absent; effective OS/deployment default was not confirmed.' }
+        $rows.Add([pscustomobject]@{Target=$dc; Control='LDAPChannelBinding'; Status=$cbStatus; Severity=$(if ($cbStatus -eq 'Finding') {'Medium'} else {'Info'}); Detail=$cbDetail})
+        $ldaps = Test-ADAuditLdapsEndpoint -ComputerName $dc
+        $rows.Add([pscustomobject]@{Target=$dc; Control='LDAPSEndpoint'; Status=$ldaps.Status; Severity='Info'; Detail=$ldaps.Detail})
+        $connection = $null
+        $anonymousStatus = 'NotAssessed'; $anonymousDetail = ''
         try {
-            $hasLdapsCert = Invoke-Command -ComputerName $dc -ArgumentList $serverAuthOid -ScriptBlock {
-                param($oid)
-                [bool](Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction Stop | Where-Object {
-                    ($_.EnhancedKeyUsageList.ObjectId -contains $oid) -or
-                    ($_.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } | ForEach-Object { $_.EnhancedKeyUsages.Value }) -contains $oid
-                })
-            } -ErrorAction Stop
-
-            if ($hasLdapsCert) {
-                Write-Both "    [+] LDAPS (Server Authentication) certificate present on $dc"
-            }
-            else {
-                Write-Both "    [!] No LDAPS (Server Authentication) certificate found on $dc"
-                Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "No LDAPS (Server Authentication) certificate found on $dc"
-                Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "No LDAPS (Server Authentication) certificate found on $dc"
-            }
+            $connection = [System.DirectoryServices.Protocols.LdapConnection]::new("${dc}:389")
+            $connection.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
+            $connection.SessionOptions.ProtocolVersion = 3
+            $connection.Timeout = [TimeSpan]::FromSeconds(5)
+            $connection.Bind()
+            # A bind/RootDSE result is normal and not evidence of directory disclosure.
+            # This bounded read asks only for the DN of one entry under the domain NC.
+            $request = [System.DirectoryServices.Protocols.SearchRequest]::new($domainDN,'(objectClass=*)',[System.DirectoryServices.Protocols.SearchScope]::Base,@('distinguishedName'))
+            $request.SizeLimit = 1
+            $request.TimeLimit = [TimeSpan]::FromSeconds(5)
+            $response = [System.DirectoryServices.Protocols.SearchResponse]$connection.SendRequest($request)
+            $anonymousStatus = Get-ADAuditAnonymousReadOutcome -EntryCount $response.Entries.Count
+            $anonymousDetail = "Explicit anonymous base-scope read of $domainDN returned $($response.Entries.Count) entry(s). This tests the domain object only, not every subtree or attribute."
+        } catch [System.DirectoryServices.Protocols.DirectoryOperationException] {
+            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.ResultCode } else { -1 }
+            $anonymousStatus = Get-ADAuditAnonymousReadOutcome -ErrorCode $code
+            $anonymousDetail = "Anonymous domain-object query result $code`: $($_.Exception.Message)"
+        } catch [System.DirectoryServices.Protocols.LdapException] {
+            $anonymousStatus = Get-ADAuditAnonymousReadOutcome -ErrorCode $_.Exception.ErrorCode
+            $anonymousDetail = "Anonymous LDAP test error $($_.Exception.ErrorCode): $($_.Exception.Message)"
+        } catch {
+            $anonymousStatus = 'NotAssessed'; $anonymousDetail = $_.Exception.Message
+        } finally { if ($connection) { $connection.Dispose() } }
+        $rows.Add([pscustomobject]@{Target=$dc; Control='AnonymousDomainRead'; Status=$anonymousStatus; Severity=$(if ($anonymousStatus -eq 'Finding') {'Medium'} else {'Info'}); Detail=$anonymousDetail})
+    }
+    $rows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'ldap_security.csv')
+    foreach ($row in $rows) {
+        Write-Both "    [$($row.Status)] $($row.Target) / $($row.Control): $($row.Detail)"
+        if ($row.Status -eq 'NotAssessed') { Register-ADAuditNotAssessed -Name $row.Control -Switch 'ldapsecurity' -Target $row.Target -Reason $row.Detail }
+        if ($row.Status -eq 'Finding') {
+            $line = "$($row.Target) / $($row.Control): $($row.Detail)"
+            Add-Content -LiteralPath $evidence -Value $line
+            Write-Nessus-Finding 'LDAP security configuration' 'KB1101' $line $row.Severity
         }
-        catch {
-            Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target $dc -RequiresRemotePS -Reason "Could not enumerate the DC's certificate store for an LDAPS certificate (needs WinRM to $dc): $($_.Exception.Message)"
-        }
-    }
-
-    # --- LDAP anonymous (null) bind: a network test, valid from any host ---
-    $Server = (Get-ADDomainController -Discover).HostName
-    $Port = 389
-    try {
-        Add-Type -AssemblyName System.DirectoryServices.Protocols
-        $ldapConnection = New-Object System.DirectoryServices.Protocols.LdapConnection("$Server`:$Port")
-        $ldapConnection.Timeout = [System.TimeSpan]::FromSeconds(5)
-        $anonymousCredential = New-Object System.Net.NetworkCredential("", "")
-        $ldapConnection.Bind($anonymousCredential)
-
-        Write-Both "    [!] Issue identified LDAP null session allowed on server $Server`:$Port"
-        Add-Content -Path (Get-EvidencePath 'LDAPSecurity.txt') -Value "null session allowed on server $Server`:$Port"
-        Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP null session allowed on server $Server`:$Port"
-    }
-    catch [System.DirectoryServices.Protocols.LdapException] {
-        Write-Both "    [+] LDAP null session not allowed on server $Server`:$Port"
-    }
-    catch {
-        Register-ADAuditNotAssessed -Name 'Get-LDAPSecurity' -Switch 'ldapsecurity' -Target "$Server`:$Port" -Reason "LDAP null-bind test could not run: $($_.Exception.Message)"
     }
 }
-
-function Invoke-LdapSecurityCheck {
-    Get-LDAPSecurity
-}
-
-# ---- Standalone launch --------------------------------------------------------------------
-# Dot-sourced by AdAudit-PS7.ps1 this file only defines functions. Started directly it hands
-# over to the runner so the output folders, Nessus export and HTML reports are identical.
+function Invoke-LdapSecurityCheck { Get-LDAPSecurity }
 if ($MyInvocation.InvocationName -ne '.') {
     & (Join-Path (Split-Path -Parent $PSScriptRoot) 'AdAudit-PS7.ps1') -select ldapsecurity @args
 }

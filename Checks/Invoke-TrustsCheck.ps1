@@ -1,50 +1,46 @@
-<#
-    .SYNOPSIS
-        ADAudit check: Domain Trust Audit
-
-    .DESCRIPTION
-        Part of AdAudit-PS7.ps1 (switch -trusts). This file defines the functions of the
-        check and is dot-sourced by the runner, which supplies the shared helpers from
-        Library\ADAudit.Common.ps1 (output folders, logging, failure / not-assessed tracking,
-        Nessus export) and builds the HTML reports afterwards.
-
-        Run this check on its own (same output folders and reports as the full audit):
-            .\Checks\Invoke-TrustsCheck.ps1 [any AdAudit-PS7.ps1 option]
-        which is the same as:
-            .\AdAudit-PS7.ps1 -select trusts [options]
-
-    .NOTES
-        Entry point: Invoke-TrustsCheck (called by the runner through Invoke-AuditCheck).
-        The check functions were moved verbatim from AdAudit-PS7.ps1 v9.0 when the toolkit was
-        split into Library / Checks files. Required modules: ActiveDirectory.
-#>
-Function Get-DomainTrusts {
-    #Lists domain trusts and flags the risk of inbound/bidirectional (outbound-from-us) trusts
-    foreach ($trust in (Get-ADObject -Filter { objectClass -eq "trustedDomain" } -Properties TrustPartner, TrustDirection, trustType, trustAttributes)) {
-        # Direction 2 = Outbound, 3 = Bidirectional. In both, THIS domain trusts the partner,
-        # so the partner's principals can be authorised here (the risky direction for us).
-        # Direction 1 = Inbound-only (partner trusts us) is not flagged.
-        if ($trust.TrustDirection -eq 2 -or $trust.TrustDirection -eq 3) {
-            if (($trust.TrustAttributes -band 0x1) -or ($trust.TrustAttributes -band 0x4)) {
-                # 0x1 = non-transitive, 0x4 = quarantined/SID-filtered: partner access is contained.
-                Write-Both "    [!] $env:UserDomain trusts the domain $($trust.Name) (non-transitive or SID-filtered - contained, but confirm the business need). (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "$env:UserDomain trusts the domain $($trust.Name). Trust is non-transitive or SID-filtered (contained). Review the business justification."
-            }
-            else {
-                Write-Both "    [!] $env:UserDomain trusts the domain $($trust.Name) and the trust is TRANSITIVE with no SID filtering - principals from $($trust.Name) (and domains it trusts) can be authorised here, so a compromise there can pivot into this domain. (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "$env:UserDomain trusts the domain $($trust.Name); the trust is TRANSITIVE with no SID filtering, so principals from the trusted forest (and its onward trusts) can be authorised in this domain. Enable SID filtering / quarantine unless a business need requires otherwise."
-            }
-        }
+<# Trust inventory separates authentication direction, trust boundary and hardening flags. #>
+function Get-ADAuditTrustAssessment {
+    param($Trust)
+    $attributes = [int]$Trust.trustAttributes
+    $direction = switch ([int]$Trust.trustDirection) { 1 {'Inbound: partner trusts this domain'} 2 {'Outbound: this domain trusts partner'} 3 {'Bidirectional'} default {'Disabled/unknown'} }
+    $within = ($attributes -band 0x20) -ne 0
+    $forest = ($attributes -band 0x08) -ne 0
+    $boundary = if ($within) {'WithinForest'} elseif ($forest) {'CrossForest'} elseif ([int]$Trust.trustType -eq 3) {'KerberosRealm'} else {'ExternalOrLegacy'}
+    $quarantined = ($attributes -band 0x04) -ne 0
+    $externalFiltering = ($attributes -band 0x40) -ne 0
+    $selective = ($attributes -band 0x10) -ne 0
+    $tgtDelegation = ($attributes -band 0x800) -ne 0
+    $finding = (-not $within -and ($tgtDelegation -or ($forest -and $externalFiltering)))
+    [pscustomobject]@{
+        Partner = $Trust.Name
+        Direction = $direction
+        TrustType = $Trust.trustType
+        Boundary = $boundary
+        Attributes = ('0x{0:X8}' -f $attributes)
+        Quarantined = $quarantined
+        SelectiveAuthentication = $selective
+        TreatAsExternal = $externalFiltering
+        TgtDelegationEnabled = $tgtDelegation
+        Status = if ($finding) {'Finding'} else {'Review'}
+        Severity = if ($finding) {'High'} else {'Info'}
+        Detail = if ($within) {'Expected intra-forest trust boundary; forest domains share the forest security boundary. Review business topology and privilege separation.'} elseif ($forest) {'Cross-forest SID filtering applies according to the trust boundary and flags; absence of quarantine does not mean no filtering. Forest transitivity covers domains in the two forests, not onward third-forest trusts. Review selective authentication, permitted resource access and business need.'} else {'Determine the external/realm trust boundary and effective filtering before recommending changes. Absence of quarantine alone does not establish absence of SID filtering. Review permitted resource access and business need.'}
     }
 }
-
-function Invoke-TrustsCheck {
-    Get-DomainTrusts
+function Get-DomainTrusts {
+    try { $trusts = @(Get-ADObject -Filter { objectClass -eq 'trustedDomain' } -Properties TrustPartner,TrustDirection,trustType,trustAttributes -ErrorAction Stop) }
+    catch { Register-ADAuditNotAssessed -Name 'Trust inventory' -Switch 'trusts' -Reason $_.Exception.Message; return }
+    $rows = @($trusts | ForEach-Object { Get-ADAuditTrustAssessment $_ })
+    Export-ADAuditSecurityCsv -Rows $rows -Columns @('Partner','Direction','TrustType','Boundary','Attributes','Quarantined','SelectiveAuthentication','TreatAsExternal','TgtDelegationEnabled','Status','Severity','Detail') -Path (Get-EvidencePath 'trust_inventory.csv')
+    foreach ($row in $rows) {
+        Write-Both "    [$($row.Status)] Trust $($row.Partner): $($row.Direction); $($row.Boundary). $($row.Detail)"
+        if ($row.Status -eq 'Finding') {
+            $detail = "$($row.Partner): explicit TGT delegation=$($row.TgtDelegationEnabled); forest filtering relaxed to external=$($row.TreatAsExternal). Review these high-impact exceptions against the trust design. $($row.Detail)"
+            Write-Nessus-Finding 'DomainTrusts' 'KB250' $detail $row.Severity
+        }
+    }
+    Write-Both "    [*] $($rows.Count) trust object(s) inventoried in the current domain; partner-side policies and actual resource permissions were not assessed."
 }
-
-# ---- Standalone launch --------------------------------------------------------------------
-# Dot-sourced by AdAudit-PS7.ps1 this file only defines functions. Started directly it hands
-# over to the runner so the output folders, Nessus export and HTML reports are identical.
+function Invoke-TrustsCheck { Get-DomainTrusts }
 if ($MyInvocation.InvocationName -ne '.') {
     & (Join-Path (Split-Path -Parent $PSScriptRoot) 'AdAudit-PS7.ps1') -select trusts @args
 }

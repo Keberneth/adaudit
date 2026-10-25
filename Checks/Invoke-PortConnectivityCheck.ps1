@@ -1,6 +1,6 @@
 <#
     .SYNOPSIS
-        ADAudit check: Domain Controller port connectivity check (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC)
+        ADAudit check: Domain Controller TCP endpoint connectivity
 
     .DESCRIPTION
         Part of AdAudit-PS7.ps1 (switch -portconnectivity). This file defines the functions of the
@@ -18,20 +18,40 @@
         The check functions were moved verbatim from AdAudit-PS7.ps1 v9.0 when the toolkit was
         split into Library / Checks files. Required modules: ActiveDirectory.
 #>
+function Test-ADAuditPortEndpoint {
+    param([string]$Target, [int]$Port, [int]$TimeoutMs = 1500)
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $Target
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $async = $tcp.BeginConnect($Target, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return [pscustomobject]@{Open=$false; Error='timeout'} }
+        $tcp.EndConnect($async)
+        [pscustomobject]@{Open=$true; Error=$null}
+    } catch {
+        [pscustomobject]@{Open=$false; Error=$_.Exception.Message}
+    } finally { $tcp.Close() }
+}
+
+function Test-ADAuditPortTargetResolution {
+    param([string]$Target)
+    if (Test-ADAuditLocalComputer $Target) { return $true }
+    Assert-ADAuditRemoteTargetAllowed -ComputerName $Target
+    try { $null = [System.Net.Dns]::GetHostAddresses($Target); return $true } catch { return $false }
+}
+
 Function Test-DCPortConnectivity {
     <#
         Tests TCP connectivity from the running host (and, if WinRM is
         available, from each DC) to every DC on the standard set of ports an
-        AD environment needs. Closed ports here directly limit AD
-        functionality (replication, authentication, DNS, group policy, AD
-        Web Services for the PowerShell module). LDAP/LDAPS are also flagged
-        as risk findings because plaintext LDAP enables MITM/relay attacks.
+        AD environment uses. A blocked endpoint is evidence for that source
+        and target only. Role-specific and optional endpoints are inventory;
+        reachability does not establish authentication or transport security.
 
         Output:
             dc_port_connectivity.txt  - human readable findings with WHY/FIX
             dc_port_connectivity.csv  - machine readable per-(source,target,port) rows
-        Plus a Nessus finding (KB1310) and a CheckFailures entry for each DC
-        that could not be reached at all.
+        Plus a Nessus finding (KB1310) for required endpoint failures and
+        coverage records when cross-DC collection cannot run.
 
         WinRM dependency: cross-DC tests REQUIRE WinRM 5985/5986 to be open
         from this host to each DC. If WinRM is unavailable we still run the
@@ -51,20 +71,19 @@ Function Test-DCPortConnectivity {
     # closed port is presented to the operator (some ports are advisory,
     # most are operationally required).
     $portCatalog = @(
-        [pscustomobject]@{ Port=53;    Proto='tcp'; Name='DNS';                          Severity='Critical'; Why='DC must serve DNS for SRV/A records used by clients to find DCs.'; Required=$true }
+        [pscustomobject]@{ Port=53;    Proto='tcp'; Name='DNS';                          Severity='Information'; Why='DNS is a separate role and need not be installed on every DC. Validate the configured DNS servers separately.'; Required=$false }
         [pscustomobject]@{ Port=88;    Proto='tcp'; Name='Kerberos';                     Severity='Critical'; Why='Kerberos AS/TGS exchanges. If blocked, no Kerberos auth happens.'; Required=$true }
         [pscustomobject]@{ Port=135;   Proto='tcp'; Name='RPC endpoint mapper';          Severity='Critical'; Why='Endpoint mapper for AD replication, Netlogon, RPC over TCP. Without it most AD operations fail.'; Required=$true }
-        [pscustomobject]@{ Port=389;   Proto='tcp'; Name='LDAP (plaintext)';             Severity='Medium';   Why='Plaintext LDAP; required for legacy clients but should NEVER be the only AD lookup path. Channel binding/LDAP signing must be enforced.'; Required=$true }
+        [pscustomobject]@{ Port=389;   Proto='tcp'; Name='LDAP / STARTTLS';              Severity='Medium';   Why='Directory protocol endpoint. Port 389 supports STARTTLS and SASL sealing; TCP reachability does not establish signing or confidentiality.'; Required=$true }
         [pscustomobject]@{ Port=445;   Proto='tcp'; Name='SMB';                          Severity='Critical'; Why='SYSVOL/NETLOGON shares, GPO download. Without it clients cannot apply Group Policy.'; Required=$true }
         [pscustomobject]@{ Port=464;   Proto='tcp'; Name='Kerberos password change';     Severity='High';     Why='kpasswd. Required for password changes through Kerberos (Set-ADAccountPassword, ALTER DOMAIN PASSWORD, etc).'; Required=$true }
-        [pscustomobject]@{ Port=636;   Proto='tcp'; Name='LDAPS (LDAP over TLS)';        Severity='High';     Why='Encrypted LDAP. Required to protect bind credentials and search content. CLOSED = a real risk because plaintext LDAP can be intercepted/relayed.'; Required=$true }
+        [pscustomobject]@{ Port=636;   Proto='tcp'; Name='LDAPS (LDAP over TLS)';        Severity='Information'; Why='TLS endpoint, required only for clients configured to use LDAPS. A closed listener does not imply plaintext on port 389.'; Required=$false }
         [pscustomobject]@{ Port=3268;  Proto='tcp'; Name='Global Catalog (LDAP)';        Severity='Critical'; Why='GC queries used by Exchange, multi-domain forest auth. Closed GC breaks login in multi-domain forests.'; Required=$true }
-        [pscustomobject]@{ Port=3269;  Proto='tcp'; Name='Global Catalog (LDAPS)';       Severity='High';     Why='Encrypted GC. Same role as 3268 but over TLS. Should be open if 3268 is open.'; Required=$true }
+        [pscustomobject]@{ Port=3269;  Proto='tcp'; Name='Global Catalog (LDAPS)';       Severity='Information'; Why='TLS Global Catalog endpoint; applicability depends on the GC role and client requirements.'; Required=$false }
         [pscustomobject]@{ Port=9389;  Proto='tcp'; Name='AD Web Services (ADWS)';       Severity='High';     Why='Used by the ActiveDirectory PowerShell module and Get-AD* cmdlets. Closed ADWS breaks every PowerShell-based admin tool.'; Required=$true }
-        [pscustomobject]@{ Port=5985;  Proto='tcp'; Name='WinRM HTTP';                   Severity='Medium';   Why='Remote PowerShell. This audit script and many ops tools depend on it for cross-DC checks. Required for some cross-DC checks in THIS report.'; Required=$true }
-        [pscustomobject]@{ Port=5986;  Proto='tcp'; Name='WinRM HTTPS';                  Severity='Low';      Why='Encrypted WinRM. Optional but recommended over 5985.'; Required=$false }
+        [pscustomobject]@{ Port=5985;  Proto='tcp'; Name='WinRM HTTP';                   Severity='Information'; Why='Optional management transport used by this audit. A closed port limits collection and is not an AD security finding.'; Required=$false }
+        [pscustomobject]@{ Port=5986;  Proto='tcp'; Name='WinRM HTTPS';                  Severity='Information'; Why='Optional TLS management endpoint. WinRM HTTP can also protect messages with Kerberos; this TCP probe does not assess session security.'; Required=$false }
         [pscustomobject]@{ Port=139;   Proto='tcp'; Name='NetBIOS Session';              Severity='Low';      Why='Legacy NetBIOS. Modern clients use 445; can be closed if no down-level systems remain.'; Required=$false }
-        [pscustomobject]@{ Port=49152; Proto='tcp'; Name='Dynamic RPC (sample)';         Severity='High';     Why='Sample of the dynamic RPC range (49152-65535) used for AD replication, DRS, FRS/DFSR. If 49152 is closed but the RPC firewall rule is open the actual replication may still be allowed; investigate before remediating.'; Required=$true }
     )
 
     # Discover DCs
@@ -72,32 +91,32 @@ Function Test-DCPortConnectivity {
     try {
         $dcs = @(Get-ADDomainController -Filter * -ErrorAction Stop |
                  Sort-Object Name |
-                 Select-Object Name,HostName,IPv4Address)
+                  Select-Object Name,HostName,IPv4Address,IsGlobalCatalog)
     } catch {
         Add-Content -Path $evidencePath -Value "ERROR: could not enumerate DCs via Get-ADDomainController: $($_.Exception.Message)"
         Write-Both "    [!] DC port check: could not enumerate DCs: $($_.Exception.Message)"
+        Register-ADAuditNotAssessed -Name 'DC port connectivity' -Switch 'portconnectivity' -Reason $_.Exception.Message
         return
     }
     if ($dcs.Count -eq 0) {
         Add-Content -Path $evidencePath -Value 'No domain controllers were returned by Get-ADDomainController.'
         Write-Both '    [!] DC port check: no DCs returned.'
+        Register-ADAuditNotAssessed -Name 'DC port connectivity' -Switch 'portconnectivity' -Reason 'No domain controllers returned.'
         return
     }
 
-    # Helper: TCP probe with short timeout
-    function _Test-TcpPort {
-        param([string]$Target, [int]$Port, [int]$TimeoutMs = 1500)
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        try {
-            $async = $tcp.BeginConnect($Target, $Port, $null, $null)
-            $ok = $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
-            if (-not $ok) { return [pscustomobject]@{ Open=$false; Error='timeout' } }
-            try { $tcp.EndConnect($async) } catch { return [pscustomobject]@{ Open=$false; Error=$_.Exception.Message } }
-            return [pscustomobject]@{ Open=$true; Error=$null }
-        } catch {
-            return [pscustomobject]@{ Open=$false; Error=$_.Exception.Message }
-        } finally {
-            try { $tcp.Close() } catch {}
+    if ($script:ADAuditIsolatedClone) {
+        foreach ($dc in $dcs) {
+            $targetName = if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name }
+            if (-not (Test-ADAuditLocalComputer $targetName)) {
+                Register-ADAuditNotAssessed -Name 'DC port connectivity' -Switch 'portconnectivity' -Target $targetName -Reason 'Isolated-clone mode: remote DC endpoint probes and cross-DC sources were intentionally excluded.'
+            }
+        }
+        $dcs = @($dcs | Where-Object { Test-ADAuditLocalComputer $(if ($_.HostName) { $_.HostName } else { $_.Name }) })
+        if ($dcs.Count -eq 0) {
+            Register-ADAuditNotAssessed -Name 'DC port connectivity' -Switch 'portconnectivity' -Reason 'No local DC identity matched in isolated-clone mode; no endpoint probes were run.'
+            Set-Content -LiteralPath $evidencePath -Value 'Isolated-clone mode: no local DC matched; current production connectivity is not assessed.'
+            return
         }
     }
 
@@ -108,22 +127,16 @@ Function Test-DCPortConnectivity {
     # and we skip the per-port probes for that DC. If the name resolves but
     # the host is down (e.g. firewall drops everything) the per-port loop
     # still runs and produces normal closed-port findings.
-    function _Test-HostResolves {
-        param([string]$Target)
-        try {
-            $null = [System.Net.Dns]::GetHostAddresses($Target)
-            return $true
-        } catch {
-            return $false
-        }
-    }
-
-    Write-Both ("    [+] Probing {0} DC(s) from this host on {1} required ports..." -f $dcs.Count, $portCatalog.Count)
+    Write-Both ("    [+] Probing {0} DC(s) from this host on {1} TCP endpoints..." -f $dcs.Count, $portCatalog.Count)
     $rows           = New-Object System.Collections.Generic.List[object]
     $unresolvedDcs  = New-Object System.Collections.Generic.List[string]
+    $probeIndex = 0
+    $probeTotal = $dcs.Count * $portCatalog.Count
     foreach ($dc in $dcs) {
         $tgt = if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name }
-        if (-not (_Test-HostResolves -Target $tgt)) {
+        Write-ADAuditProgress -Activity 'DC port connectivity' -Status "Resolving $tgt" -PercentComplete ([int](70 * $probeIndex / $probeTotal))
+        if (-not (Test-ADAuditPortTargetResolution -Target $tgt)) {
+            $probeIndex += $portCatalog.Count
             $unresolvedDcs.Add($tgt) | Out-Null
             $rows.Add([pscustomobject]@{
                 Source     = $env:COMPUTERNAME
@@ -141,7 +154,9 @@ Function Test-DCPortConnectivity {
             continue
         }
         foreach ($p in $portCatalog) {
-            $r = _Test-TcpPort -Target $tgt -Port $p.Port
+            Write-ADAuditProgress -Activity 'DC port connectivity' -Status "$tgt TCP $($p.Port) ($($p.Name))" -PercentComplete ([int](70 * $probeIndex / $probeTotal))
+            $r = Test-ADAuditPortEndpoint -Target $tgt -Port $p.Port
+            $probeIndex++
             $rows.Add([pscustomobject]@{
                 Source     = $env:COMPUTERNAME
                 Target     = $tgt
@@ -167,16 +182,30 @@ Function Test-DCPortConnectivity {
     $winrmSkippedReason = $null
 
     $winrmAvailableDcs = @()
+    $localSources = @()
+    $winrmSsl = @{}
     foreach ($dc in $dcs) {
         $tgt = if ($dc.HostName) { [string]$dc.HostName } else { [string]$dc.Name }
+        if (Test-ADAuditLocalComputer $tgt) {
+            # This process already probes from this DC. Reuse those observations
+            # instead of requiring WinRM to connect back to the same computer.
+            $localSources += $tgt
+            foreach ($row in $rows) {
+                if (-not (Test-ADAuditLocalComputer $row.Target)) { $row.ProbeFrom = "local DC '$env:COMPUTERNAME' (cross-DC origin)" }
+            }
+            continue
+        }
         $winrmRow = $rows | Where-Object { $_.Target -eq $tgt -and $_.Port -eq 5985 }
-        if ($winrmRow -and $winrmRow.Open) { $winrmAvailableDcs += $tgt }
+        $winrmTlsRow = $rows | Where-Object { $_.Target -eq $tgt -and $_.Port -eq 5986 }
+        if ($winrmTlsRow -and $winrmTlsRow.Open) { $winrmAvailableDcs += $tgt; $winrmSsl[$tgt] = $true }
+        elseif ($winrmRow -and $winrmRow.Open) { $winrmAvailableDcs += $tgt; $winrmSsl[$tgt] = $false }
+        elseif ($dcs.Count -gt 1) { Register-ADAuditNotAssessed -Name 'Cross-DC port connectivity' -Switch 'portconnectivity' -Target $tgt -Reason 'Neither WinRM HTTP nor HTTPS is reachable from the auditing host; no probes were run from this DC.' }
     }
 
-    if ($winrmAvailableDcs.Count -eq 0) {
-        $winrmSkippedReason = "WinRM (TCP 5985) is not reachable from this host to any DC, so we cannot run a cross-DC port matrix. Local-host probes above are still complete."
+    if ($winrmAvailableDcs.Count -eq 0 -and $localSources.Count -eq 0) {
+        $winrmSkippedReason = "WinRM (TCP 5985/5986) is not reachable from this host to any DC, so the cross-DC port matrix was not assessed. Local-host probes are recorded separately."
         Write-Both "    [!] WinRM is not reachable to any DC - skipping cross-DC port matrix. $winrmSkippedReason"
-    } else {
+    } elseif ($winrmAvailableDcs.Count -gt 0) {
         Write-Both ("    [+] WinRM reachable to {0} DC(s) - running cross-DC port matrix..." -f $winrmAvailableDcs.Count)
         # Run a probe FROM each WinRM-reachable DC TO every other DC. Drop any
         # DC that did not resolve via DNS from this host - the remote probe
@@ -185,8 +214,11 @@ Function Test-DCPortConnectivity {
         $allTargets = @($dcs | ForEach-Object { if ($_.HostName) { [string]$_.HostName } else { [string]$_.Name } } | Where-Object { $unresolvedDcs -notcontains $_ })
 
         foreach ($srcDc in $winrmAvailableDcs) {
+            Write-ADAuditProgress -Activity 'DC port connectivity' -Status "Cross-DC source $srcDc" -PercentComplete 75
             try {
-                $remoteResults = Invoke-Command -ComputerName $srcDc -ErrorAction Stop -ArgumentList $allTargets,$portCatalog -ScriptBlock {
+                Assert-ADAuditRemoteTargetAllowed -ComputerName $srcDc
+                $transport = @{ UseSSL = [bool]$winrmSsl[$srcDc] }
+                $remoteResults = Invoke-Command -ComputerName $srcDc @transport -ErrorAction Stop -ArgumentList $allTargets,$portCatalog -ScriptBlock {
                     param($Targets, $Catalog)
                     $local = $env:COMPUTERNAME
                     $out = New-Object System.Collections.Generic.List[object]
@@ -228,6 +260,7 @@ Function Test-DCPortConnectivity {
                 if ($remoteResults) { foreach ($rr in $remoteResults) { $crossRows.Add($rr) | Out-Null } }
             } catch {
                 Write-Both ("    [!] Cross-DC probe from {0} failed: {1}" -f $srcDc, $_.Exception.Message)
+                Register-ADAuditNotAssessed -Name 'Cross-DC port connectivity' -Switch 'portconnectivity' -Target $srcDc -Reason $_.Exception.Message
             }
         }
     }
@@ -235,6 +268,12 @@ Function Test-DCPortConnectivity {
     $allRows = New-Object System.Collections.Generic.List[object]
     foreach ($r in $rows)      { $allRows.Add($r) | Out-Null }
     foreach ($r in $crossRows) { $allRows.Add($r) | Out-Null }
+    foreach ($row in $allRows) {
+        $targetDc = $dcs | Where-Object { $_.HostName -eq $row.Target -or $_.Name -eq $row.Target } | Select-Object -First 1
+        if ($row.Port -in 3268,3269 -and -not $targetDc.IsGlobalCatalog) { $row.Required=$false; $row.Severity='Information'; $row.Why='Target is not a Global Catalog; no GC listener is required.' }
+        if (-not $row.Required) { $row.Severity='Information' }
+        elseif ($row.ProbeFrom -eq 'this host') { $row.Severity='Medium'; $row.Why += ' This is a management-host path observation, not proof of a DC-wide outage.' }
+    }
 
     # Persist machine-readable CSV
     if ($allRows.Count -gt 0) {
@@ -250,7 +289,9 @@ Function Test-DCPortConnectivity {
     [void]$sb.AppendLine(" Probed from    : $env:COMPUTERNAME")
     [void]$sb.AppendLine(" DC count       : $($dcs.Count)")
     [void]$sb.AppendLine(" Ports per DC   : $($portCatalog.Count)")
-    [void]$sb.AppendLine(" Cross-DC probe : $(if ($winrmAvailableDcs.Count -gt 0) { 'yes via WinRM from ' + ($winrmAvailableDcs -join ', ') } else { 'SKIPPED' })")
+    [void]$sb.AppendLine(" Local DC source: $(if ($localSources.Count) { $localSources -join ', ' } else { 'not running on a DC' })")
+    [void]$sb.AppendLine(" Remote sources : $(if ($winrmAvailableDcs.Count -gt 0) { 'via WinRM from ' + ($winrmAvailableDcs -join ', ') } else { 'none collected' })")
+    if ($script:ADAuditIsolatedClone) { [void]$sb.AppendLine(' Scope          : isolated clone, local listeners only; production connectivity and peer availability are not assessed.') }
     if ($winrmSkippedReason) { [void]$sb.AppendLine("                  Reason: $winrmSkippedReason") }
     [void]$sb.AppendLine('---------------------------------------------------------------------')
     [void]$sb.AppendLine('')
@@ -258,14 +299,14 @@ Function Test-DCPortConnectivity {
     [void]$sb.AppendLine(' - Each section below groups the closed-port findings by severity.')
     [void]$sb.AppendLine(' - "Closed" means the TCP probe could not establish a connection from')
     [void]$sb.AppendLine('   the named source to the named target on that port within 1.5s.')
-    [void]$sb.AppendLine(' - LDAP (389) and LDAPS (636) are special: 389 OPEN is normal but a')
-    [void]$sb.AppendLine('   risk if LDAP signing/channel-binding is not enforced; 636 CLOSED')
-    [void]$sb.AppendLine('   is treated as a real finding because it forces all LDAP to plain.')
+    [void]$sb.AppendLine(' - LDAP 389 supports STARTTLS and SASL sealing. TCP probes do not test session protection.')
+    [void]$sb.AppendLine(' - Optional listeners are informational. UDP and dynamic RPC endpoint/range access are not assessed.')
+    [void]$sb.AppendLine(' - Failed probes describe only the named source/target path; validate requirements before changing firewall rules.')
     [void]$sb.AppendLine('')
 
     # Closed-port findings, grouped by severity (highest first)
     $closed = @($allRows | Where-Object { -not $_.Open })
-    $sevOrder = @{ 'Critical'=0; 'High'=1; 'Medium'=2; 'Low'=3 }
+    $sevOrder = @{ 'Critical'=0; 'High'=1; 'Medium'=2; 'Low'=3; 'Information'=4 }
     $closedBySeverity = $closed | Group-Object Severity | Sort-Object @{Expression={$sevOrder[$_.Name]}}
 
     if ($closed.Count -eq 0) {
@@ -281,16 +322,16 @@ Function Test-DCPortConnectivity {
                 [void]$sb.AppendLine("  Port $($first.Port)/$($first.Proto) - $($first.PortName)")
                 [void]$sb.AppendLine("    Why : $($first.Why)")
                 $fix = switch -Regex ($first.PortName) {
-                    '^LDAPS' { 'Issue an LDAPS certificate to the DC (Server Authentication EKU, subject = DC FQDN), reload the DC schannel store (e.g. restart NTDS), and verify with `ldp.exe` to <DC>:636.' ; break }
+                    '^LDAPS' { 'Confirm that this source is expected to use LDAPS. If so, inspect the listener and certificate chain/name/expiry with ldp.exe before changing policy or services.'; break }
                     'LDAP \(plaintext\)' { 'LDAP itself must be open (clients still use 389). The risk is unsigned/cleartext binds. Enforce LDAP signing (HKLM\System\CurrentControlSet\Services\NTDS\Parameters\LDAPServerIntegrity=2) and channel binding (LdapEnforceChannelBinding=2) - both should already be on per the LDAPSecurity check above.' ; break }
-                    'WinRM HTTP|WinRM HTTPS' { 'Enable WinRM (`Enable-PSRemoting -Force`) or open TCP 5985/5986 on the DC firewall to the management subnet. Cross-DC checks in this audit need 5985 reachable from the audit host.' ; break }
+                    'WinRM HTTP|WinRM HTTPS' { 'Collection requires an approved WinRM transport from the audit host. Coordinate scoped access or run collection from an approved management host; do not expose management ports broadly.'; break }
                     'AD Web Services' { 'Verify the ADWS service is running on the DC (`Get-Service ADWS`). Open TCP 9389 from any host that uses the ActiveDirectory PowerShell module.' ; break }
                     'RPC endpoint' { 'Open TCP 135 from the source to the target. Most AD operations (replication, secure channel, Netlogon) start by hitting the RPC endpoint mapper here. Without it almost everything below fails.' ; break }
                     'Dynamic RPC' { 'Open the dynamic RPC range (TCP 49152-65535) or pin a static replication port via the RPC dynamic-port restriction registry value. Sampling 49152 alone is heuristic - one closed sample does not prove the entire range is blocked.' ; break }
                     'Kerberos password change' { 'Open TCP/UDP 464 between the DC and any host that does password changes (clients changing passwords, Set-ADAccountPassword from a remote DC).' ; break }
                     'Kerberos\b' { 'Open TCP/UDP 88 between the source and the DC. Kerberos auth fails completely without it.' ; break }
-                    'Global Catalog' { "Open the GC port (3268 plain / 3269 TLS) from the source to the DC. Multi-domain forest logons and Exchange use GC; closed GC breaks them." ; break }
-                    'DNS\b' { 'Open TCP/UDP 53 from clients to the DC. Without it clients cannot find DCs (no SRV records).' ; break }
+                    'Global Catalog' { 'Confirm the target GC role and client path requirements. Validate GC 3268 or its TLS endpoint before requesting scoped firewall changes.'; break }
+                    'DNS\b' { 'Confirm this DC hosts the DNS role and that the named source is expected to query it; otherwise no listener is required.'; break }
                     'SMB\b' { 'Open TCP 445 between the source and the DC. SYSVOL, NETLOGON, GPO download all use SMB.' ; break }
                     'NetBIOS' { 'TCP 139 is legacy. If only modern clients exist this is fine to leave closed; otherwise open it.' ; break }
                     default { 'Open this port from the source to the target on the DC firewall and any path firewall.' }
@@ -319,9 +360,9 @@ Function Test-DCPortConnectivity {
         $ldapsState = if ($ldaps -and $ldaps.Open) { 'OPEN' } else { 'CLOSED' }
         $verdict =
             if ($ldapsState -eq 'OPEN' -and $ldapState -eq 'OPEN') { 'OK (both available - enforce LDAP signing + channel binding)' }
-            elseif ($ldapsState -eq 'OPEN' -and $ldapState -eq 'CLOSED') { 'OK (LDAPS only, plaintext blocked - rare but ideal)' }
-            elseif ($ldapsState -eq 'CLOSED' -and $ldapState -eq 'OPEN') { 'RISK: LDAPS not reachable - all LDAP traffic forced to plaintext on 389' }
-            else { 'CRITICAL: neither LDAP nor LDAPS reachable - no AD lookups possible from this host' }
+            elseif ($ldapsState -eq 'OPEN' -and $ldapState -eq 'CLOSED') { 'LDAPS reachable; LDAP 389 unavailable on this source path. Validate client requirements.' }
+            elseif ($ldapsState -eq 'CLOSED' -and $ldapState -eq 'OPEN') { 'LDAP 389 reachable; LDAPS unavailable on this source path. STARTTLS/SASL sealing and effective protections require separate assessment.' }
+            else { 'Neither LDAP listener was reached from this host; directory access and protection were not established.' }
         [void]$sb.AppendLine(("  {0,-40} 389={1,-6} 636={2,-6}  =>  {3}" -f $tgt, $ldapState, $ldapsState, $verdict))
     }
     [void]$sb.AppendLine('')
@@ -343,8 +384,9 @@ Function Test-DCPortConnectivity {
     }
 
     try {
-        Write-Nessus-Finding "DCPortConnectivity" "KB1310" ([System.IO.File]::ReadAllText($evidencePath))
+        if ($closedReq.Count -gt 0) { Write-Nessus-Finding "DCPortConnectivity" "KB1310" ([System.IO.File]::ReadAllText($evidencePath)) 'Medium' }
     } catch {}
+    Write-ADAuditProgress -Activity 'DC port connectivity' -Status 'Connectivity evidence written' -PercentComplete 100 -Completed
 }
 
 function Invoke-PortConnectivityCheck {

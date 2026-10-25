@@ -34,14 +34,15 @@ Function Get-HighRiskADBaselineReport {
             This function is additive and does not modify existing checks or outputs.
     #>
 
-    # Baseline (opinionated, aligned with Microsoft tiering + common security guidance)
+    # Audit review targets. Counts alone do not establish unnecessary permanent
+    # access, compromised credentials or an exploitable path.
     $baseline = [ordered]@{
-        'Domain Admins (permanent members)'        = '<= 5'
-        'Enterprise Admins (permanent members)'    = '0-2 (temporary only)'
-        'Schema Admins (permanent members)'        = '0 (except during schema change)'
+        'Domain Admins (observed members)'        = '<= 5 (audit review target; permanence not established)'
+        'Enterprise Admins (observed members)'    = '0-2 (review standing versus temporary access)'
+        'Schema Admins (observed members)'        = '0 (except during authorized schema change)'
         'BUILTIN\Administrators (permanent members)' = 'Minimal (avoid non-DA users)'
         'Account Operators / Server Operators / Backup Operators / Print Operators' = 'Empty'
-        'krbtgt password age'                      = '<= 180 days (rotate; 2x after incident)'
+        'krbtgt password age'                      = 'Review rotation process after 180 days; age alone does not establish compromise'
         'Enabled user inactivity'                  = 'Disable if inactive > 180 days (adjust to org policy)'
         'Disabled user retention'                  = 'Review/remove if disabled > 180 days'
         'Password never expires (humans)'          = '0 (use gMSA/MSA for services)'
@@ -60,15 +61,19 @@ Function Get-HighRiskADBaselineReport {
     # Helper: safe group member enumeration
     function _Get-GroupMembersBySidOrName {
         param(
-            [Parameter(Mandatory=$true)][string]$Identity
+            [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Identity,
+            [string]$Server
         )
         # Return $null on failure (distinct from an empty array) so the caller can tell
         # "enumeration failed" apart from "group is genuinely empty". Get-ADGroupMember
         # -Recursive routinely throws on foreign security principals from trusted domains
         # or the 5000-member limit; treating that as an empty group is a false all-clear.
         try {
-            $g = Get-ADGroup -Identity $Identity -ErrorAction Stop
-            return ,@(Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop)
+            if (-not $Identity) { return $null }
+            $query = @{ ErrorAction='Stop' }
+            if ($Server) { $query.Server = $Server }
+            $g = Get-ADGroup -Identity $Identity @query
+            return ,@(Get-ADGroupMember -Identity $g -Recursive @query)
         } catch {
             return $null
         }
@@ -82,12 +87,18 @@ Function Get-HighRiskADBaselineReport {
     }
 
     # Collect privileged groups (covering domain/forest + builtin operator groups)
-    $domainSid = (Get-ADDomain -Current LoggedOnUser).DomainSID.Value
+    $domainSid = (Get-ADDomain -Current LoggedOnUser -ErrorAction Stop).DomainSID.Value
+    $rootSid = $null
+    $rootServer = $null
+    try {
+        $rootServer = (Get-ADForest -ErrorAction Stop).RootDomain
+        $rootSid = (Get-ADDomain -Identity $rootServer -Server $rootServer -ErrorAction Stop).DomainSID.Value
+    } catch { Register-ADAuditNotAssessed -Name 'HighRisk forest-root identity' -Reason $_.Exception.Message }
 
     $groupDefs = @(
-        @{ RiskId='PRIV_DA';   Name='Domain Admins';        Identity=($domainSid + '-512'); Baseline='<= 5'; Severity='CRITICAL' }
-        @{ RiskId='PRIV_EA';   Name='Enterprise Admins';    Identity=($domainSid + '-519'); Baseline='0-2 (temporary only)'; Severity='CRITICAL' }
-        @{ RiskId='PRIV_SA';   Name='Schema Admins';        Identity=($domainSid + '-518'); Baseline='0 (except during schema change)'; Severity='CRITICAL' }
+        @{ RiskId='PRIV_DA';   Name='Domain Admins';        Identity=($domainSid + '-512'); Baseline='<= 5 (audit review target)'; Severity='HIGH' }
+        @{ RiskId='PRIV_EA';   Name='Enterprise Admins';    Identity=$(if ($rootSid) { $rootSid + '-519' } else { '' }); Server=$rootServer; Baseline='0-2 (review temporary access)'; Severity='HIGH' }
+        @{ RiskId='PRIV_SA';   Name='Schema Admins';        Identity=$(if ($rootSid) { $rootSid + '-518' } else { '' }); Server=$rootServer; Baseline='0 (except during authorized schema change)'; Severity='HIGH' }
         @{ RiskId='PRIV_ADM';  Name='BUILTIN\Administrators'; Identity='S-1-5-32-544';        Baseline='Minimal'; Severity='HIGH' }
         @{ RiskId='PRIV_AO';   Name='BUILTIN\Account Operators'; Identity='S-1-5-32-548';     Baseline='Empty'; Severity='HIGH' }
         @{ RiskId='PRIV_SO';   Name='BUILTIN\Server Operators';  Identity='S-1-5-32-549';     Baseline='Empty'; Severity='HIGH' }
@@ -98,8 +109,11 @@ Function Get-HighRiskADBaselineReport {
     $privDetails = @()
     $privGroupFailed = @{}
     $privSamSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    $groupIndex = 0
     foreach ($gd in $groupDefs) {
-        $members = _Get-GroupMembersBySidOrName -Identity $gd.Identity
+        Write-ADAuditProgress -Activity 'High risk: privileged membership' -Status "Group $($groupIndex + 1)/$($groupDefs.Count): $($gd.Name)" -PercentComplete ($groupIndex / [math]::Max(1,$groupDefs.Count) * 100)
+        $groupIndex++
+        $members = _Get-GroupMembersBySidOrName -Identity $gd.Identity -Server $gd.Server
         if ($null -eq $members) {
             $privGroupFailed[$gd.RiskId] = $true
             Register-ADAuditNotAssessed -Name 'HighRisk privileged group enumeration' -Target $gd.Name -Reason 'Get-ADGroupMember -Recursive failed (foreign security principals from a trusted domain, the 5000-member limit, or insufficient rights). Membership count is unknown - re-run with adequate permissions.'
@@ -154,7 +168,7 @@ Function Get-HighRiskADBaselineReport {
             Baseline       = $gd.Baseline
             Observed       = $cnt
             IsFinding      = $isFinding
-            Recommendation = 'Minimize permanent membership; use JIT/PIM where possible; keep Tier0 separate; monitor changes.'
+            Recommendation = 'Review authorization, enablement state and temporary versus standing membership. Count is a privilege-governance signal, not proof of exploitation. Reduce unnecessary standing access and monitor changes.'
         }
     }
 
@@ -176,14 +190,15 @@ Function Get-HighRiskADBaselineReport {
             RiskId         = 'PRIV_DA_OVERLAP'
             Category       = 'Privileged Group Membership'
             Item           = 'Domain Admins group overlap (extra group memberships)'
-            Severity       = 'CRITICAL'
+            Severity       = 'HIGH'
             Baseline       = 0
             Observed       = $overlapCount
             IsFinding      = ($overlapCount -gt 0)
-            Recommendation = 'Remove Domain Admin accounts from all non-essential groups. Tier0 identities must be isolated; avoid Tier0+Tier1 overlap and delegated memberships.'
+            Recommendation = 'Review group purpose, effective rights and account enablement before changing memberships. Group-name and membership overlap alone do not prove a credential exposure or an exploitable path. Remove unnecessary memberships and separate administrative duties.'
         }
     }
 
+    Write-ADAuditProgress -Activity 'High risk: account hygiene' -Status 'Reading krbtgt, enabled and disabled account evidence' -PercentComplete -1
     # krbtgt password age
     $krbtgt = Get-ADUser -Filter { SamAccountName -eq "krbtgt" } -Properties PasswordLastSet -ErrorAction SilentlyContinue
     $krbtgtLastSet = $null
@@ -197,11 +212,17 @@ Function Get-HighRiskADBaselineReport {
         RiskId='KRB_KRBTGT'
         Category='Kerberos'
         Item='krbtgt password age'
-        Severity='CRITICAL'
-        Baseline='<= 180 days'
+        Severity=$(if ($script:ADAuditIsolatedClone -or $null -eq $krbtgtDays) { 'INFORMATION' } else { 'MEDIUM' })
+        Baseline='180 days (rotation review target)'
         Observed= $(if ($krbtgtLastSet) { "$krbtgtLastSet ($krbtgtDays days)" } else { 'Unknown' })
-        IsFinding=$krbtgtFinding
-        Recommendation='Rotate krbtgt regularly; after incident perform two resets per Microsoft guidance (allow ticket lifetime between resets).'
+        IsFinding=($krbtgtFinding -and -not $script:ADAuditIsolatedClone)
+        Assessment=$(if ($script:ADAuditIsolatedClone) { 'Not assessed on isolated clone' } elseif ($null -eq $krbtgtDays) { 'Not assessed: password age unavailable' } elseif ($krbtgtFinding) { 'Rotation process review' } else { 'Within audit age threshold' })
+        Recommendation='Verify the current production rotation history and incident context. Age alone does not establish a stolen krbtgt key or Golden Ticket exposure. Coordinate any rotation with replication health, ticket lifetimes and application impact; follow the documented incident recovery procedure when compromise is known or suspected.'
+    }
+    if ($script:ADAuditIsolatedClone) {
+        Register-ADAuditNotAssessed -Name 'HighRisk krbtgt rotation age' -Reason 'An isolated copy cannot establish current production key age or rotation history. Snapshot age does not increase severity.'
+    } elseif ($null -eq $krbtgtDays) {
+        Register-ADAuditNotAssessed -Name 'HighRisk krbtgt rotation age' -Reason 'PasswordLastSet was not available; no rotation-age finding was inferred.'
     }
 
     # Enabled inactive users (>180 days)
@@ -238,9 +259,8 @@ foreach ($u in $enabledUsers) {
     $invalidFileTime = ($null -ne $lltRaw -and $null -eq $llt)
 
     # If lastLogonTimestamp is missing/invalid, fall back to whenCreated as a best-effort heuristic
-    $isInactive =
-        (($llt -ne $null) -and ($llt -lt $cutoff)) -or
-        (($llt -eq $null) -and ($u.whenCreated -lt $cutoff))
+    $isInactive = $u.whenCreated -and ($u.whenCreated -lt $cutoff) -and -not $invalidFileTime -and (
+        (($llt -ne $null) -and ($llt -lt $cutoff)) -or ($llt -eq $null))
 
     if ($isInactive) {
         $inactiveDetails.Add([pscustomobject]@{
@@ -285,7 +305,7 @@ $inactiveObj = [pscustomobject]@{
             SamAccountName=$u.SamAccountName
             Name=$u.Name
             Baseline='0 (humans); use gMSA/MSA for services'
-            Severity= $(if ($privSamSet.Contains([string]$u.SamAccountName)) { 'CRITICAL' } else { 'HIGH' })
+            Severity= 'HIGH'
             IsPrivileged= $privSamSet.Contains([string]$u.SamAccountName)
         })
     }
@@ -297,7 +317,7 @@ $inactiveObj = [pscustomobject]@{
         Baseline='0 (humans); services should use gMSA/MSA'
         Observed=$(if ($pneQueryFailed) { 'Unknown (query failed)' } else { ($pneDetails | Measure-Object).Count })
         IsFinding=((($pneDetails | Measure-Object).Count) -gt 0)
-        Recommendation='Eliminate non-expiring human passwords; migrate service accounts to gMSA; rotate credentials; enforce MFA for admins.'
+        Recommendation='Review the account purpose and password policy, including controls for compromised passwords and privileged access. The non-expiring flag alone does not prove password weakness or compromise. Consider managed service accounts and coordinate any required credential rotation.'
     }
 
     # Disabled accounts stale (>180 days) based on whenChanged (best-effort)
@@ -366,7 +386,7 @@ $inactiveObj = [pscustomobject]@{
 
     if (Import-ADAuditModule -Name DSInternals) {
         try {
-            $dcObj = Get-ADDomainController -Discover
+            $dcObj = if ($script:ADAuditIsolatedClone) { Get-ADDomainController -Identity $env:COMPUTERNAME -Server $env:COMPUTERNAME -ErrorAction Stop } else { Get-ADDomainController -Discover }
             $dc = $dcObj.DNSHostName
             if (-not $dc) { $dc = $dcObj.HostName }
             if (-not $dc) { $dc = $dcObj.Name }
@@ -376,13 +396,22 @@ $inactiveObj = [pscustomobject]@{
             $domainDN = $domain.DistinguishedName
 
             $replAccounts = Get-ADAuditReplAccountsCached -Server $dc -NamingContext $domainDN
-            $hashGroups = @()
+            $hashGroups = [System.Collections.Generic.List[object]]::new()
 
+            $replIndex = 0
             foreach ($ra in $replAccounts) {
+                Write-ADAuditProgress -Activity 'High risk: duplicate password grouping' -Status "$replIndex/$($replAccounts.Count) replicated accounts processed" -PercentComplete ($replIndex / [math]::Max(1,$replAccounts.Count) * 100)
+                $replIndex++
                 $sam = $ra.SamAccountName
                 $hex = _ToHex -Bytes $ra.NTHash
                 if ($sam -and $hex) {
-                    $hashGroups += [pscustomobject]@{ SamAccountName=$sam; NTHash=$hex }
+                    $state = 'Unknown'
+                    if ($ra.PSObject.Properties['Enabled'] -and $ra.Enabled -is [bool]) {
+                        $state = if ($ra.Enabled) { 'Enabled' } else { 'Disabled' }
+                    } elseif ($ra.PSObject.Properties['UserAccountControl'] -and $null -ne $ra.UserAccountControl) {
+                        try { $state = if (([int64]$ra.UserAccountControl -band 2) -ne 0) { 'Disabled' } else { 'Enabled' } } catch { }
+                    }
+                    $hashGroups.Add([pscustomobject]@{ SamAccountName=$sam; NTHash=$hex; AccountStatus=$state })
                 }
             }
 
@@ -398,14 +427,16 @@ $inactiveObj = [pscustomobject]@{
 
                 foreach ($m in $members) {
                     $isPrivileged = $privSamSet.Contains([string]$m)
+                    $memberState = ($g.Group | Where-Object SamAccountName -eq $m | Select-Object -First 1).AccountStatus
                     $dupDetails += [pscustomobject]@{
                         RiskId='PWD_DUPLICATE'
                         PasswordGroup=$groupLabel
                         SharedCount=@($members).Count
                         SamAccountName=$m
+                        AccountStatus=$memberState
                         SamePasswordAccounts=$samePasswordAccounts
                         IsPrivileged=$isPrivileged
-                        Severity= $(if ($isPrivileged) { 'CRITICAL' } else { 'HIGH' })
+                        Severity= $(if ($memberState -eq 'Unknown') { 'INFORMATION' } elseif ($memberState -eq 'Disabled') { 'LOW' } elseif ($isPrivileged) { 'CRITICAL' } else { 'HIGH' })
                         Baseline='0'
                     }
                 }
@@ -413,22 +444,25 @@ $inactiveObj = [pscustomobject]@{
 
             $dupDetails = @($dupDetails | Sort-Object PasswordGroup, SamAccountName)
 
-            $dupCount = ($dups | Measure-Object).Count
+            $activeDupDetails = @($dupDetails | Where-Object AccountStatus -eq 'Enabled')
+            $dupCount = @($activeDupDetails | Select-Object -ExpandProperty PasswordGroup -Unique).Count
             $dupSummaryObj = [pscustomobject]@{
                 RiskId='PWD_DUPLICATE'
                 Category='Credential Hygiene'
                 Item='Duplicate passwords (duplicate NT hashes)'
                 Severity='CRITICAL'
                 Baseline='0'
-                Observed="$dupCount duplicate-hash groups; $($dupDetails.Count) affected accounts"
-                IsFinding=($dupDetails.Count -gt 0)
+                Observed="$dupCount duplicate-hash groups affecting $($activeDupDetails.Count) enabled accounts; $(@($dupDetails | Where-Object AccountStatus -eq 'Disabled').Count) disabled; $(@($dupDetails | Where-Object AccountStatus -eq 'Unknown').Count) unknown state"
+                IsFinding=($activeDupDetails.Count -gt 0)
                 Recommendation='Eliminate password reuse; prioritize privileged accounts; enforce unique passwords; rotate; consider banned password lists.'
             }
         } catch {
-            # Keep default "Not evaluated" if anything fails
+            $dupSummaryObj.Observed = 'Not evaluated (collection failed)'
+            Register-ADAuditNotAssessed -Name 'HighRisk duplicate passwords' -Reason $_.Exception.Message
         }
     }
 
+    Write-ADAuditProgress -Activity 'High risk: report generation' -Status 'Writing summary and evidence' -PercentComplete -1
     # Build summary table
     $summary = @()
     $summary += $privSummary
@@ -558,7 +592,12 @@ Write-Both "    [+] High-risk AD baseline report generated: ad_high_risk_baselin
 }
 
 function Invoke-HighRiskCheck {
-    Get-HighRiskADBaselineReport
+    Write-ADAuditProgress -Activity 'High-risk baseline' -Status 'Starting collection' -PercentComplete -1
+    try {
+        Get-HighRiskADBaselineReport
+    } finally {
+        Write-ADAuditProgress -Activity 'High-risk baseline' -Completed
+    }
 }
 
 # ---- Standalone launch --------------------------------------------------------------------

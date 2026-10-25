@@ -42,34 +42,91 @@ function Get-ADObjectAclSafe {
     }
 }
 
+function Get-ADAuditAceSid {
+    param($Ace, [hashtable]$Cache)
+    try {
+        $identity = $Ace.IdentityReference
+        if ([string]$identity -match '^S-1-') { return [string]$identity }
+        $key = [string]$identity
+        if ($null -ne $Cache -and $Cache.ContainsKey($key)) { return $Cache[$key] }
+        $sid = $identity.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($null -ne $Cache -and $sid) { $Cache[$key] = $sid }
+        return $sid
+    } catch { return $null }
+}
+
+function Export-ADAuditSecurityCsv {
+    param($Rows, [string[]]$Columns, [string]$Path)
+    $items = @($Rows | Where-Object { $null -ne $_ })
+    if ($items.Count -gt 0) {
+        $items | Select-Object -Property $Columns | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath $Path
+    } else {
+        # Preserve the schema for empty results; a zero-byte file is ambiguous.
+        (($Columns | ForEach-Object { '"' + ($_ -replace '"','""') + '"' }) -join ',') | Set-Content -Encoding UTF8 -LiteralPath $Path
+    }
+}
+
+function Get-ADAuditDangerousAceCapability {
+    # This identifies an applicable allow ACE, not effective access through a complete token.
+    # Retain that distinction in the evidence: other ACEs and group memberships matter.
+    param($Ace, [switch]$IncludeDescendants)
+    if ([string]$Ace.AccessControlType -ne 'Allow') { return }
+    if (-not $IncludeDescendants -and ([string]$Ace.PropagationFlags -match 'InheritOnly')) { return }
+    $rights = [int]$Ace.ActiveDirectoryRights
+    $guid = [string]$Ace.ObjectType
+    $allProperties = (-not $guid -or $guid -eq [guid]::Empty.ToString())
+    if (($rights -band 983551) -eq 983551) { 'GenericAll'; return }
+    if (($rights -band 262144) -ne 0) { 'WriteDacl' }
+    if (($rights -band 524288) -ne 0) { 'WriteOwner' }
+    if (($rights -band 131112) -eq 131112) { 'GenericWrite' }
+    elseif (($rights -band 32) -ne 0 -and $allProperties) { 'WriteAllProperties' }
+    elseif (($rights -band 32) -ne 0 -and $guid -eq 'bf9679c0-0de6-11d0-a285-00aa003049e2') { 'WriteGroupMembership' }
+    if (($rights -band 256) -ne 0 -and ($allProperties -or $guid -eq '00299570-246d-11d0-a768-00aa006e0529')) { 'ResetPasswordOrAllExtendedRights' }
+    if (($rights -band 65536) -ne 0) { 'Delete' }
+}
+
 function Find-DangerousACLPermissions {
     #Specify the ACLs and Groups to check against
-    $dangerousAces = @('GenericAll', 'GenericWrite', 'ForceChangePassword', 'WriteDacl', 'WriteOwner', 'Delete')
+    $coverage = [System.Collections.Generic.List[object]]::new()
+    $sidCache = @{}
     # Build the low-privilege identity list dynamically. The literal 'DOMAIN\Domain Users'
     # placeholder never matched a real IdentityReference (e.g. 'CONTOSO\Domain Users'),
     # so the whole check silently found nothing. Use the locale-correct script variables
     # populated by Get-Variables and qualify Domain Users with the real NetBIOS name.
-    $nbDomain  = try { (Get-ADDomain).NetBIOSName } catch { $env:USERDOMAIN }
+    $domain = Get-ADDomain -ErrorAction Stop
+    $nbDomain  = if ($domain.NetBIOSName) { $domain.NetBIOSName } else { $env:USERDOMAIN }
     $authUsers = if ($script:AuthenticatedUsers) { $script:AuthenticatedUsers } else { 'NT AUTHORITY\Authenticated Users' }
     $everyone  = if ($script:EveryOne)           { $script:EveryOne }           else { 'Everyone' }
     $domUsers  = if ($script:DomainUsers)         { $script:DomainUsers }         else { 'Domain Users' }
     $groupsToCheck = @($authUsers, $everyone, "$nbDomain\$domUsers")
+    $domainSid = $domain.DomainSID.Value
+    $broadSids = @('S-1-1-0','S-1-5-11','S-1-5-32-545',"$domainSid-513","$domainSid-515")
 
     # Find dangerous permissions on Computers
-    $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties Name -ResultPageSize 2000
+    Write-ADAuditProgress -Activity 'ACL: computers' -Status 'Enumerating directory objects' -PercentComplete -1
+    $computers = @(Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties Name -ResultPageSize 2000 -ErrorAction Stop)
     $ci = 0
+    $ciFailed = 0
     $computerResults = foreach ($computer in $computers) {
         try {
+            Write-ADAuditProgress -Activity 'ACL: computers' -Status "Reading computer $($ci + 1)/$($computers.Count); $ci reads finished, ${ciFailed} unreadable" -PercentComplete ($ci / [math]::Max(1,$computers.Count) * 100)
             $acl = Get-ADObjectAclSafe -DistinguishedName $computer.DistinguishedName
         }
         catch {
             Write-Warning "Could not retrieve ACL for computer '$computer': $_"
+            Register-ADAuditNotAssessed -Name 'Dangerous ACL' -Switch 'acl' -Target $computer.DistinguishedName -Reason "ACL read failed: $($_.Exception.Message)"
+            $coverage.Add([pscustomobject]@{ObjectType='Computer'; DistinguishedName=$computer.DistinguishedName; Status='NotAssessed'})
+            $ciFailed++
             continue
+        } finally {
+            $ci++
+            Write-ADAuditProgress -Activity 'ACL: computers' -Status "${ci}/$($computers.Count) ACL reads finished; ${ciFailed} unreadable" -PercentComplete ($ci / [math]::Max(1,$computers.Count) * 100)
         }
+        $coverage.Add([pscustomobject]@{ObjectType='Computer'; DistinguishedName=$computer.DistinguishedName; Status='Assessed'})
 
         $dangerousRules = $acl.Access | Where-Object {
-            ([string]$_.IdentityReference -in $groupsToCheck) -and
-            ((($_.ActiveDirectoryRights.ToString()) -split ',\s*') | Where-Object { $_ -in $dangerousAces })
+            ((Get-ADAuditAceSid $_ -Cache $sidCache) -in $broadSids -or [string]$_.IdentityReference -in $groupsToCheck) -and
+            @(Get-ADAuditDangerousAceCapability $_).Count -gt 0
         }
 
         if ($dangerousRules) {
@@ -80,28 +137,44 @@ function Find-DangerousACLPermissions {
                     IdentityReference     = $rule.IdentityReference
                     AccessControlType     = $rule.AccessControlType
                     ActiveDirectoryRights = $rule.ActiveDirectoryRights
+                    DistinguishedName     = $computer.DistinguishedName
+                    TrusteeSid            = Get-ADAuditAceSid $rule -Cache $sidCache
+                    ObjectTypeGuid        = [string]$rule.ObjectType
+                    InheritanceType       = [string]$rule.InheritanceType
+                    IsInherited           = $rule.IsInherited
+                    Capability            = @(Get-ADAuditDangerousAceCapability $rule) -join '; '
+                    Status                = 'PotentialExposure'
+                    Severity              = 'High'
                 }
             }
         }
-        $ci++
-        Write-Progress -Activity "Searching for dangerous ACL permissions on computers" -Status "Computers searched: $ci/$($computers.Count)" -PercentComplete ($ci / $computers.Count * 100)
     }
 
     # Find dangerous permissions on groups
-    $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties Name -ResultPageSize 2000
+    Write-ADAuditProgress -Activity 'ACL: groups' -Status 'Enumerating directory objects' -PercentComplete -1
+    $groups = @(Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties Name -ResultPageSize 2000 -ErrorAction Stop)
     $gi = 0
+    $giFailed = 0
     $groupResults = foreach ($group in $groups) {
         try {
+            Write-ADAuditProgress -Activity 'ACL: groups' -Status "Reading group $($gi + 1)/$($groups.Count); $gi reads finished, ${giFailed} unreadable" -PercentComplete ($gi / [math]::Max(1,$groups.Count) * 100)
             $acl = Get-ADObjectAclSafe -DistinguishedName $group.DistinguishedName
         }
         catch {
             Write-Warning "Could not retrieve ACL for group '$group': $_"
+            Register-ADAuditNotAssessed -Name 'Dangerous ACL' -Switch 'acl' -Target $group.DistinguishedName -Reason "ACL read failed: $($_.Exception.Message)"
+            $coverage.Add([pscustomobject]@{ObjectType='Group'; DistinguishedName=$group.DistinguishedName; Status='NotAssessed'})
+            $giFailed++
             continue
+        } finally {
+            $gi++
+            Write-ADAuditProgress -Activity 'ACL: groups' -Status "${gi}/$($groups.Count) ACL reads finished; ${giFailed} unreadable" -PercentComplete ($gi / [math]::Max(1,$groups.Count) * 100)
         }
+        $coverage.Add([pscustomobject]@{ObjectType='Group'; DistinguishedName=$group.DistinguishedName; Status='Assessed'})
 
         $dangerousRules = $acl.Access | Where-Object {
-            ([string]$_.IdentityReference -in $groupsToCheck) -and
-            ((($_.ActiveDirectoryRights.ToString()) -split ',\s*') | Where-Object { $_ -in $dangerousAces })
+            ((Get-ADAuditAceSid $_ -Cache $sidCache) -in $broadSids -or [string]$_.IdentityReference -in $groupsToCheck) -and
+            @(Get-ADAuditDangerousAceCapability $_).Count -gt 0
         }
 
         if ($dangerousRules) {
@@ -112,28 +185,44 @@ function Find-DangerousACLPermissions {
                     IdentityReference     = $rule.IdentityReference
                     AccessControlType     = $rule.AccessControlType
                     ActiveDirectoryRights = $rule.ActiveDirectoryRights
+                    DistinguishedName     = $group.DistinguishedName
+                    TrusteeSid            = Get-ADAuditAceSid $rule -Cache $sidCache
+                    ObjectTypeGuid        = [string]$rule.ObjectType
+                    InheritanceType       = [string]$rule.InheritanceType
+                    IsInherited           = $rule.IsInherited
+                    Capability            = @(Get-ADAuditDangerousAceCapability $rule) -join '; '
+                    Status                = 'PotentialExposure'
+                    Severity              = 'High'
                 }
             }
         }
-        $gi++
-        Write-Progress -Activity "Searching for dangerous ACL permissions on groups" -Status "Groups searched: $gi/$($groups.Count)" -PercentComplete ($gi / $groups.Count * 100)
     }
     # Find dangerous permissions on users
-    $users = Get-ADObject -Filter { objectClass -eq 'user' -and objectCategory -eq 'person' } -Properties Name -ResultPageSize 2000
+    Write-ADAuditProgress -Activity 'ACL: users' -Status 'Enumerating directory objects' -PercentComplete -1
+    $users = @(Get-ADObject -Filter { objectClass -eq 'user' -and objectCategory -eq 'person' } -Properties Name -ResultPageSize 2000 -ErrorAction Stop)
     $ui = 0
+    $uiFailed = 0
 
     $userResults = foreach ($user in $users) {
         try {
+            Write-ADAuditProgress -Activity 'ACL: users' -Status "Reading user $($ui + 1)/$($users.Count); $ui reads finished, ${uiFailed} unreadable" -PercentComplete ($ui / [math]::Max(1,$users.Count) * 100)
             $acl = Get-ADObjectAclSafe -DistinguishedName $user.DistinguishedName
         }
         catch {
             Write-Warning "Could not retrieve ACL for user '$user': $_"
+            Register-ADAuditNotAssessed -Name 'Dangerous ACL' -Switch 'acl' -Target $user.DistinguishedName -Reason "ACL read failed: $($_.Exception.Message)"
+            $coverage.Add([pscustomobject]@{ObjectType='User'; DistinguishedName=$user.DistinguishedName; Status='NotAssessed'})
+            $uiFailed++
             continue
+        } finally {
+            $ui++
+            Write-ADAuditProgress -Activity 'ACL: users' -Status "${ui}/$($users.Count) ACL reads finished; ${uiFailed} unreadable" -PercentComplete ($ui / [math]::Max(1,$users.Count) * 100)
         }
+        $coverage.Add([pscustomobject]@{ObjectType='User'; DistinguishedName=$user.DistinguishedName; Status='Assessed'})
         if ($acl) {
             $dangerousRules = $acl.Access | Where-Object {
-            ([string]$_.IdentityReference -in $groupsToCheck) -and
-            ((($_.ActiveDirectoryRights.ToString()) -split ',\s*') | Where-Object { $_ -in $dangerousAces })
+            ((Get-ADAuditAceSid $_ -Cache $sidCache) -in $broadSids -or [string]$_.IdentityReference -in $groupsToCheck) -and
+            @(Get-ADAuditDangerousAceCapability $_).Count -gt 0
         }
             if ($dangerousRules) {
                 foreach ($rule in $dangerousRules) {
@@ -143,45 +232,55 @@ function Find-DangerousACLPermissions {
                         IdentityReference     = $rule.IdentityReference
                         AccessControlType     = $rule.AccessControlType
                         ActiveDirectoryRights = $rule.ActiveDirectoryRights
+                        DistinguishedName     = $user.DistinguishedName
+                        TrusteeSid            = Get-ADAuditAceSid $rule -Cache $sidCache
+                        ObjectTypeGuid        = [string]$rule.ObjectType
+                        InheritanceType       = [string]$rule.InheritanceType
+                        IsInherited           = $rule.IsInherited
+                        Capability            = @(Get-ADAuditDangerousAceCapability $rule) -join '; '
+                        Status                = 'PotentialExposure'
+                        Severity              = 'High'
                     }
                 }
             }
         }
-        $ui++
-        Write-Progress -Activity "Searching for dangerous ACL permissions on users" -Status "Users searched: $ui/$($users.Count)" -PercentComplete ($ui / $users.Count * 100)
     }
 
+    Write-ADAuditProgress -Activity 'ACL: evidence export' -Status 'Writing findings and coverage' -PercentComplete -1
     # Output results
+    Export-ADAuditSecurityCsv -Rows (@($computerResults) + @($groupResults) + @($userResults)) -Columns @('ObjectType','ObjectName','DistinguishedName','IdentityReference','TrusteeSid','AccessControlType','ActiveDirectoryRights','ObjectTypeGuid','InheritanceType','IsInherited','Capability','Status','Severity') -Path (Get-EvidencePath 'dangerous_acls.csv')
+    $coverage | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'dangerous_acl_coverage.csv')
+    Write-Both '    [*] ACL scope: broad built-in groups only; reported allow ACEs are potential exposure, not a complete effective-access calculation. Review deny ACEs and nested/custom trustee groups.'
     $dangerousAclHtmlPath = Join-Path (Get-HtmlReportsDir -BaseRoot $outputdir) 'dangerousACLs.html'
     $hasAnyAcl = $false
 
     if ($computerResults) {
         $hasAnyAcl = $true
-        $computerResults | Format-Table -AutoSize -Property ObjectType, ObjectName, IdentityReference, AccessControlType | Out-File (Get-EvidencePath 'dangerousACL_Computer.txt') -Encoding UTF8
-        Write-Both "    [!] Issue identified, vulnerable ACL on Computer, see $outputdir\dangerousACL_Computer.txt"
-        Write-Nessus-Finding "Weak Computer Permissions" "KB551" ([System.IO.File]::ReadAllText((Get-EvidencePath 'dangerousACL_Computer.txt')))
+        $computerResults | Format-List ObjectType,DistinguishedName,IdentityReference,AccessControlType,ActiveDirectoryRights,ObjectTypeGuid,InheritanceType,Capability,Status | Out-File (Get-EvidencePath 'dangerousACL_Computer.txt') -Encoding UTF8 -Width 4096
+        Write-Both '    [!] Potential broad-group permission exposure on computers; validate effective access. See dangerous_acls.csv.'
+        Write-Nessus-Finding "Weak Computer Permissions" "KB551" ([System.IO.File]::ReadAllText((Get-EvidencePath 'dangerousACL_Computer.txt'))) 'High'
     }
     else {
-        Write-Host "    [+] No dangerous ACL permissions were found on any computer."
+        Write-Both "    [*] No matching broad-group allow ACEs found on assessed computers. Assessed: $(@($coverage | Where-Object { $_.ObjectType -eq 'Computer' -and $_.Status -eq 'Assessed' }).Count)/$($computers.Count)."
     }
 
     if ($groupResults) {
         $hasAnyAcl = $true
-        $groupResults | Format-Table -AutoSize -Property ObjectType, ObjectName, IdentityReference, AccessControlType, ActiveDirectoryRights | Out-File (Get-EvidencePath 'dangerousACL_Groups.txt')
-        Write-Both "    [!] Issue identified, vulnerable ACL on Group, see $outputdir\dangerousACL_Groups.txt"
-        Write-Nessus-Finding "Weak Group Permissions" "KB551" ([System.IO.File]::ReadAllText((Get-EvidencePath 'dangerousACL_Groups.txt')))
+        $groupResults | Format-List ObjectType,DistinguishedName,IdentityReference,AccessControlType,ActiveDirectoryRights,ObjectTypeGuid,InheritanceType,Capability,Status | Out-File (Get-EvidencePath 'dangerousACL_Groups.txt') -Encoding UTF8 -Width 4096
+        Write-Both '    [!] Potential broad-group permission exposure on groups; validate effective access. See dangerous_acls.csv.'
+        Write-Nessus-Finding "Weak Group Permissions" "KB551" ([System.IO.File]::ReadAllText((Get-EvidencePath 'dangerousACL_Groups.txt'))) 'High'
     }
     else {
-        Write-Host "    [+] No dangerous ACL permissions were found on any group."
+        Write-Both "    [*] No matching broad-group allow ACEs found on assessed groups. Assessed: $(@($coverage | Where-Object { $_.ObjectType -eq 'Group' -and $_.Status -eq 'Assessed' }).Count)/$($groups.Count)."
     }
     if ($userResults) {
         $hasAnyAcl = $true
-        $userResults | Format-Table -AutoSize -Property ObjectType, ObjectName, IdentityReference, AccessControlType, ActiveDirectoryRights | Out-File (Get-EvidencePath 'dangerousACLUsers.txt')
-        Write-Both "    [!] Issue identified, vulnerable ACL on User, see $outputdir\dangerousACLUsers.txt"
-        Write-Nessus-Finding "Weak User Permissions" "KB551" ([System.IO.File]::ReadAllText((Get-EvidencePath 'dangerousACLUsers.txt')))
+        $userResults | Format-List ObjectType,DistinguishedName,IdentityReference,AccessControlType,ActiveDirectoryRights,ObjectTypeGuid,InheritanceType,Capability,Status | Out-File (Get-EvidencePath 'dangerousACLUsers.txt') -Encoding UTF8 -Width 4096
+        Write-Both '    [!] Potential broad-group permission exposure on users; validate effective access. See dangerous_acls.csv.'
+        Write-Nessus-Finding "Weak User Permissions" "KB551" ([System.IO.File]::ReadAllText((Get-EvidencePath 'dangerousACLUsers.txt'))) 'High'
     }
     else {
-        Write-Host "    [+] No dangerous ACL permissions were found on any user."
+        Write-Both "    [*] No matching broad-group allow ACEs found on assessed users. Assessed: $(@($coverage | Where-Object { $_.ObjectType -eq 'User' -and $_.Status -eq 'Assessed' }).Count)/$($users.Count)."
     }
 
     # Build consolidated modern HTML report
@@ -221,7 +320,12 @@ function Find-DangerousACLPermissions {
 }
 
 function Invoke-DangerousAclCheck {
-    Find-DangerousACLPermissions
+    Write-ADAuditProgress -Activity 'Dangerous ACL permissions' -Status 'Starting collection' -PercentComplete -1
+    try {
+        Find-DangerousACLPermissions
+    } finally {
+        Write-ADAuditProgress -Activity 'Dangerous ACL permissions' -Completed
+    }
 }
 
 # ---- Standalone launch --------------------------------------------------------------------

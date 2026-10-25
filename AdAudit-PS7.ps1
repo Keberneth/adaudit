@@ -18,6 +18,15 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
+            [X] Version 9.2.1 - 25/10/2026
+                Kept current operation/target in the parent progress bar and batched
+                    Domain Audit service collection into one query per DC.
+            [X] Version 9.2 - 25/10/2026
+                Added selected-check and phase progress, readable local-time run folders,
+                    isolated-clone scope, local/DCOM collection, and HTML theme controls.
+                Corrected informational port scoring and overlapping membership totals;
+                    scoring v2.1 distinguishes index bands, priority, and coverage.
+                Separated derived report downloads from collected CSV evidence.
             [X] Version 9.0 - 08/10/2026
                 Added Invoke-LateralMovementCheck.ps1 (-lateralmovement / -lateral / -lm, also
                     part of -all, and selectable in the GUI). Separate companion script, dot-sourced
@@ -549,6 +558,8 @@ Param (
     [switch]$all = $false,
     [string[]]$exclude = @(),
     [string]$select,
+    [switch]$IsolatedClone = $false,
+    [ValidatePattern('^\d{4}-\d{2}-\d{2}$')][string]$SnapshotDate,
     [switch]$KeepLegacyArtifacts = $false
 )
 
@@ -562,7 +573,7 @@ if ($select) { $selectedChecks = @($select -split '[,\s]+' | ForEach-Object { $_
 # defeats the match (e.g. ' dnszone' -notin the check names).
 $exclude = @($exclude | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-$versionnum = "v9.0"
+$versionnum = "v9.2.1"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 $script:ADAuditIsWindows = ($env:OS -eq 'Windows_NT')
@@ -612,7 +623,7 @@ $script:ADAuditChecks = @(
     [pscustomobject]@{ Switch = 'ldapsecurity'; Variable = 'ldapsecurity'; Name = 'LDAPSecurity'; File = 'Invoke-LdapSecurityCheck.ps1'; Load = $true; Modules = @('ActiveDirectory'); AlsoWith = @(); Description = 'Check for LDAP Security Issues'; Run = { Invoke-LdapSecurityCheck } }
     [pscustomobject]@{ Switch = 'dataextract'; Variable = 'dataextract'; Name = 'AdDataExtract'; File = 'Invoke-DataExtractCheck.ps1'; Load = $true; Modules = @('ActiveDirectory','GroupPolicy'); AlsoWith = @(); Description = 'AD Raw Data Extract'; Run = { Invoke-DataExtractCheck } }
     [pscustomobject]@{ Switch = 'delegatedpermissions'; Variable = 'delegatedpermissions'; Name = 'DelegatedPermissions'; File = 'Invoke-DelegatedPermissionsCheck.ps1'; Load = $true; Modules = @('ActiveDirectory'); AlsoWith = @(); Description = 'Delegated Permissions Report'; Run = { Invoke-DelegatedPermissionsCheck } }
-    [pscustomobject]@{ Switch = 'portconnectivity'; Variable = 'portconnectivity'; Name = 'DCPortConnectivity'; File = 'Invoke-PortConnectivityCheck.ps1'; Load = $true; Modules = @('ActiveDirectory'); AlsoWith = @(); Description = 'Domain Controller port connectivity check (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC)'; Run = { Invoke-PortConnectivityCheck } }
+    [pscustomobject]@{ Switch = 'portconnectivity'; Variable = 'portconnectivity'; Name = 'DCPortConnectivity'; File = 'Invoke-PortConnectivityCheck.ps1'; Load = $true; Modules = @('ActiveDirectory'); AlsoWith = @(); Description = 'Domain Controller port connectivity check (RPC endpoint mapper/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM)'; Run = { Invoke-PortConnectivityCheck } }
     [pscustomobject]@{ Switch = 'adhealth'; Variable = 'adhealth'; Name = 'ADHealth'; File = 'Invoke-HealthCheck.ps1'; Load = $true; Modules = @('ActiveDirectory'); AlsoWith = @(); Description = 'AD platform health check (replication, dcdiag, SYSVOL/DFSR, NTDS, time, services, events, sites, recycle bin, group hygiene)'; Run = { Invoke-HealthCheck } }
     [pscustomobject]@{ Switch = 'lateralmovement'; Variable = 'lateralmovement'; Name = 'LateralMovement'; File = 'Invoke-LateralMovementCheck.ps1'; Load = $false; Modules = @('ActiveDirectory'); AlsoWith = @(); Description = 'Lateral movement analysis (group nesting, hidden Tier 0 paths, AGDLP violations, per-user / per-group risk map)'; Run = {
         # Self-contained companion script with its own parameters: dot-sourced at run time
@@ -659,7 +670,29 @@ function Test-ADAuditCheckSelected {
     return $false
 }
 
-$outputdir = Join-Path -Path (Get-Item -Path '.').FullName -ChildPath $env:COMPUTERNAME
+$knownChecks = @($script:ADAuditChecks.Switch)
+$invalidChecks = @($selectedChecks + $exclude | Where-Object { $_ -notin $knownChecks })
+if ($invalidChecks.Count -gt 0) { throw "Unknown check name(s): $($invalidChecks -join ', '). Use the switch names listed in README.md." }
+if ($SnapshotDate) {
+    if (-not $IsolatedClone) { throw '-SnapshotDate describes a copied directory and requires -IsolatedClone.' }
+    $snapshotValue = [datetime]::ParseExact($SnapshotDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture)
+    if ($snapshotValue.Date -gt (Get-Date).Date) { throw '-SnapshotDate cannot be in the future.' }
+}
+$script:ADAuditIsolatedClone = [bool]$IsolatedClone
+$script:ADAuditSnapshotDate = $SnapshotDate
+if ($IsolatedClone) {
+    # Keep implicit AD/GPO reads on the copy rather than rediscovering a peer.
+    # Copy the preference table so the caller's hashtable is not mutated.
+    $PSDefaultParameterValues = @{} + $PSDefaultParameterValues
+    foreach ($command in @('Get-AD*','Search-AD*','Get-GPO','Get-GPOReport')) {
+        $PSDefaultParameterValues["${command}:Server"] = $env:COMPUTERNAME
+    }
+}
+$script:ADAuditRunId = [guid]::NewGuid().ToString('N')
+$runStarted = [datetimeoffset]::Now
+# Isolate evidence even for two runs on the same workstation. A report never reads
+# an earlier run, and the paid Password Audit output remains in its own folder.
+$outputdir = New-ADAuditRunDirectory -ParentPath (Join-Path $PSScriptRoot $env:COMPUTERNAME) -Timestamp $runStarted
 $script:outputdir = $outputdir
 $starttime = Get-Date
 $scriptname = $MyInvocation.MyCommand.Name
@@ -668,22 +701,13 @@ if (!(Test-Path "$outputdir")) { New-Item -ItemType Directory -Path $outputdir |
 $script:HtmlReportsDir = Join-Path $outputdir 'HTML Reports'
 $script:EvidenceFilesDir = Join-Path $outputdir 'Raw Data'
 $script:LegacyArtifactsDir = Join-Path $script:EvidenceFilesDir 'Source'
-$script:ReportDownloadsDir = $script:LegacyArtifactsDir  # Merged: Prepared now points to Source
+$script:ReportDownloadsDir = Join-Path $script:EvidenceFilesDir 'ReportDownloads'
 if (!(Test-Path $script:HtmlReportsDir)) { New-Item -ItemType Directory -Path $script:HtmlReportsDir -Force | Out-Null }
 if (!(Test-Path $script:EvidenceFilesDir)) { New-Item -ItemType Directory -Path $script:EvidenceFilesDir -Force | Out-Null }
 if (!(Test-Path $script:LegacyArtifactsDir)) { New-Item -ItemType Directory -Path $script:LegacyArtifactsDir -Force | Out-Null }
 
-# Clear the prior run's per-check evidence files so this run starts clean.
-# Many checks append (Add-Content) rather than overwrite their evidence file;
-# because the output folder is reused, without this the files accumulate stale
-# lines across runs - duplicating Nessus findings and inflating the risk-report
-# scores that are computed from line counts. -KeepLegacyArtifacts preserves them.
-if (-not $KeepLegacyArtifacts) {
-    # -Recurse: subfolders (e.g. HighRisk) hold per-run CSVs that would otherwise
-    # be re-imported by the management report as current findings.
-    Get-ChildItem -LiteralPath $script:LegacyArtifactsDir -File -Recurse -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-}
+# Every run starts in a new folder. KeepLegacyArtifacts only controls legacy
+# evidence layout within this run; it must never import earlier evidence.
 Write-Both " _____ ____     _____       _ _ _
 |  _  |    \   |  _  |_ _ _| |_| |_
 |     |  |  |  |     | | | . | |  _|
@@ -700,6 +724,12 @@ if (-not $script:ADAuditIsWindows) {
 }
 
 $script:ADAuditSelectedChecks = @($script:ADAuditChecks | Where-Object { Test-ADAuditCheckSelected -Check $_ })
+Initialize-ADAuditCheckStatus -Checks $script:ADAuditChecks -SelectedSwitches @($script:ADAuditSelectedChecks.Switch)
+Write-Both "[*] Audit selection: running $($script:ADAuditSelectedChecks.Count) of $($script:ADAuditChecks.Count) checks; skipping $($script:ADAuditChecks.Count - $script:ADAuditSelectedChecks.Count)."
+Write-Both '[*] Overall progress counts finished checks, not elapsed time. Phase percentages are shown where a work-item total is known.'
+if ($IsolatedClone) {
+    Write-Both "[~] ISOLATED CLONE: snapshot date $(if ($SnapshotDate) { $SnapshotDate } else { 'not supplied' }). Results describe the copy, not current production. Remote DC operational probes will be skipped."
+}
 $needsActiveDirectory = [bool]@($script:ADAuditSelectedChecks | Where-Object { 'ActiveDirectory' -in $_.Modules }).Count
 $needsGroupPolicy     = [bool]@($script:ADAuditSelectedChecks | Where-Object { 'GroupPolicy'     -in $_.Modules }).Count
 $needsDnsServer       = [bool]@($script:ADAuditSelectedChecks | Where-Object { 'DnsServer'       -in $_.Modules }).Count
@@ -768,9 +798,11 @@ if ($installdeps) {
     $running = $true
     Invoke-AuditCheck -Name 'InstallDependencies' -Switch 'installdeps' -Description 'Installing optional features' -Body { Install-Dependencies }
 }
+$checkNumber = 0
 foreach ($__chk in $script:ADAuditSelectedChecks) {
     $running = $true
-    Invoke-AuditCheck -Name $__chk.Name -Switch $__chk.Switch -Description $__chk.Description -Body $__chk.Run
+    $checkNumber++
+    Invoke-AuditCheck -Name $__chk.Name -Switch $__chk.Switch -Description $__chk.Description -Body $__chk.Run -Modules $__chk.Modules -CheckIndex $checkNumber -SelectedCount $script:ADAuditSelectedChecks.Count -AvailableCount $script:ADAuditChecks.Count
 }
 if (!$running) {
     Write-Both "[!] No arguments selected"
@@ -798,17 +830,35 @@ if (!$running) {
     Write-Both "    -dataextract exports raw AD audit data (users/groups/computers/OUs/GPO reports/OU ACLs/FGPP/trusts) to .\<COMPUTERNAME>\Raw Data\ADExtract"
     Write-Both "    -delegatedpermissions generates an AD delegated permissions report (alias: -delegated-permissions)"
     Write-Both "        Optional: -DelegIncludeSystemTrustees -DelegIncludeDeny -DelegIncludeInherited -DelegServer <dc> -DelegatedOutputRoot <path>"
-    Write-Both "    -portconnectivity tests TCP ports DCs need (RPC/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM/dynamic RPC) from this host and (via WinRM) cross-DC. Aliases: -dcports, -dc-ports, -portcheck"
+    Write-Both "    -portconnectivity tests TCP ports DCs need (RPC endpoint mapper/LDAP/LDAPS/Kerberos/SMB/ADWS/WinRM) from this host and (via WinRM) cross-DC. Aliases: -dcports, -dc-ports, -portcheck"
     Write-Both "    -adhealth runs AD platform health checks (replication, dcdiag, SYSVOL/DFSR, NTDS, time, services, events, sites, recycle bin, group hygiene) and writes AD_Health.html. Aliases: -ad-health, -health"
     Write-Both "    -lateralmovement analyses group nesting for lateral movement (hidden Tier 0 paths, AGDLP violations, per-user / per-group risk) and writes Lateral-Movement.html. Aliases: -lateral, -lm"
     Write-Both "        Optional: -LateralBaselinePath <lateral_movement_edges.csv> -LateralTier0Groups <group[,group...]>"
     Write-Both "    -all runs all checks, e.g. $scriptname -all"
     Write-Both "    -exclude <check[,check...]> skips the named checks when running -all, e.g. $scriptname -all -exclude gpo,dnszone"
     Write-Both "    -select <check[,check...]> runs only the named checks (comma-separated), e.g. $scriptname -select accounts,spn"
-    Write-Both "    -KeepLegacyArtifacts keeps the previous run's per-check evidence files instead of clearing them at startup (by default each run starts with a clean .\\<COMPUTERNAME>\\Raw Data\\Source folder)"
+    Write-Both "    -KeepLegacyArtifacts retains legacy evidence layout within the current isolated run."
 }
 Write-CheckFailuresReport -BaseRoot $outputdir
 Write-NotAssessedReport -BaseRoot $outputdir
+$runMetadata = @{
+    RunId = $script:ADAuditRunId; ToolVersion = $versionnum; ScoringVersion = 'v2.1'
+    RunFolder = Split-Path $outputdir -Leaf; StartedLocal = $runStarted.ToString('o'); TimeZone = [TimeZoneInfo]::Local.Id
+    AssessmentMode = $(if ($IsolatedClone) { 'IsolatedClone' } else { 'Connected' }); SnapshotDate = $SnapshotDate
+    StartedUtc = $starttime.ToUniversalTime().ToString('o'); FinishedUtc = [datetime]::UtcNow.ToString('o')
+    ComputerName = $env:COMPUTERNAME; Domain = $null; DomainSid = $null; Forest = $null
+    SelectedChecks = @($script:ADAuditSelectedChecks.Switch); ExcludedChecks = @($exclude)
+    PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+}
+if ($needsActiveDirectory) {
+    try {
+        $metadataDomain = Get-ADDomain -ErrorAction Stop
+        $runMetadata.Domain = $metadataDomain.DNSRoot
+        $runMetadata.DomainSid = [string]$metadataDomain.DomainSID
+        $runMetadata.Forest = $metadataDomain.Forest
+    } catch { Write-Both "[~] Run metadata: domain identity unavailable ($($_.Exception.Message))." }
+}
+Write-ADAuditRunMetadata -Metadata $runMetadata
 Write-Nessus-Footer
 # Note: .nessus content is XML-escaped at write time inside Write-Nessus-Finding
 # (and the header/footer are static), so no post-hoc character sanitisation is
@@ -821,8 +871,13 @@ Write-Both "[*] Script end time $endtime"
 $oldEap = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 try {
+    Write-Both "[*] All $($script:ADAuditSelectedChecks.Count) selected checks have finished. Building HTML reports and evidence downloads..."
+    Write-ADAuditProgress -Activity 'Report assembly' -Status 'Rendering findings and preparing evidence links'
     Invoke-ADAuditFinalReports -Root $outputdir
+    Write-Both "[+] Audit and reports complete: $outputdir"
 }
 finally {
+    Write-Progress -Id 1 -Activity 'Report assembly' -Completed
+    Write-Progress -Id 0 -Activity 'AD audit' -Completed
     $ErrorActionPreference = $oldEap
 }

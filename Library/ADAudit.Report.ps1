@@ -1,4 +1,4 @@
-<#
+﻿<#
     .SYNOPSIS
         ADAudit reporting library: management / audit HTML reports and end-of-run assembly.
 
@@ -39,6 +39,16 @@ function Invoke-ManagementReport {
     if (-not $PSBoundParameters.ContainsKey('OutputTxt') -or [string]::IsNullOrWhiteSpace($OutputTxt)) { $OutputTxt = $null }
 
     $ErrorActionPreference = 'Stop'
+    Write-ADAuditProgress -Activity 'Report assembly' -Status 'Reading evidence and classifying findings'
+    # Report construction failures are coverage gaps, never evidence of a clean check.
+    $ReportIssues = New-Object 'System.Collections.Generic.List[object]'
+    $ReportIssueKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+    $ScoringVersion = 'v2.1'
+    function Add-ReportIssue([string]$Path, [string]$Reason) {
+        if ($ReportIssueKeys.Add("$Path|$Reason")) {
+            $ReportIssues.Add([pscustomobject]@{ CheckName='Report evidence'; Target=$Path; Reason=$Reason }) | Out-Null
+        }
+    }
 
     # ---------------------------
     # Tunable baselines
@@ -131,7 +141,7 @@ function Invoke-ManagementReport {
             return @((Get-Content -LiteralPath $path -ErrorAction Stop) |
                 ForEach-Object { $_.Trim() } |
                 Where-Object { $_ -match '^[^=\-\s].*\\' })
-        } catch { return @() }
+        } catch { Add-ReportIssue $path $_.Exception.Message; return @() }
     }
 
     function Get-NonHeaderLines([string]$path) {
@@ -152,13 +162,25 @@ function Invoke-ManagementReport {
                     # findings and inflate severity (e.g. Critical >= 25 line threshold).
                     $_ -and $_.Trim().Length -gt 0 -and -not ($_.TrimStart().StartsWith('#'))
                 }
-        } catch { return @() }
+        } catch { Add-ReportIssue $path $_.Exception.Message; return @() }
     }
 
-    function Get-CsvSafe([string]$path) {
+    function Get-CsvSafe([string]$path, [string[]]$RequiredColumns = @()) {
         $path = Resolve-AuditArtifactPath $path
         if (-not $path -or -not (Test-Path -LiteralPath $path)) { return @() }
-        try { return Import-Csv -LiteralPath $path -ErrorAction Stop } catch { return @() }
+        try {
+            $rows = @(Import-Csv -LiteralPath $path -ErrorAction Stop)
+            if ($RequiredColumns.Count -gt 0) {
+                $header = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction Stop
+                if ([string]::IsNullOrWhiteSpace($header)) { throw 'Required CSV header is missing.' }
+                $probe = @((@($header, (($RequiredColumns | ForEach-Object { 'schema' }) -join ',')) -join "`n") | ConvertFrom-Csv -ErrorAction Stop)
+                $columns = @($probe[0].PSObject.Properties.Name)
+                foreach ($column in $RequiredColumns) {
+                    if ($column -notin $columns) { throw "Required CSV column '$column' is missing." }
+                }
+            }
+            return $rows
+        } catch { Add-ReportIssue $path $_.Exception.Message; return @() }
     }
 
     # ---------------------------
@@ -173,7 +195,7 @@ function Invoke-ManagementReport {
         if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
 
         $lines = @()
-        try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { return @() }
+        try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { Add-ReportIssue $Path $_.Exception.Message; return @() }
         if (-not $lines -or $lines.Count -eq 0) { return @() }
 
         $results = New-Object 'System.Collections.Generic.List[object]'
@@ -216,7 +238,7 @@ function Invoke-ManagementReport {
         if (-not $path -or -not (Test-Path -LiteralPath $path)) { return @() }
 
         $lines = @()
-        try { $lines = Get-Content -LiteralPath $path -ErrorAction Stop } catch { return @() }
+        try { $lines = Get-Content -LiteralPath $path -ErrorAction Stop } catch { Add-ReportIssue $path $_.Exception.Message; return @() }
 
         $results = New-Object 'System.Collections.Generic.List[object]'
 
@@ -249,7 +271,7 @@ function Invoke-ManagementReport {
         if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
 
         $lines = @()
-        try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { return @() }
+        try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop } catch { Add-ReportIssue $Path $_.Exception.Message; return @() }
         if (-not $lines -or $lines.Count -eq 0) { return @() }
 
         $startIdx = -1
@@ -328,7 +350,9 @@ function Invoke-ManagementReport {
             [string]$Title,
             [string]$Evidence,
             [string]$Path,
-            [int]$ScoreOverride
+            [int]$ScoreOverride,
+            [object[]]$Rows = @(),
+            [string]$RuleId
         )
 
         $Severity = Normalize-Severity $Severity
@@ -338,6 +362,8 @@ function Invoke-ManagementReport {
         if ($PSBoundParameters.ContainsKey('ScoreOverride')) {
             $score = [int]$ScoreOverride
         }
+        if ($Severity -eq 'Information') { $score = 0 }
+        if (-not $RuleId) { $RuleId = New-Slug $Title }
 
         $resolvedPath = $null
         if (-not [string]::IsNullOrWhiteSpace($Path)) {
@@ -350,6 +376,8 @@ function Invoke-ManagementReport {
             Evidence = $Evidence
             Link     = $resolvedPath
             Score    = $score
+            RuleId   = $RuleId
+            EvidenceRows = @($Rows)
         }) | Out-Null
     }
 
@@ -360,7 +388,9 @@ function Invoke-ManagementReport {
             [string]$Title,
             [string]$Evidence,
             [string]$Path,
-            [int]$ScoreOverride
+            [int]$ScoreOverride,
+            [object[]]$Rows = @(),
+            [string]$RuleId
         )
         $Severity = Normalize-Severity $Severity
         $Title = Get-CanonicalTitle $Title
@@ -371,7 +401,9 @@ function Invoke-ManagementReport {
         }
         $k = '{0}|{1}|{2}' -f $Severity, (($Title -as [string]).Trim()), $pathKey
         if ($dedup.Add($k)) {
-            Add-Finding -Severity $Severity -Title $Title -Evidence $Evidence -Path $Path -ScoreOverride $ScoreOverride
+            $arguments = @{ Severity=$Severity; Title=$Title; Evidence=$Evidence; Path=$Path; Rows=$Rows; RuleId=$RuleId }
+            if ($PSBoundParameters.ContainsKey('ScoreOverride')) { $arguments.ScoreOverride = $ScoreOverride }
+            Add-Finding @arguments
         }
     }
 
@@ -453,6 +485,9 @@ function Invoke-ManagementReport {
 
     function Get-FindingCategory([string]$Title) {
         switch -Regex ($Title) {
+            '^AD CS' { return 'Certificate services' }
+            '^Directory ACL' { return 'Access control' }
+            '^Directory replication permissions' { return 'Privileged access' }
             '^Lateral movement' { return 'Lateral movement (group nesting)' }
             'Domain Admins membership review \(size-adjusted\)|Built-in domain Administrator \(RID-500\) hygiene' { return 'Privileged access' }
             'cannot reach replication partners|DC unreachable|replication broken with this peer|Replication failures detected|Lingering-object' { return 'DC reachability and replication' }
@@ -472,11 +507,20 @@ function Invoke-ManagementReport {
 
     function Get-FindingWhyItMatters([string]$Title) {
         switch -Regex ($Title) {
+            '\(disabled\)$' { return 'The affected accounts are disabled. This is a hygiene and reactivation review, not evidence of an enabled account exposure. Account disablement does not erase stored credential material.' }
+            'unknown|unconfirmed password material|Password material requires verification' { return 'The evidence does not establish the account state or a usable empty password. Missing password material can reflect the authentication design. Resolve the uncertainty before deciding on a credential change.' }
+            'confirmed empty passwords' { return 'The collector identified the known empty-password NT hash on an enabled account. This is stronger evidence than PASSWD_NOTREQD or an absent hash, and requires prompt validation and remediation.' }
+            '^AD CS' { return 'Certificate enrollment and template permissions can create privilege escalation paths. PotentialExposure identifies a configuration that needs expert validation; publication, effective enrollment rights, approval requirements and authentication protections determine exploitability.' }
+            '^Directory ACL' { return 'The identified permission can allow a trustee to change an AD object or its security. Effective rights depend on the object type, inheritance, deny entries and the trustee token; this is a permission exposure, not a demonstrated attack.' }
+            '^Directory replication permissions' { return 'The same trustee has both directory replication extended rights on the domain naming context. Outside expected privileged identities, this can permit replication of credential material. This is an ACL configuration observation; no credential replication was attempted by this check.' }
+            '^Computer accounts with stale activity signals' { return 'Old directory timestamps are a cleanup lead, not proof that a server or workstation is unused. Some live workloads authenticate infrequently. Creation and machine-password rotation signals reduce false positives but do not replace ownership and workload validation.' }
+            '^LDAPS endpoint' { return 'TCP 636 was not reachable from the probe location. This does not establish that LDAP traffic is plaintext: StartTLS and SASL signing or sealing on 389 are separate mechanisms. Confirm the intended endpoint and actual bind protection.' }
+            '^LAPS coverage' { return 'Computers without expected LAPS password material may lack managed local administrator credentials. Confirm policy eligibility, deployment, permissions and backup location before treating absent AD attributes as missing protection.' }
             '^Lateral movement:.*\(LM01\)' {
-                return 'A group that is not a designed Tier 0 group is nested (directly or through other groups) into Domain Admins, Administrators, Backup/Account/Server Operators, the Exchange permission groups or another Tier 0 group - or into a privileged DC-level group such as DnsAdmins. Everyone in that group inherits the Tier 0 privilege exactly as if they were a direct member, but a review of the privileged group shows only the nested group name. This is the mechanism behind most "we did not know helpdesk was Domain Admin" incidents.'
+                return 'The directory contains a group nesting path into a privileged or potentially privileged group. SID-identified built-in groups have known administrative roles; custom groups classified from names require confirmation of their actual permissions. Review the members and business purpose of the entire path. Nesting alone does not prove unauthorized access or compromise.'
             }
             '^Lateral movement:.*\(LM02\)' {
-                return 'These accounts are effectively Tier 0: their access token contains a Tier 0 group SID. Critical ones reach it only through a nesting chain and are invisible as direct members. An attacker does not need a Domain Admin - any one of these accounts (phished, Kerberoasted, left logged on to a client) gives the same result. whoami /groups on a compromised machine lists the whole chain.'
+                return 'These accounts have observed direct or nested membership paths to groups classified as privileged. Review enabled state, the target group identity, nested membership, and intended administration role. Paths to custom groups inferred from names require validation of effective permissions; this directory graph does not inspect host access tokens or local administrator assignments.'
             }
             '^Lateral movement:.*\(LM03\)' {
                 return 'A computer account in a Tier 0 group means anyone who is SYSTEM on that machine is Tier 0; a service account there is a Kerberoastable Tier 0 credential; Everyone / Authenticated Users makes the privilege public; cross-domain principals move the trust boundary to a domain that is not audited here.'
@@ -512,7 +556,7 @@ function Invoke-ManagementReport {
                 return 'repadmin /replsummary reports non-zero failures across DC pairs. Replication is the mechanism that keeps every DC consistent; failures here mean directory state is drifting. Common root causes: DNS issues between DCs, RPC/firewall blocks, expired Kerberos secure channel, time skew >5 min, USN rollback after an improper restore.'
             }
             'Domain Admins membership review \(size-adjusted\)' {
-                return 'Microsoft AD guidance is that Domain Admins is intended for build and disaster-recovery scenarios only, with day-to-day admin work performed via delegated administration, tiered admin accounts, and temporary elevation (PAM / PIM / JIT). The static benchmark of 5 named Domain Admins is a common security baseline; this script also applies a size-adjusted threshold (capped at 10) so a 3,000-user environment is not held to the same absolute number as a 100-user one - but scaling never makes the finding "safe", and any service account, computer account, gMSA, or nested group inside Domain Admins is high risk regardless of total count.'
+                return 'Standing Domain Admin membership expands the set of identities that can administer the domain. This tool uses a review benchmark of 5 named administrators and a size-adjusted threshold capped at 10; these are audit heuristics, not Microsoft-mandated limits. Service identities, computer accounts, nested groups, stale accounts, and disabled members need different reviews. Their presence alone does not establish a Critical credential exposure or unauthorized access.'
             }
             'Built-in domain Administrator \(RID-500\) hygiene' {
                 return 'The built-in domain Administrator account (SID ending in -500) cannot be deleted, has unrestricted access in the domain (and across the forest in the root domain), and is the prime target if its credential is compromised. Microsoft Defender for Identity explicitly flags this account when its password is older than 180 days. It must be reserved for build / break-glass / disaster recovery, not used for daily work, and never used as a service account or scheduled task account.'
@@ -538,7 +582,7 @@ function Invoke-ManagementReport {
             # Specific before generic: these titles also contain 'disabled' and
             # must not fall into the generic inactive/disabled case below.
             'no password set \((all )?disabled\)' {
-                return 'These accounts have PASSWD_NOTREQD set but are currently disabled, so they cannot be used as-is. The risk is latent: if re-enabled they could be used with no password. Their presence also indicates weak account-creation hygiene.'
+                return 'These accounts are disabled. Validate the password evidence separately from PASSWD_NOTREQD, which does not prove that a password is empty. Keep them disabled while ownership and retention requirements are reviewed.'
             }
             'inactive|disabled|Inactive computer' {
                 return 'Inactive or disabled objects increase attack surface, complicate review, and often indicate weak lifecycle controls. Disabled accounts left in place can be re-enabled by an attacker who gains sufficient rights.'
@@ -592,10 +636,10 @@ function Invoke-ManagementReport {
                 return 'Computer accounts with default passwords have not completed domain join properly or have been reset, making them vulnerable to impersonation.'
             }
             'AES keys missing' {
-                return 'Accounts missing Kerberos AES keys will fall back to weaker encryption (RC4/DES) for Kerberos authentication, increasing vulnerability to offline attacks.'
+                return 'The collector did not find AES key material for these accounts. Actual authentication behavior depends on account type, supported encryption types, KDC policy and client capabilities; missing key evidence should be validated before a credential change.'
             }
             'CVE-2026-20833|RC4' {
-                return 'Microsoft''s CVE-2026-20833 update hardens the KDC so it stops issuing RC4-encrypted Kerberos service tickets for accounts that do not advertise AES support. Accounts whose msDS-SupportedEncryptionTypes lacks AES128/AES256 (or whose passwords were last set before AES keys were generated) will fail to authenticate after the hardening enforcement, and any traffic still using RC4 today is cryptographically weak and Kerberoastable.'
+                return 'RC4 Kerberos configuration or observed use can expose credentials to weaker cryptography and create compatibility problems as KDC hardening changes. An unset account encryption-types attribute alone does not prove RC4-only operation; effective defaults, available keys and actual ticket events must be considered.'
             }
             'DES-only' {
                 return 'DES encryption is cryptographically broken and can be cracked in real-time. Accounts restricted to DES-only are critically vulnerable.'
@@ -604,7 +648,7 @@ function Invoke-ManagementReport {
                 return 'Administrative accounts allowed for delegation can be impersonated by services, creating privilege escalation paths if those services are compromised.'
             }
             'not required to have a password|password not required' {
-                return 'The PASSWD_NOTREQD flag allows accounts to exist with empty passwords, bypassing the domain password policy entirely.'
+                return 'PASSWD_NOTREQD is an account configuration exception to the password requirement. It does not prove the current password is empty. Review why the flag is set and verify account state and credential controls separately.'
             }
             default {
                 return 'This finding indicates a deviation from common Active Directory hardening expectations and should be reviewed in context.'
@@ -614,6 +658,15 @@ function Invoke-ManagementReport {
 
     function Get-FindingRecommendation([string]$Title) {
         switch -Regex ($Title) {
+            '\(disabled\)$' { return 'Keep the account disabled. Confirm whether it is retained for a mailbox, application or recovery requirement; review memberships and retention. Before any approved reactivation, set appropriate credentials and remove unnecessary password-policy exceptions. Do not re-enable accounts merely to clear this finding.' }
+            'unknown|unconfirmed password material|Password material requires verification' { return 'Check the account enablement state and intended authentication method, then recollect structured evidence with appropriate permissions. An absent NT hash alone is not a reason to reset a password or change a smart-card account.' }
+            'confirmed empty passwords' { return 'Validate the account and its dependencies, then set a strong password or disable the account through the approved change process. Independently review PASSWD_NOTREQD; clearing that flag does not itself replace an existing empty password.' }
+            '^AD CS' { return 'Review each published template and issuing CA with the PKI owner. Validate effective enrollment and write permissions, subject-name supply, authentication EKUs, approval and authorized-signature requirements. Restrict inappropriate enrollment or write rights, and validate web enrollment authentication and Extended Protection before concluding ESC8 exposure. Test legitimate certificate issuance after changes.' }
+            '^Directory ACL' { return 'Review the exact object, trustee SID, permission and inheritance shown in the evidence. Confirm the effective right with the owner before removing or narrowing an ACE. Preserve necessary application delegations and validate both the intended access and denial of unauthorized changes afterwards.' }
+            '^Directory replication permissions' { return 'Confirm each trustee and the business requirement, including approved directory synchronization services. Remove unintended replication grants on the domain root using a planned permission change. Validate effective rights, monitor replication-rights changes, and confirm authorized synchronization still works.' }
+            '^Computer accounts with stale activity signals' { return 'Corroborate directory dates with asset inventory, monitoring, workload ownership and recent authentication evidence. Investigate live servers and exceptional machine-password policies. Disable or delete only after the asset is confirmed unused and retention and recovery requirements are met.' }
+            '^LDAPS endpoint' { return 'Validate DNS, routing, firewall policy, listener and certificate configuration from the relevant client network. Test the intended LDAP bind using LDAPS or StartTLS, and separately inspect signing, channel binding and SASL sealing. A failed TCP probe alone does not justify a plaintext-traffic claim.' }
+            '^LAPS coverage' { return 'Confirm each computer is in LAPS scope and which backup location is intended. Verify applied policy, LAPS operational events, password rotation and delegated read permissions; then remediate confirmed deployment gaps.' }
             '^Lateral movement:.*\(LM01\)|^Lateral movement:.*\(LM20\)' {
                 return 'Remove the nested group from the Tier 0 group (Remove-ADGroupMember -Identity <Tier0 group> -Members <group>). If the members genuinely need the right, give it through a dedicated, named Tier 0 group with direct, reviewed and time-bound membership (PAM/PIM) - never through a role or resource group that exists for another purpose. Re-run the check and keep lateral_movement_edges.csv as the baseline for the next run.'
             }
@@ -677,7 +730,7 @@ function Invoke-ManagementReport {
             # Specific before generic: these titles also contain 'disabled' and
             # must not fall into the generic inactive/disabled case below.
             'no password set \((all )?disabled\)' {
-                return 'These accounts are disabled - do NOT set a password and re-enable them. Confirm each is genuinely unused, then delete it, or keep it disabled and clear the PASSWD_NOTREQD flag (Set-ADUser <account> -PasswordNotRequired $false) so it cannot later be re-enabled without a policy-compliant password. Investigate why the flag was set.'
+                return 'Keep the accounts disabled while ownership and retention are reviewed. Validate empty-password evidence separately from PASSWD_NOTREQD. Before an approved reactivation, set appropriate credentials and review unnecessary password-policy exceptions.'
             }
             'inactive|disabled|Inactive computer' {
                 return 'Review ownership, remove genuinely unused accounts and computer objects, and enforce a documented lifecycle and exception process. Leave accounts disabled (not re-enabled with a fresh password) until they are confirmed unused, then delete them.'
@@ -716,7 +769,7 @@ function Invoke-ManagementReport {
                 return 'Enable SMB signing on all DCs via Group Policy: "Microsoft network server: Digitally sign communications (always)" = Enabled. Validate client compatibility before enforcement.'
             }
             'weak.*encryption|legacy.*encryption' {
-                return 'Force a password change for affected user accounts. For computer accounts use Reset-ComputerMachinePassword or rejoin the domain. For service accounts rotate the password or migrate to gMSA. Set msDS-SupportedEncryptionTypes to 24 (AES128+AES256) on all accounts via Group Policy or directly: Set-ADUser <account> -Replace @{''msDS-SupportedEncryptionTypes''=24}. Verify with Get-ADUser <account> -Properties msDS-SupportedEncryptionTypes.'
+                return 'Validate effective KDC defaults, account key material, service dependencies and client support. Plan a supported encryption-policy change and credential rotation only for confirmed affected accounts; preserve other attribute flags. Avoid blanket domain rejoins or machine-password resets. Pilot the change and verify ticket encryption and application authentication.'
             }
             'LM hashes' {
                 return 'Disable LM hash storage via Group Policy (Network security: Do not store LAN Manager hash value on next password change = Enabled). Force password changes for all affected accounts to eliminate stored LM hashes.'
@@ -731,10 +784,10 @@ function Invoke-ManagementReport {
                 return 'Rejoin affected computers to the domain to trigger machine account password rotation. Investigate why the machine account password was not updated during the join process.'
             }
             'AES keys missing' {
-                return 'Force a password change or reset for affected accounts. The new password hash will include AES keys. For computer accounts use Reset-ComputerMachinePassword. For service accounts consider migrating to gMSA.'
+                return 'Confirm the account type, authentication design and service support for AES. Where password-derived AES material is required, plan a supported credential rotation with the owning team and validate the resulting keys and ticket encryption. Do not reset machine or service passwords merely because an attribute was absent.'
             }
             'CVE-2026-20833|RC4' {
-                return 'For each affected account set msDS-SupportedEncryptionTypes to 24 (AES128+AES256): Set-ADUser <acct> -Replace @{''msDS-SupportedEncryptionTypes''=24} or Set-ADComputer <acct> -Replace @{''msDS-SupportedEncryptionTypes''=24}. Then force a password change so AES keys are actually generated (Reset-ComputerMachinePassword for computers; rotate or migrate to gMSA for service accounts; perform a planned double-rotation for krbtgt). At the domain level set the KDC registry value DefaultDomainSupportedEncTypes to 0x18 so accounts with a blank attribute fall back to AES instead of RC4. Validate by inspecting DC events 4768/4769 (TicketEncryptionType 0x11/0x12 = AES, 0x17/0x18 = RC4). References: https://www.cayosoft.com/blog/kerberos-rc4-hardening-what-microsoft-s-cve-2026-20833-update-really-means-for-active-directory-admins/ and https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc'
+                return 'Review the current Microsoft Kerberos RC4 hardening guidance for the installed DC updates. Validate each affected account against effective KDC defaults, available AES keys, client and service compatibility, and events 4768/4769. Pilot targeted changes and supported service credential rotation, preserving unrelated encryption attribute flags. KRBTGT rotation requires a separate replication-aware recovery plan; do not perform blanket account resets or domain rejoins from this list. Reference: https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc'
             }
             'DES-only' {
                 return 'Remove the DES restriction from affected accounts: Set-ADUser <account> -Replace @{''msDS-SupportedEncryptionTypes''=24}. Clear the "Use Kerberos DES encryption types for this account" checkbox in account properties. Force a password change after the update.'
@@ -743,11 +796,22 @@ function Invoke-ManagementReport {
                 return 'Mark sensitive administrative accounts as "Account is sensitive and cannot be delegated" in account properties, or add them to the Protected Users group. Review which services need delegation and use constrained delegation with specific target SPNs.'
             }
             'not required to have a password|password not required' {
-                return 'Clear the PASSWD_NOTREQD flag on affected accounts: Set-ADUser <account> -PasswordNotRequired $false. Then force a password change to ensure a proper password is set. Review why the flag was enabled.'
+                return 'Review the account owner and dependencies, then remove an unjustified PASSWD_NOTREQD exception. This flag alone does not prove an empty password, so verify credentials and account state separately. Use the appropriate AD user or computer cmdlet for the object type and validate service operation after changes.'
             }
             default {
                 return 'Review the affected configuration, identify the owning team, and document a remediation plan with validation after implementation.'
             }
+        }
+    }
+
+    function Get-FindingVerification([string]$Title) {
+        switch -Regex ($Title) {
+            '^AD CS' { return 'Re-enumerate the template and issuing CA after replication, inspect effective permissions and issuance requirements, and confirm normal enrollment still works. A review observation is not a verified exploitable chain.' }
+            '^Directory ACL' { return 'Read the resulting DACL and inheritance on each affected object; validate effective permissions for the original trustee and the intended administrator or application identity.' }
+            'password|Password|AS-REP|Kerberoast' { return 'Confirm the account SID, object type and enablement state first. Re-run the relevant authorized collector after replication and verify the condition is absent, with no new authentication or application failures. Do not expose hashes or plaintext credentials in the handoff.' }
+            'stale activity|inactive|disabled' { return 'Confirm the asset or account owner and workload evidence. Recheck directory state after the approved change; a timestamp-only observation does not establish that an asset can safely be removed.' }
+            'LDAP|NTLM|SMB' { return 'Check effective settings on every in-scope DC, test the intended authentication path from a representative client, and review relevant audit events. Verify protection independently of simple port reachability.' }
+            default { return 'Re-run this check against the same in-scope targets after the approved change and replication. Confirm the expected state in the source evidence and verify that dependent services still work.' }
         }
     }
 
@@ -1578,6 +1642,23 @@ function Invoke-ManagementReport {
             [string]$DownloadRoot
         )
 
+        if (@($Finding.EvidenceRows).Count -gt 0) {
+            $downloadPath = Join-Path $DownloadRoot ((New-Slug $Finding.Title) + '.csv')
+            Ensure-DirectoryPath (Split-Path -Path $downloadPath -Parent)
+            $Finding.EvidenceRows | Export-Csv -LiteralPath $downloadPath -NoTypeInformation -Encoding UTF8
+            $importantColumns = @('Category','SamAccountName','AccountStatus','PasswordEvidence','EvidenceDetail','Name','Assessment','Reason','Template','Rule','Status','Severity','Detail','ObjectType','ObjectName','IdentityReference','Capability','ActiveDirectoryRights','DistinguishedName','Trustee','TrusteeSid','ScopeDN','Target','Setting','Endpoint','Account','Enabled')
+            $availableColumns = @($Finding.EvidenceRows[0].PSObject.Properties.Name)
+            $previewColumns = @($importantColumns | Where-Object { $_ -in $availableColumns } | Select-Object -First 10)
+            return [pscustomobject]@{
+                DownloadHref = Get-RelativeHref -FromFile $AuditReportPath -ToPath $downloadPath
+                DownloadLabel = [System.IO.Path]::GetFileName($downloadPath)
+                DownloadText = 'Download Result'
+                ResultsHtml = New-PreviewTableHtml -Rows $Finding.EvidenceRows -Columns $previewColumns -MaxRows 250
+                OpenInNewTab = $false
+                ResolvedSourcePath = $Finding.Link
+            }
+        }
+
         $definition = Get-FindingArtifactDefinition -Finding $Finding
         $sourcePath = $definition.SourcePath
         $downloadPath = $null
@@ -1724,7 +1805,8 @@ function Invoke-ManagementReport {
             [string]$ComputerName,
             [string]$GeneratedOn,
             [string]$ManagementReportPath,
-            [object[]]$CompanionReports
+            [object[]]$CompanionReports,
+            [string]$CoverageHtml
         )
 
         $severityOrder = @('Critical','High','Medium','Low','Information')
@@ -1865,6 +1947,10 @@ function Invoke-ManagementReport {
       <div class="panel">
         <h4>Recommended action</h4>
         <p>$(HtmlEncode (Get-FindingRecommendation $item.Title))</p>
+      </div>
+      <div class="panel">
+        <h4>Verify after the change</h4>
+        <p>$(HtmlEncode (Get-FindingVerification $item.Title))</p>
       </div>
       <div class="panel">
         <h4>Download Result</h4>
@@ -2299,7 +2385,7 @@ $primaryNav
       <div>
         <h1>Active Directory Audit Results</h1>
         <div class="meta">
-          Target: <span class="mono">$(HtmlEncode $ComputerName)</span><br>
+          Audit host: <span class="mono">$(HtmlEncode $ComputerName)</span><br>
           Generated: $(HtmlEncode $GeneratedOn)<br>
           Report style: HTML audit summary with severity-based findings and embedded evidence<br>
           Finding details include in-report result previews with per-finding downloads.<br>
@@ -2309,7 +2395,7 @@ $primaryNav
       <div class="hero-actions">
         <button type="button" class="theme-toggle" id="themeToggle" aria-pressed="false">Dark mode</button>
         <div class="meta">
-          Total findings: <b>$totalCount</b><br>
+          Finding groups: <b>$($totalCount - $Counts.Information)</b>; information entries: <b>$($Counts.Information)</b><br>
           Risk report: <a href="$(HtmlAttrEncode $managementRel)">$(HtmlEncode ([System.IO.Path]::GetFileName($ManagementReportPath)))</a>
         </div>
       </div>
@@ -2319,6 +2405,8 @@ $primaryNav
       $($countCards -join "`n")
     </div>
   </section>
+
+  $CoverageHtml
 
   <div class="layout">
     <aside class="sidebar">
@@ -2395,6 +2483,23 @@ $js
         Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
     }
 
+    # Read saved context before interpreting time-based evidence or probe scope.
+    $runMetadataPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'audit_run.json')
+    $runMetadata = $null
+    if ($runMetadataPath -and (Test-Path -LiteralPath $runMetadataPath)) {
+        try { $runMetadata = Get-Content -LiteralPath $runMetadataPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+        catch { Add-ReportIssue $runMetadataPath $_.Exception.Message }
+    }
+    $reportIsClone = $runMetadata -and $runMetadata.PSObject.Properties['AssessmentMode'] -and $runMetadata.AssessmentMode -eq 'IsolatedClone'
+
+    # Structured password evidence is authoritative, including empty or unreadable results.
+    $passwordEvidencePath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'password_quality_findings.csv')
+    $passwordEvidencePresent = $passwordEvidencePath -and (Test-Path -LiteralPath $passwordEvidencePath)
+    $passwordRows = @()
+    if ($passwordEvidencePresent) {
+        $passwordRows = @(Get-CsvSafe $passwordEvidencePath @('Category','SamAccountName','AccountStatus','PasswordEvidence'))
+    }
+
     # ---------------------------
     # Baseline parsing (authoritative)
     # ---------------------------
@@ -2409,7 +2514,8 @@ $js
     $baselineHasMAQ         = $false
 
     if ($baselinePath -and (Test-Path -LiteralPath $baselinePath)) {
-        $lines = Get-Content -LiteralPath $baselinePath -ErrorAction SilentlyContinue
+        try { $lines = Get-Content -LiteralPath $baselinePath -ErrorAction Stop }
+        catch { Add-ReportIssue $baselinePath $_.Exception.Message; $lines = @() }
         $inFindings = $false
 
         foreach ($ln in $lines) {
@@ -2426,6 +2532,7 @@ $js
 
                 # suppress baseline duplicate-password line (keep only HighRisk\DUPLICATE_PASSWORDS.csv)
                 if ($title -match '^\s*Duplicate passwords\b') { continue }
+                if ($passwordEvidencePresent -and $title -match 'PasswordNeverExpires') { continue }
 
                 if ($title -match '^Enabled accounts inactive >\s*180\s*days$') { $baselineHasInactive180 = $true }
                 if ($title -match '^Enabled user accounts with PasswordNeverExpires$') { $baselineHasPNE = $true }
@@ -2437,6 +2544,12 @@ $js
 
                     '^krbtgt password age$' {
                         $baselineHasKrbtgt = $true
+                        if ($reportIsClone) {
+                            Add-ReportIssue $baselinePath 'KRBTGT rotation age on an isolated copy cannot establish current production rotation; not scored.'
+                            continue
+                        }
+                        $sev = 'Medium'
+                        $score = $SeverityScore.Medium
                         $obsDays = 0
                         if ($obs -match '\(([0-9]+)\s*days\)') { $obsDays = [int]$matches[1] }
                         elseif ($obs -match '([0-9]+)') { $obsDays = [int]$matches[1] }
@@ -2451,6 +2564,8 @@ $js
 
                     '^Domain Admins$' {
                         $baselineHasDA = $true
+                        $sev = 'High'
+                        $score = $SeverityScore.High
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
                         $baseCount = 0
@@ -2460,10 +2575,12 @@ $js
                         }
                     }
 
-                    '^Enterprise Admins$' { $baselineHasEA = $true }
+                    '^Enterprise Admins$' { $baselineHasEA = $true; $sev = 'High'; $score = $SeverityScore.High }
 
                     '^Schema Admins$' {
                         $baselineHasSA = $true
+                        $sev = 'High'
+                        $score = $SeverityScore.High
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
 
@@ -2473,8 +2590,7 @@ $js
 
                         if ($obsCount -gt 0) {
                             if ($baseCount -le 0) {
-                                $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 28 -K 8
-                                $sev = 'Critical'
+                                $score = Score-BaselineZeroLog -Severity 'High' -Observed $obsCount -MaxAdd 28 -K 8
                             } else {
                                 $score = Score-OverBaselineLog -Severity $sev -Observed $obsCount -Baseline $baseCount -MaxAdd 18 -K 4
                             }
@@ -2485,8 +2601,8 @@ $js
                         $obsCount = 0
                         if ($obs -match '([0-9]+)') { $obsCount = [int]$matches[1] }
                         if ($obsCount -gt 0) {
-                            $sev = 'Critical'
-                            $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $obsCount -MaxAdd 34 -K 10
+                            $sev = 'High'
+                            $score = Score-BaselineZeroLog -Severity 'High' -Observed $obsCount -MaxAdd 34 -K 10
                         }
                     }
 
@@ -2518,6 +2634,7 @@ $js
                     default { $score = [int]$SeverityScore[$sev] }
                 }
 
+                if ($reportIsClone -and $title -eq 'krbtgt password age') { continue }
                 Add-FindingOnce $sev $title $evidence $baselinePath $score
             }
         }
@@ -2526,7 +2643,7 @@ $js
     # PasswordNeverExpires is reported by up to three sources (baseline text,
     # HighRisk CSV, DSInternals pq file, and accounts_passdontexpire.txt). Track a
     # single "already reported" flag so the finding appears exactly once.
-    $pneReported = $baselineHasPNE
+    $pneReported = $baselineHasPNE -or $passwordEvidencePresent
 
     # ---------------------------
     # Domain stats from ADExtract (optional)
@@ -2566,10 +2683,21 @@ $js
         # same shared-password accounts below with richer per-group detail, so only emit
         # this HighRisk-CSV finding when that richer source is not present.
         $pqDupEarlyPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_duplicate_passwords.txt')
-        $pqDupEarlyPresent = ($pqDupEarlyPath -and (Test-Path -LiteralPath $pqDupEarlyPath) -and ((Get-PqAccountLines $pqDupEarlyPath).Count -gt 0))
+        $pqDupEarlyPresent = $passwordEvidencePresent -or ($pqDupEarlyPath -and (Test-Path -LiteralPath $pqDupEarlyPath) -and ((Get-PqAccountLines $pqDupEarlyPath).Count -gt 0))
         $dupRows = Get-CsvSafe $hrFiles.DUPLICATE_PASSWORDS
         if ($dupRows.Count -gt 0 -and -not $pqDupEarlyPresent) {
-            Add-FindingOnce 'Critical' 'Duplicate passwords detected' "Affected accounts in shared-password groups: $($dupRows.Count)" $hrFiles.DUPLICATE_PASSWORDS (Score-Scaled 'Critical' $dupRows.Count 100)
+            foreach ($state in @('Enabled','Disabled','Unknown')) {
+                $stateRows = @($dupRows | Where-Object { if ($state -eq 'Unknown') { $_.AccountStatus -notin @('Enabled','Disabled') } else { $_.AccountStatus -eq $state } })
+                if ($stateRows.Count -eq 0) { continue }
+                $severity = if ($state -eq 'Enabled') { 'Critical' } elseif ($state -eq 'Disabled') { 'Low' } else { 'Information' }
+                $title = 'Accounts sharing the same password (identical NTLM hash)'
+                if ($state -ne 'Enabled') { $title += " ($($state.ToLowerInvariant()))" }
+                $score = if ($state -eq 'Enabled') { Score-Scaled 'Critical' $stateRows.Count } else { 0 }
+                $evidence = "Accounts: $($stateRows.Count) | State: $state. Accounts in each listed password group share the same NT password material."
+                if ($state -eq 'Disabled') { $evidence += ' Disabled-account hygiene only; no active-exposure points. Keep these accounts disabled during review.' }
+                if ($state -eq 'Unknown') { Add-ReportIssue $hrFiles.DUPLICATE_PASSWORDS 'Account state is unknown for one or more duplicate-password observations; these are not assumed enabled.' }
+                Add-FindingOnce -Severity $severity -Title $title -Evidence $evidence -Path $hrFiles.DUPLICATE_PASSWORDS -ScoreOverride $score -Rows $stateRows -RuleId "PQ-DuplicatePasswordGroups-$state"
+            }
         }
 
         # Suppress when the baseline text already reported krbtgt password age.
@@ -2588,10 +2716,12 @@ $js
                 if ($raw) { $ageVal = [int](([string]$raw) -replace '[^0-9]','') }
             } catch { $ageVal = 0 }
 
-            if ($ageVal -gt 180) {
-                $sev = if ($ageVal -ge 730) { 'Critical' }
-                       elseif ($ageVal -ge 365) { 'High' }
-                       else { 'Medium' }
+            $explicitlyNotFinding = $first -and $first.PSObject.Properties['IsFinding'] -and [string]$first.IsFinding -match '^(false|0)$'
+            if ($reportIsClone -and $ageVal -gt 180) {
+                Add-ReportIssue $hrFiles.KRBTGT 'KRBTGT rotation age on an isolated copy cannot establish current production rotation; not scored.'
+            }
+            elseif ($ageVal -gt 180 -and -not $explicitlyNotFinding) {
+                $sev = 'Medium'
                 Add-FindingOnce $sev 'KRBTGT password age is high' "Estimated age (days): $ageVal" $hrFiles.KRBTGT (Score-Scaled $sev ([Math]::Max($ageVal,1) / 30))
             }
         }
@@ -2600,10 +2730,11 @@ $js
         # empty in any domain); only raise the finding when the baseline
         # collector itself judged at least one group to be over baseline.
         $privRows = Get-CsvSafe $hrFiles.PRIVILEGED_GROUPS
-        $privOverBaseline = @(Get-CsvSafe $hrFiles.Summary | Where-Object { "$($_.RiskId)" -like 'PRIV_*' -and "$($_.IsFinding)" -match '^(true|1)$' })
+        $privOverBaseline = @(Get-CsvSafe $hrFiles.Summary | Where-Object { "$($_.RiskId)" -like 'PRIV_*' -and "$($_.RiskId)" -notmatch 'OVERLAP' -and "$($_.IsFinding)" -match '^(true|1)$' })
         if ($privRows.Count -gt 0 -and $privOverBaseline.Count -gt 0) {
-            $sev = if ($privRows.Count -ge 20) { 'High' } elseif ($privRows.Count -ge 10) { 'Medium' } else { 'Low' }
-            Add-FindingOnce $sev 'Large privileged group membership' "Groups over baseline: $($privOverBaseline.Count); membership rows: $($privRows.Count)" $hrFiles.PRIVILEGED_GROUPS (Score-Scaled $sev $privRows.Count)
+            # This is an inventory rollup of the per-group baseline controls,
+            # not a separate exposure. Repeated memberships are not unique people.
+            Add-FindingOnce 'Information' 'Large privileged group membership' "Group baseline observations: $($privOverBaseline.Count); membership rows: $($privRows.Count). Inventory rollup only; prioritize the individual group findings. No additional points are added for the same memberships." $hrFiles.PRIVILEGED_GROUPS 0
         }
 
         # Keep ONLY baseline inactive >180 days (renamed), suppress HighRisk\INACTIVE_ACCOUNTS.csv
@@ -2696,6 +2827,60 @@ $js
         Add-FindingOnce $sev 'Disabled user accounts present (review and cleanup)' ("Disabled accounts: $disabledCount (Baseline: <= $base) | Example: $preview") $disabledPath $score
     }
 
+    $typedPreauthEnabled = @($passwordRows | Where-Object { $_.Category -eq 'PreAuthNotRequired' -and $_.AccountStatus -eq 'Enabled' })
+    $pqKerbPresent = $false
+    if ($passwordEvidencePresent) {
+        $passwordRules = @(
+            @{ Category='ClearTextPassword'; Title='Passwords stored using reversible encryption'; Severity='Critical' },
+            @{ Category='LMHash'; Title='LM hashes of passwords present in AD'; Severity='Critical' },
+            @{ Category='EmptyPassword'; Title='Accounts with confirmed empty passwords'; Severity='Critical' },
+            @{ Category='WeakPassword'; Title='Passwords found in dictionary/breach list'; Severity='Critical' },
+            @{ Category='WeakPasswordHistory'; Title='Historical passwords found in dictionary/breach list'; Severity='Medium' },
+            @{ Category='DuplicatePasswordGroups'; Title='Accounts sharing the same password (identical NTLM hash)'; Severity='Critical' },
+            @{ Category='DefaultComputerPassword'; Title='Computer accounts with default passwords'; Severity='High' },
+            @{ Category='AESKeysMissing'; Title='Kerberos AES keys missing from accounts'; Severity='Medium' },
+            @{ Category='PreAuthNotRequired'; Title='Accounts without Kerberos pre-auth (AS-REP roastable)'; Severity='Critical' },
+            @{ Category='DESEncryptionOnly'; Title='Accounts restricted to DES-only encryption'; Severity='Critical' },
+            @{ Category='DelegatableAdmins'; Title='Administrative accounts allowed to be delegated'; Severity='High' },
+            @{ Category='PasswordNeverExpires'; Title='Enabled user accounts with PasswordNeverExpires'; Severity='Medium' },
+            @{ Category='PasswordNotRequired'; Title='Accounts with password not required flag'; Severity='High' },
+            @{ Category='Kerberoastable'; Title='Kerberoastable accounts (SPN set on user account, weak password risk)'; Severity='High' },
+            @{ Category='SamAccountNameAsPassword'; Title='Accounts using their account name as password'; Severity='Critical' },
+            @{ Category='SmartCardUsersWithPassword'; Title='Smart card accounts with password material to review'; Severity='Medium' }
+        )
+        foreach ($rule in $passwordRules) {
+            $categoryRows = @($passwordRows | Where-Object { $_.Category -eq $rule.Category })
+            foreach ($state in @('Enabled','Disabled','Unknown')) {
+                $rows = @($categoryRows | Where-Object { if ($state -eq 'Unknown') { $_.AccountStatus -notin @('Enabled','Disabled') } else { $_.AccountStatus -eq $state } })
+                if ($rows.Count -eq 0) { continue }
+                if ($state -eq 'Unknown') { Add-ReportIssue $passwordEvidencePath "Account state unknown for $($rows.Count) $($rule.Category) observation(s); excluded from active-exposure scoring." }
+                if ($rule.Category -eq 'EmptyPassword') {
+                    $unconfirmed = @($rows | Where-Object { $_.PasswordEvidence -ne 'EmptyNtHash' })
+                    if ($unconfirmed.Count -gt 0) {
+                        Add-FindingOnce -Severity 'Information' -Title "Missing or unconfirmed password material ($state)" -Evidence "Accounts: $($unconfirmed.Count). No confirmed empty NT hash; verify the authentication design and collector evidence before changing credentials." -Path $passwordEvidencePath -ScoreOverride 0 -Rows $unconfirmed -RuleId "PQ-EmptyPassword-Review-$state"
+                    }
+                    $rows = @($rows | Where-Object { $_.PasswordEvidence -eq 'EmptyNtHash' })
+                    if ($rows.Count -eq 0) { continue }
+                }
+                $severity = if ($state -eq 'Enabled') { $rule.Severity } elseif ($state -eq 'Disabled') { 'Low' } else { 'Information' }
+                $title = if ($state -eq 'Enabled') { $rule.Title } else { "$($rule.Title) ($($state.ToLowerInvariant()))" }
+                $score = if ($state -eq 'Enabled') { Score-Scaled $severity $rows.Count } else { 0 }
+                if ($rule.Category -eq 'PreAuthNotRequired' -and $state -eq 'Enabled') {
+                    $score = if ($rows.Count -eq 1) { 12 } else { Score-BaselineZeroLog 'Critical' $rows.Count -MaxAdd 34 -K 10 }
+                }
+                if ($rule.Category -eq 'Kerberoastable' -and $state -eq 'Enabled') { $pqKerbPresent = $true }
+                $detail = "Accounts: $($rows.Count) | State: $state | Evidence: DSInternals Test-PasswordQuality."
+                if ($rule.Category -eq 'PasswordNotRequired') { $detail += ' PASSWD_NOTREQD is a configuration flag; it does not prove an empty password.' }
+                if ($state -eq 'Disabled') { $detail += ' Disabled account hygiene; contributes no active-exposure score. Do not re-enable as remediation.' }
+                if ($state -eq 'Unknown') { $detail += ' Account enablement could not be established.' }
+                Add-FindingOnce -Severity $severity -Title $title -Evidence $detail -Path $passwordEvidencePath -ScoreOverride $score -Rows $rows -RuleId "PQ-$($rule.Category)-$state"
+            }
+        }
+        $knownCategories = @($passwordRules | ForEach-Object { $_.Category })
+        foreach ($unknownCategory in @($passwordRows | Where-Object { $_.Category -notin $knownCategories } | Group-Object Category)) {
+            Add-ReportIssue $passwordEvidencePath "Unrecognized password evidence category '$($unknownCategory.Name)' requires report support."
+        }
+    } else {
     # ---------------------------
     # Password quality (reversible encryption) - try split file first, fall back to combined
     # ---------------------------
@@ -2732,54 +2917,12 @@ $js
         Add-FindingOnce 'Critical' 'LM hashes of passwords present in AD' "Accounts: $($pqLmLines.Count)" $pqLmPath $score
     }
 
-    # Accounts with no password set - cross-reference with Users.csv to check enabled/disabled
+    # Legacy password text does not establish account state or an empty NT hash.
     $pqNoPwdPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_no_password.txt')
-    $pqNoPwdLines = Get-PqAccountLines $pqNoPwdPath
+    $pqNoPwdLines = @(Get-PqAccountLines $pqNoPwdPath)
     if ($pqNoPwdLines.Count -gt 0) {
-        # Extract SamAccountNames from DOMAIN\user format
-        $noPwdSams = @($pqNoPwdLines | ForEach-Object { ($_ -split '\\', 2)[-1].Trim() } | Where-Object { $_ })
-
-        # Try to determine how many are enabled via Users.csv (userAccountControl bit 0x2 = disabled)
-        $enabledNoPwd = 0
-        $disabledNoPwd = $pqNoPwdLines.Count
-        try {
-            $adExtractDir = Resolve-AuditArtifactPath (Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'ADExtract')
-            if ($adExtractDir -and (Test-Path -LiteralPath $adExtractDir)) {
-                $uCsv = Get-ChildItem -Path $adExtractDir -Recurse -File -Filter '*-Users.csv' | Select-Object -First 1
-                if ($uCsv) {
-                    # ADExtract CSVs are written pipe-delimited (see Export-ADAuditDataExtract)
-                    $allUserRows = @(Import-Csv -LiteralPath $uCsv.FullName -Delimiter '|' -ErrorAction Stop)
-                    $noPwdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    foreach ($s in $noPwdSams) { $noPwdSet.Add($s) | Out-Null }
-                    $enabledNoPwd = 0
-                    foreach ($row in $allUserRows) {
-                        $sam = $row.SamAccountName
-                        if (-not $sam -or -not $noPwdSet.Contains($sam)) { continue }
-                        # The extract writes userAccountControl as text ("Disabled - Password Does
-                        # Not Expire", "Unknown User Account Type - 66082"), so a plain [int] cast
-                        # failed silently, left 0 and counted every account as ENABLED.
-                        $uacText = [string]$row.userAccountControl
-                        $disabled = $false
-                        if ($uacText -match '(?i)\bdisabled\b') { $disabled = $true }
-                        elseif ($uacText -match '(\d+)') { $disabled = (([int64]$matches[1]) -band 2) -ne 0 }
-                        if (-not $disabled) { $enabledNoPwd++ }
-                    }
-                    $disabledNoPwd = $pqNoPwdLines.Count - $enabledNoPwd
-                }
-            }
-        } catch {}
-
-        if ($enabledNoPwd -gt 0) {
-            # Enabled accounts with no password = Critical
-            $score = Score-BaselineZeroLog -Severity 'Critical' -Observed $enabledNoPwd -MaxAdd 34 -K 10
-            Add-FindingOnce 'Critical' 'Accounts with no password set (ENABLED)' "Enabled: $enabledNoPwd of $($pqNoPwdLines.Count) total" $pqNoPwdPath $score
-        }
-        if ($disabledNoPwd -gt 0 -and $enabledNoPwd -eq 0) {
-            # All disabled = Low severity (common for shared mailboxes / service accounts)
-            Add-FindingOnce 'Low' 'Accounts with no password set (all disabled)' "Disabled accounts: $disabledNoPwd" $pqNoPwdPath (Score-Scaled 'Low' $disabledNoPwd)
-        } elseif ($disabledNoPwd -gt 0 -and $enabledNoPwd -gt 0) {
-            Add-FindingOnce 'Low' 'Accounts with no password set (disabled)' "Disabled accounts: $disabledNoPwd (review and cleanup)" $pqNoPwdPath (Score-Scaled 'Low' $disabledNoPwd)
-        }
+        Add-ReportIssue $pqNoPwdPath 'Legacy password evidence lacks account state and empty-hash confirmation. Recollect structured password evidence.'
+        Add-FindingOnce 'Information' 'Password material requires verification (account state unknown)' "Accounts: $($pqNoPwdLines.Count). An absent NT hash is not proof of an empty password." $pqNoPwdPath 0
     }
 
     # Dictionary passwords found
@@ -2827,7 +2970,8 @@ $js
     $pqPwdNotReqLines = Get-PqAccountLines $pqPwdNotReqPath
     if ($pqPwdNotReqLines.Count -gt 0) {
         $score = Score-BaselineZeroLog -Severity 'High' -Observed $pqPwdNotReqLines.Count -MaxAdd 20 -K 8
-        Add-FindingOnce 'High' 'Accounts not required to have a password' "Accounts: $($pqPwdNotReqLines.Count)" $pqPwdNotReqPath $score
+        Add-ReportIssue $pqPwdNotReqPath 'Legacy PASSWD_NOTREQD evidence lacks account state.'
+        Add-FindingOnce 'Information' 'Password not required flag (account state unknown)' "Accounts: $($pqPwdNotReqLines.Count). This flag does not prove an empty password." $pqPwdNotReqPath 0
     }
 
     # Duplicate passwords (accounts sharing the same NTLM hash)
@@ -2878,8 +3022,8 @@ $js
     $pqNoPreauthPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'pq_no_preauth.txt')
     $pqNoPreauthLines = Get-PqAccountLines $pqNoPreauthPath
     if ($pqNoPreauthLines.Count -gt 0 -and -not $asrepEarlyPresent) {
-        $score = Score-BaselineZeroLog -Severity 'High' -Observed $pqNoPreauthLines.Count -MaxAdd 20 -K 8
-        Add-FindingOnce 'High' 'Accounts with Kerberos pre-authentication disabled (AS-REP roastable)' "Accounts: $($pqNoPreauthLines.Count)" $pqNoPreauthPath $score
+        $score = if ($pqNoPreauthLines.Count -eq 1) { 12 } else { Score-BaselineZeroLog -Severity 'Critical' -Observed $pqNoPreauthLines.Count -MaxAdd 34 -K 10 }
+        Add-FindingOnce 'Critical' 'Accounts without Kerberos pre-auth (AS-REP roastable)' "Accounts: $($pqNoPreauthLines.Count)" $pqNoPreauthPath $score
     }
 
     # Password never expires (DSInternals view, complements accounts_passdontexpire.txt)
@@ -2901,13 +3045,15 @@ $js
         Add-FindingOnce 'High' 'Kerberoastable accounts (SPN set on user account, weak password risk)' "Accounts: $($pqKerbLines.Count)" $pqKerbPath $score
     }
 
+    }
+
     # ---------------------------
     # AS-REP roastable
     # ---------------------------
     $asrepPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ASREP.txt')
     $asrepAccounts = @(Get-AsrepAccounts -path $asrepPath)
     $asrepCount = @($asrepAccounts).Count
-    if ($asrepCount -gt 0) {
+    if ($asrepCount -gt 0 -and $typedPreauthEnabled.Count -eq 0) {
         $sev = 'Critical'
         $score = if ($asrepCount -eq 1) { [int]$SeverityScore.Critical }
         else { Score-BaselineZeroLog -Severity $sev -Observed $asrepCount -MaxAdd 34 -K 10 }
@@ -2925,18 +3071,22 @@ $js
     $spnPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'SPNs.txt')
     $spnLines = @(Get-NonHeaderLines $spnPath | Where-Object { $_ -notmatch '^\s*No high value kerberoastable user accounts identified\.?\s*$' })
     if ($spnLines.Count -gt 0 -and -not $pqKerbPresent) {
-        Add-FindingOnce 'Medium' 'Kerberoastable SPNs present (review high-value service accounts)' "Lines: $($spnLines.Count)" $spnPath (Score-Scaled 'Medium' $spnLines.Count)
+        Add-FindingOnce 'High' 'Kerberoastable SPNs present (review high-value service accounts)' "Lines: $($spnLines.Count)" $spnPath (Score-Scaled 'High' $spnLines.Count)
     }
 
-    # Inactive computer objects (>90 days)
+    # Stale directory signals are review candidates, not proof an asset is unused.
+    $inactiveCompsCsv = Resolve-AuditArtifactPath (Join-Path $InputRoot 'computers_inactive_90days.csv')
     $inactiveCompsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'computers_inactive_90days.txt')
-    $inactiveCompsLines = Get-NonHeaderLines $inactiveCompsPath
-    if ($inactiveCompsLines.Count -gt 0) {
-        $obs = $inactiveCompsLines.Count
-        $base = 5
-        $sev = if ($obs -ge 200) { 'High' } elseif ($obs -ge 50) { 'Medium' } else { 'Low' }
-        $score = Score-OverBaselineLog -Severity $sev -Observed $obs -Baseline $base -MaxAdd 14 -K 3
-        Add-FindingOnce $sev 'Inactive computer accounts (>90 days)' "Computers inactive: $obs (Baseline: <= $base)" $inactiveCompsPath $score
+    if ($inactiveCompsCsv -and (Test-Path -LiteralPath $inactiveCompsCsv)) {
+        $inactiveRows = @(Get-CsvSafe $inactiveCompsCsv @('Name','Assessment','Reason'))
+        if ($inactiveRows.Count -gt 0) {
+            Add-FindingOnce -Severity 'Low' -Title 'Computer accounts with stale activity signals (review)' -Evidence "Candidates: $($inactiveRows.Count). Directory timestamps do not prove a server or workstation is unused. Confirm workload and asset ownership before disabling or deleting." -Path $inactiveCompsCsv -ScoreOverride 2 -Rows $inactiveRows -RuleId 'COMPUTER-STALE-SIGNALS'
+        }
+    } else {
+        $inactiveCompsLines = @(Get-NonHeaderLines $inactiveCompsPath)
+        if ($inactiveCompsLines.Count -gt 0) {
+            Add-FindingOnce 'Low' 'Computer accounts with stale activity signals (review)' "Legacy timestamp evidence requires validation; this is not a list of confirmed inactive systems." $inactiveCompsPath 2
+        }
     }
 
     # Suppress accounts_passdontexpire.txt when PasswordNeverExpires was already reported.
@@ -2949,13 +3099,20 @@ $js
         }
     }
 
-    $lapsRightsPath  = Resolve-AuditArtifactPath (Join-Path $InputRoot 'laps_read-extendedrights.txt')
-    $lapsExpiredPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'laps_expired-passwords.txt')
-    if (($lapsRightsPath -and (Test-Path -LiteralPath $lapsRightsPath)) -or ($lapsExpiredPath -and (Test-Path -LiteralPath $lapsExpiredPath))) {
-        $rightsCount  = (Get-NonHeaderLines $lapsRightsPath).Count
-        $expiredCount = (Get-NonHeaderLines $lapsExpiredPath).Count
-        if ($rightsCount -gt 0)  { Add-FindingOnce 'High'   'LAPS password read rights widely delegated' "Readers: $rightsCount" $lapsRightsPath (Score-Scaled 'High' $rightsCount) }
-        if ($expiredCount -gt 0) { Add-FindingOnce 'Medium' 'LAPS passwords expired' "Computers flagged: $expiredCount" $lapsExpiredPath (Score-Scaled 'Medium' $expiredCount) }
+    $lapsStatusPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'laps_status.csv')
+    if ($lapsStatusPath -and (Test-Path -LiteralPath $lapsStatusPath)) {
+        $lapsRows = @(Get-CsvSafe $lapsStatusPath @('Name','Generation','Assessment','Detail'))
+        $lapsUnknown = @($lapsRows | Where-Object Assessment -eq 'Backup destination unverified')
+        if ($lapsUnknown.Count -gt 0) {
+            Add-FindingOnce -Severity 'Information' -Title 'LAPS coverage requires review' -Evidence "Computers: $($lapsUnknown.Count). AD backup destination is unverified; Entra backup, device scope or an approved exception may explain absent attributes." -Path $lapsStatusPath -Rows $lapsUnknown -RuleId 'LAPS-COVERAGE-REVIEW'
+        }
+        $lapsOverdue = @($lapsRows | Where-Object Assessment -eq 'Rotation overdue candidate')
+        if ($lapsOverdue.Count -gt 0) { Add-FindingOnce -Severity 'Low' -Title 'LAPS rotation overdue candidates' -Evidence "Computers: $($lapsOverdue.Count). Validate device connectivity and applied policy before concluding rotation failure." -Path $lapsStatusPath -ScoreOverride 2 -Rows $lapsOverdue -RuleId 'LAPS-ROTATION-REVIEW' }
+    } else {
+        foreach ($lapsLegacy in @('laps_missing-computers.txt','laps_expired-passwords.txt','laps_read-extendedrights.txt')) {
+            $lapsLegacyPath = Resolve-AuditArtifactPath (Join-Path $InputRoot $lapsLegacy)
+            if (@(Get-NonHeaderLines $lapsLegacyPath).Count -gt 0) { Add-FindingOnce 'Information' "LAPS evidence requires review ($lapsLegacy)" 'Legacy evidence does not establish scope, backup destination or excessive effective read permissions. Validate the object and policy before remediation.' $lapsLegacyPath 0 }
+        }
     }
 
     $ldapSecPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'LDAPSecurity.txt')
@@ -3030,30 +3187,40 @@ $js
     $portCsvPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dc_port_connectivity.csv')
     $portTxtPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dc_port_connectivity.txt')
     if ($portCsvPath -and (Test-Path -LiteralPath $portCsvPath)) {
-        $portRows = @(Get-CsvSafe $portCsvPath)
+        $portRows = @(Get-CsvSafe $portCsvPath @('Source','Target','Port','Proto','PortName','Open','Severity'))
         $closedRows = @($portRows | Where-Object { ([string]$_.Open) -in @('False','false','No','no','0') })
+        foreach ($row in $closedRows) {
+            # Optional endpoints and role-inapplicable listeners are inventory,
+            # even if an older collector assigned a non-informational severity.
+            $optional = ($row.PSObject.Properties['Required'] -and [string]$row.Required -match '^(false|0|no)$') -or [int]$row.Port -in @(53,139,636,3269,5985,5986)
+            if ($optional) { $row.Severity = 'Information' }
+            elseif ([string]$row.Severity -notin @('Critical','High','Medium','Low','Information')) {
+                Add-ReportIssue $portCsvPath "Unrecognized port severity for $($row.PortName); retained as unscored inventory."
+                $row.Severity = 'Information'
+            }
+        }
         $byPortName = $closedRows | Group-Object PortName
         foreach ($g in $byPortName) {
-            $first = $g.Group | Select-Object -First 1
+            $first = $g.Group | Sort-Object { Get-SeverityRank $_.Severity } -Descending | Select-Object -First 1
             $sev = switch ([string]$first.Severity) {
                 'Critical' { 'Critical' }
                 'High'     { 'High' }
                 'Medium'   { 'Medium' }
                 'Low'      { 'Low' }
-                default    { 'Medium' }
+                default    { 'Information' }
             }
             $targets = @($g.Group | Select-Object -ExpandProperty Target -Unique)
-            $detail = "Port $($first.Port)/$($first.Proto) ($($first.PortName)) closed for $($g.Count) probe(s) across $($targets.Count) target(s). See dc_port_connectivity.txt for WHY this matters and the recommended fix."
-            $portTitle = if ([int]$first.Port -eq 0) { "DC unreachable: $(@($g | ForEach-Object { $_.Target } | Sort-Object -Unique) -join ', ') does not resolve in DNS" } else { "DC port closed: $($first.PortName) ($($first.Port)/$($first.Proto))" }
+            $detail = "Port $($first.Port)/$($first.Proto) ($($first.PortName)) unreachable for $($g.Count) probe(s) across $($targets.Count) target(s). This describes reachability from the listed sources, not a verified outage or security failure for production clients. " + $(if ($sev -eq 'Information') { 'Optional or role-specific endpoint: verify applicability; no risk points added.' } else { 'Verify listener, routing, firewall policy and client impact before remediation.' })
+            $portTitle = if ([int]$first.Port -eq 0) { "DC unreachable: $($targets -join ', ') does not resolve in DNS" } else { "DC port closed: $($first.PortName) ($($first.Port)/$($first.Proto))" }
             Add-FindingOnce $sev $portTitle $detail $portTxtPath (Score-Scaled $sev $g.Count)
         }
 
-        # LDAPS-not-reachable specific finding (security risk, not just connectivity)
+        # Endpoint reachability is not proof of unprotected LDAP traffic.
         $ldapsClosedTargets = @($closedRows | Where-Object { [int]$_.Port -eq 636 } | Select-Object -ExpandProperty Target -Unique)
         if ($ldapsClosedTargets.Count -gt 0) {
-            Add-FindingOnce 'High' 'LDAPS (636) not reachable - LDAP traffic forced to plaintext' `
-                "DCs without LDAPS: $($ldapsClosedTargets -join ', '). All LDAP binds and searches against these DCs run on plaintext 389 and can be sniffed/relayed (LDAP relay to LDAPS is a documented attack path). Issue an LDAPS certificate and verify with `ldp.exe -SSL`." `
-                $portTxtPath (Score-Scaled 'High' $ldapsClosedTargets.Count)
+            Add-FindingOnce 'Information' 'LDAPS endpoint unreachable from the audit source (verify protection)' `
+                "Targets: $($ldapsClosedTargets -join ', '). TCP 636 could not be reached. Verify listener, certificate, routing and firewall policy; LDAP on 389 may use StartTLS or SASL sealing. Actual bind protection was not established by this port probe." `
+                $portTxtPath 0
         }
     }
 
@@ -3123,6 +3290,7 @@ $js
         $daReason = ''
         $mSev = [regex]::Match($daText, '(?m)^\s*Severity:\s*(\S+)\s*$')
         if ($mSev.Success) { $daSev = Normalize-Severity $mSev.Groups[1].Value }
+        if ($daSev -eq 'Critical') { $daSev = 'High' } # Older collectors escalated account type/count alone.
         $mReason = [regex]::Match($daText, '(?ms)^-+\s*VERDICT\s*-+\s*$\r?\n.*?Reason:\s*(.+?)\r?\n')
         if ($mReason.Success) { $daReason = $mReason.Groups[1].Value.Trim() }
         if ($daSev) {
@@ -3151,17 +3319,21 @@ $js
     }
 
     # ----------------------------------------------------------------
-    # Lateral movement (Invoke-LateralMovementCheck.ps1). One finding per
-    # rule (LM01-LM21), severity = worst finding of that rule, linked to
-    # lateral_movement.txt. LM16 (well-known group population) is skipped
-    # here because the HighRisk baseline already reports those groups.
+    # One finding group per lateral rule. Suppress LM16 only where the same
+    # named group is already represented; a skipped HighRisk check must not
+    # remove the lateral collector's observations from the main report.
     # ----------------------------------------------------------------
     $lmFindingsCsv = Resolve-AuditArtifactPath (Join-Path (Join-Path $InputRoot 'LateralMovement') 'lateral_movement_findings.csv')
     $lmTxtPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'lateral_movement.txt')
     if ($lmFindingsCsv -and (Test-Path -LiteralPath $lmFindingsCsv)) {
         $lmRows = @(Get-CsvSafe $lmFindingsCsv)
         $lmLink = if ($lmTxtPath -and (Test-Path -LiteralPath $lmTxtPath)) { $lmTxtPath } else { $lmFindingsCsv }
-        foreach ($lmGroup in ($lmRows | Where-Object { $_.RuleId -and $_.RuleId -ne 'LM16' } | Group-Object RuleId | Sort-Object Name)) {
+        $lmRowsForReport = foreach ($row in $lmRows) {
+            if (-not $row.RuleId) { continue }
+            if ($row.RuleId -eq 'LM16' -and @($Findings | Where-Object { $_.Title -eq $row.Subject }).Count -gt 0) { continue }
+            $row
+        }
+        foreach ($lmGroup in ($lmRowsForReport | Group-Object RuleId | Sort-Object Name)) {
             $lmWorst = 'Information'
             foreach ($r in $lmGroup.Group) { if ((Get-SeverityRank $r.Severity) -gt (Get-SeverityRank $lmWorst)) { $lmWorst = Normalize-Severity $r.Severity } }
             $lmTitle = ($lmGroup.Group | Select-Object -First 1).Rule
@@ -3174,6 +3346,79 @@ $js
     $lmHtmlPath = Join-Path (Get-HtmlReportsDir -BaseRoot $InputRoot) 'Lateral-Movement.html'
     if (Test-Path $lmHtmlPath) {
         Add-FindingOnce 'Information' 'Lateral movement map report available' 'Interactive group-nesting map: filter groups and users, follow memberOf hop by hop, see Tier 0 paths, per-user and per-group risk and how to fix each finding.' $lmHtmlPath $SeverityScore.Information
+    }
+
+    # Structured collector observations feed the same summary and expert report.
+    $adcsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'adcs_templates.csv')
+    if ($adcsPath -and (Test-Path -LiteralPath $adcsPath)) {
+        $adcsRows = @(Get-CsvSafe $adcsPath @('Template','Rule','Status','Severity','Detail'))
+        foreach ($group in @($adcsRows | Where-Object Status -eq 'PotentialExposure' | Group-Object Rule)) {
+            $severity = Normalize-Severity (($group.Group | Sort-Object { Get-SeverityRank $_.Severity } -Descending | Select-Object -First 1).Severity)
+            Add-FindingOnce -Severity $severity -Title "AD CS template permission or enrollment exposure ($($group.Name))" -Evidence "Observations: $($group.Count). Potential configuration exposure; validate effective enrollment and issuance requirements before concluding exploitability." -Path $adcsPath -ScoreOverride (Score-Scaled $severity $group.Count) -Rows $group.Group -RuleId "ADCS-$($group.Name)"
+        }
+        $reviewRows = @($adcsRows | Where-Object Status -eq 'Review')
+        if ($reviewRows.Count -gt 0) { Add-FindingOnce -Severity 'Information' -Title 'AD CS template configuration requires review' -Evidence "Observations requiring expert validation: $($reviewRows.Count). These are not confirmed exploitable findings." -Path $adcsPath -Rows $reviewRows -RuleId 'ADCS-REVIEW' }
+        foreach ($row in @($adcsRows | Where-Object Status -eq 'NotAssessed')) { Add-ReportIssue $adcsPath "$($row.Template): $($row.Detail)" }
+    } else {
+        $legacyAdcsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'vulnerable_templates.txt')
+        $legacyAdcsLines = @(Get-NonHeaderLines $legacyAdcsPath | Where-Object { $_ -match 'ESC[1-9]|Potential' })
+        if ($legacyAdcsLines.Count -gt 0) { Add-FindingOnce 'High' 'AD CS template exposure requires validation (legacy evidence)' 'Legacy template observations require confirmation of publication, effective permissions and issuance requirements.' $legacyAdcsPath 8 }
+    }
+    $adcsEndpointPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'adcs_endpoints.csv')
+    if ($adcsEndpointPath -and (Test-Path -LiteralPath $adcsEndpointPath)) {
+        $endpointRows = @(Get-CsvSafe $adcsEndpointPath @('CA','Endpoint','Status','Detail'))
+        $endpointReview = @($endpointRows | Where-Object { $_.Status -in @('Review','PotentialExposure') })
+        if ($endpointReview.Count -gt 0) { Add-FindingOnce -Severity 'Information' -Title 'AD CS web enrollment authentication requires review' -Evidence "Endpoints: $($endpointReview.Count). An HTTP response or 401 challenge alone does not establish ESC8 vulnerability; confirm authentication and Extended Protection." -Path $adcsEndpointPath -Rows $endpointReview -RuleId 'ADCS-ENDPOINT-REVIEW' }
+        foreach ($row in @($endpointRows | Where-Object Status -eq 'NotAssessed')) { Add-ReportIssue $adcsEndpointPath "$($row.Endpoint): $($row.Detail)" }
+    } else {
+        $legacyWebPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'web_enrollment.txt')
+        if (@(Get-NonHeaderLines $legacyWebPath).Count -gt 0) { Add-FindingOnce 'Information' 'AD CS web enrollment authentication requires review' 'Legacy endpoint evidence does not establish authentication protections or ESC8 exploitability.' $legacyWebPath 0 }
+    }
+    $aclPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dangerous_acls.csv')
+    if ($aclPath -and (Test-Path -LiteralPath $aclPath)) {
+        $aclRows = @(Get-CsvSafe $aclPath @('ObjectType','DistinguishedName','TrusteeSid','Capability','Status','Severity'))
+        foreach ($group in @($aclRows | Where-Object Status -eq 'PotentialExposure' | Group-Object ObjectType)) {
+            $severity = Normalize-Severity (($group.Group | Sort-Object { Get-SeverityRank $_.Severity } -Descending | Select-Object -First 1).Severity)
+            Add-FindingOnce -Severity $severity -Title "Directory ACL permission exposure ($($group.Name))" -Evidence "Permission observations: $($group.Count); unique objects: $(@($group.Group.DistinguishedName | Sort-Object -Unique).Count). Validate effective rights and business delegation." -Path $aclPath -ScoreOverride (Score-Scaled $severity $group.Count) -Rows $group.Group -RuleId "ACL-$($group.Name)"
+        }
+    } else {
+        foreach ($legacyAcl in @('dangerousACL_Computer.txt','dangerousACL_Groups.txt','dangerousACLUsers.txt')) {
+            $legacyAclPath = Resolve-AuditArtifactPath (Join-Path $InputRoot $legacyAcl)
+            if (@(Get-NonHeaderLines $legacyAclPath).Count -gt 0) { Add-FindingOnce 'High' "Directory ACL permission exposure ($legacyAcl)" 'Legacy permission observations require effective-rights and delegation review; see the exact object and trustee in the evidence.' $legacyAclPath 8 }
+        }
+    }
+    $replicationRightsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'replication_delegations.csv')
+    if ($replicationRightsPath -and (Test-Path -LiteralPath $replicationRightsPath)) {
+        $replicationRightsRows = @(Get-CsvSafe $replicationRightsPath @('Trustee','TrusteeSid','ScopeDN','GetChanges','GetChangesAll','Status','Severity','Detail'))
+        $replicationExposures = @($replicationRightsRows | Where-Object { $_.Status -eq 'PotentialExposure' -and "$($_.GetChanges)" -match '^(true|1)$' -and "$($_.GetChangesAll)" -match '^(true|1)$' })
+        if ($replicationExposures.Count -gt 0) { Add-FindingOnce -Severity 'Critical' -Title 'Directory replication permissions granted outside the expected baseline' -Evidence "Trustee and domain-scope combinations: $($replicationExposures.Count). Both GetChanges and GetChangesAll are present for the same trustee at domain scope. Validate approved synchronization identities and effective rights." -Path $replicationRightsPath -ScoreOverride (Score-Scaled 'Critical' $replicationExposures.Count) -Rows $replicationExposures -RuleId 'AD-REPLICATION-RIGHTS' }
+    }
+    $ntlmSettingsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ntlm_dc_settings.csv')
+    if ($ntlmSettingsPath -and (Test-Path -LiteralPath $ntlmSettingsPath)) {
+        $ntlmSettings = @(Get-CsvSafe $ntlmSettingsPath @('Target','Setting','Status','Severity','Reason'))
+        foreach ($group in @($ntlmSettings | Where-Object Status -eq 'Finding' | Group-Object Setting)) {
+            $severity = Normalize-Severity (($group.Group | Sort-Object { Get-SeverityRank $_.Severity } -Descending | Select-Object -First 1).Severity)
+            Add-FindingOnce -Severity $severity -Title "NTLM domain controller configuration ($($group.Name))" -Evidence "DCs affected: $(@($group.Group.Target | Sort-Object -Unique).Count). Based on observed DC configuration, not GPO inventory alone." -Path $ntlmSettingsPath -ScoreOverride (Score-Scaled $severity $group.Count) -Rows $group.Group -RuleId "NTLM-$($group.Name)"
+        }
+        foreach ($row in @($ntlmSettings | Where-Object Status -eq 'NotAssessed')) { Add-ReportIssue $ntlmSettingsPath "$($row.Target) / $($row.Setting): $($row.Reason)" }
+    }
+    $healthFindingsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'health_findings.csv')
+    if ($healthFindingsPath -and (Test-Path -LiteralPath $healthFindingsPath)) {
+        foreach ($row in @(Get-CsvSafe $healthFindingsPath @('Category','Severity','Title','Evidence','Score','Source'))) {
+            Add-FindingOnce -Severity $row.Severity -Title $row.Title -Evidence $row.Evidence -Path (Resolve-AuditArtifactPath $row.Source) -ScoreOverride ([int]$row.Score) -RuleId ('HEALTH-' + (New-Slug $row.Title))
+        }
+    }
+    $trustPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'trust_inventory.csv')
+    if ($trustPath -and (Test-Path -LiteralPath $trustPath)) {
+        $trustRows = @(Get-CsvSafe $trustPath @('Partner','Status','Severity','Detail'))
+        $trustFindings = @($trustRows | Where-Object Status -eq 'Finding')
+        if ($trustFindings.Count -gt 0) { Add-FindingOnce -Severity 'High' -Title 'Trust configuration permits elevated cross-boundary access' -Evidence "Trusts requiring review: $($trustFindings.Count). See the explicit delegation or filtering settings and boundary in the evidence." -Path $trustPath -Rows $trustFindings -RuleId 'TRUST-CONFIGURATION' }
+    }
+    $authPolicyPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'auth_policy_coverage.csv')
+    if ($authPolicyPath -and (Test-Path -LiteralPath $authPolicyPath)) {
+        $authPolicyRows = @(Get-CsvSafe $authPolicyPath @('Account','Enabled','Status','Detail'))
+        $authPolicyGaps = @($authPolicyRows | Where-Object { "$($_.Enabled)" -match '^(true|1)$' -and $_.Status -in @('Missing','AuditOnly','AssignedUnrestricted') })
+        if ($authPolicyGaps.Count -gt 0) { Add-FindingOnce -Severity 'Medium' -Title 'Privileged authentication policy configuration requires review' -Evidence "Enabled accounts: $($authPolicyGaps.Count). Scope: recursive Domain Admins and domain BUILTIN Administrators users. Other sign-in restrictions may exist; configured policy does not establish end-to-end enforcement." -Path $authPolicyPath -Rows $authPolicyGaps -RuleId 'AUTH-POLICY-COVERAGE' }
     }
 
     # Companion HTML outputs
@@ -3223,7 +3468,10 @@ $js
     $downloadsDirLocal = Get-HtmlDownloadsDir -BaseRoot $InputRoot
     Publish-CommonDownloadArtifacts -Root $InputRoot -DownloadRoot $downloadsDirLocal
 
+    $presentationNumber = 0
     foreach ($finding in $Findings) {
+        $presentationNumber++
+        Write-ADAuditProgress -Activity 'Report evidence previews' -Status "Finding $presentationNumber of $($Findings.Count)" -PercentComplete (100 * $presentationNumber / $Findings.Count)
         $presentation = New-FindingResultPresentation -Finding $finding -AuditReportPath $AuditHtml -DownloadRoot $downloadsDirLocal
         $finding | Add-Member -NotePropertyName DownloadHref -NotePropertyValue $presentation.DownloadHref -Force
         $finding | Add-Member -NotePropertyName DownloadLabel -NotePropertyValue $presentation.DownloadLabel -Force
@@ -3234,6 +3482,42 @@ $js
             $finding.Link = $presentation.ResolvedSourcePath
         }
     }
+
+    # Current-run scope and collection state. Completed checks are not control passes.
+    $statusPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'audit_check_status.csv')
+    $checkStatuses = @(Get-CsvSafe $statusPath @('CheckName','Switch','Selected','Status','Reason'))
+    $selectedStatuses = @($checkStatuses | Where-Object { "$( $_.Selected )" -match '^(true|1)$' })
+    $completedChecks = @($selectedStatuses | Where-Object Status -eq 'Completed').Count
+    $partialChecks = @($selectedStatuses | Where-Object Status -eq 'Partial').Count
+    $failedChecks = @($selectedStatuses | Where-Object Status -eq 'Failed').Count
+    $notRunChecks = @($selectedStatuses | Where-Object { $_.Status -notin @('Completed','Partial','Failed') }).Count
+    $notAssessedRows = @(Get-CsvSafe (Join-Path $InputRoot 'not_assessed.csv'))
+    $failureRows = @(Get-CsvSafe (Join-Path $InputRoot 'connection_failures.csv'))
+    $coverageKnown = $null -ne $runMetadata -and $selectedStatuses.Count -gt 0
+    $coverageComplete = $coverageKnown -and $completedChecks -eq $selectedStatuses.Count -and $notAssessedRows.Count -eq 0 -and $failureRows.Count -eq 0 -and $ReportIssues.Count -eq 0
+    $coverageLabel = if ($coverageComplete) { 'Selected checks completed' } elseif ($coverageKnown) { 'Partial assessment' } else { 'Coverage not established' }
+    $coverageDetails = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($row in $notAssessedRows) { $coverageDetails.Add("$($row.CheckName) / $($row.Target): $($row.Reason)") | Out-Null }
+    foreach ($row in $failureRows) { $coverageDetails.Add("$($row.CheckName): $($row.ErrorMessage)") | Out-Null }
+    foreach ($row in $ReportIssues) { $coverageDetails.Add("$($row.CheckName) / $([System.IO.Path]::GetFileName($row.Target)): $($row.Reason)") | Out-Null }
+    $coverageDetailHtml = ($coverageDetails | ForEach-Object { '<li>' + (HtmlEncode $_) + '</li>' }) -join "`n"
+    $statusTableHtml = if ($selectedStatuses.Count -gt 0) { New-PreviewTableHtml -Rows $selectedStatuses -Columns @('CheckName','Status','Reason','NotAssessedCount','FailureCount') -MaxRows 250 } else { '<p>No execution manifest was available. Missing evidence cannot be treated as a pass.</p>' }
+    $scopeDomain = if ($runMetadata -and $runMetadata.Domain) { [string]$runMetadata.Domain } else { 'Not recorded' }
+    $scopeForest = if ($runMetadata -and $runMetadata.Forest) { [string]$runMetadata.Forest } else { 'Not recorded' }
+    $scopeSelected = if ($runMetadata) { @($runMetadata.SelectedChecks) -join ', ' } else { 'Not recorded' }
+    $scopeExcluded = if ($runMetadata) { @($runMetadata.ExcludedChecks) -join ', ' } else { 'Not recorded' }
+    $cloneNotice = Get-ADAuditCloneNotice -IsolatedClone ($runMetadata -and $runMetadata.PSObject.Properties['AssessmentMode'] -and $runMetadata.AssessmentMode -eq 'IsolatedClone') -SnapshotDate $(if ($runMetadata -and $runMetadata.PSObject.Properties['SnapshotDate']) { [string]$runMetadata.SnapshotDate } else { '' })
+    $coverageHtml = @"
+<section class="section hero" id="assessment-coverage">
+  $cloneNotice
+  <h2>Assessment scope and coverage</h2>
+  <p><b>$coverageLabel</b>. Selected checks: $($selectedStatuses.Count); completed without recorded gaps: $completedChecks; partial: $partialChecks; failed: $failedChecks; not run: $notRunChecks.</p>
+  <p>Domain: <span class="mono">$(HtmlEncode $scopeDomain)</span> | Forest: <span class="mono">$(HtmlEncode $scopeForest)</span><br>Selected: $(HtmlEncode $scopeSelected)<br>Excluded: $(HtmlEncode $scopeExcluded)</p>
+  <p>Not assessed observations: $($notAssessedRows.Count); recorded failures: $($failureRows.Count); report evidence issues: $($ReportIssues.Count). Completion describes collection, not a pass on every control. Unselected checks and unqueried targets are outside this assessment.</p>
+  <p>Each finding group represents one reported condition and can contain multiple affected objects. Information entries and disabled-account hygiene with score 0 do not add active-exposure points. A score of 0 is not a certification that the environment is secure.</p>
+  <details><summary>Check execution and coverage details</summary>$statusTableHtml<ul>$coverageDetailHtml</ul></details>
+</section>
+"@
 
     # ---------------------------
     # Totals
@@ -3255,23 +3539,27 @@ $js
     $ScoreBands = @(
         [PSCustomObject]@{
             Level   = 'Low'
+            Label   = 'Band 1'
             Range   = '0 - 49'
-            Meaning = 'Minor control gaps or baseline drift. Address during routine maintenance and continue monitoring.'
+            Meaning = 'Lower accumulated points. Even one Critical finding can fall in this range; use finding severity to set urgency.'
         }
         [PSCustomObject]@{
             Level   = 'Medium'
+            Label   = 'Band 2'
             Range   = '50 - 99'
-            Meaning = 'Noticeable control gaps. Plan remediation in the next hardening cycle and track to closure.'
+            Meaning = 'More accumulated points. The v2 calculation sets at least Medium priority; this boundary is a script-defined heuristic.'
         }
         [PSCustomObject]@{
             Level   = 'High'
+            Label   = 'Band 3'
             Range   = '100 - 149'
-            Meaning = 'Major control gaps. Prioritize remediation and validate that administrative controls are applied consistently.'
+            Meaning = 'Higher accumulated points. The v2 calculation sets at least High priority; inspect the contributing findings and coverage.'
         }
         [PSCustomObject]@{
             Level   = 'Critical'
+            Label   = 'Band 4'
             Range   = '150+'
-            Meaning = 'Significant control gaps or privileged configuration drift. Treat as a priority workstream with defined owners and timelines.'
+            Meaning = 'Highest index range. The v2 calculation sets Critical priority; this does not establish compromise or a measured probability of attack.'
         }
     )
 
@@ -3282,15 +3570,24 @@ $js
         else { return 'Low' }
     }
 
-    $OverallLevel = Get-ScoreBand $TotalScore
+    $ScoreBand = Get-ScoreBand $TotalScore
+    $OverallLevel = $ScoreBand
+    $highestFinding = $Findings | Where-Object { $_.Score -gt 0 } | Sort-Object { Get-SeverityRank $_.Severity } -Descending | Select-Object -First 1
+    if ($highestFinding -and (Get-SeverityRank $highestFinding.Severity) -gt (Get-SeverityRank $OverallLevel)) { $OverallLevel = $highestFinding.Severity }
+    if (-not $highestFinding) { $OverallLevel = if ($coverageComplete) { 'No scored findings' } else { 'Not assessed' } }
+    $highestFindingSeverity = if ($highestFinding) { [string]$highestFinding.Severity } else { 'None' }
+    $indexBandLabel = ($ScoreBands | Where-Object Level -eq $ScoreBand).Label
+    $priorityBasis = if (-not $highestFinding) { 'No scored finding; coverage determines the conclusion.' }
+        elseif ((Get-SeverityRank $highestFinding.Severity) -ge (Get-SeverityRank $ScoreBand)) { "Highest scored finding: $($highestFinding.Severity)." }
+        else { "Accumulated index threshold ($indexBandLabel); highest individual finding: $($highestFinding.Severity)." }
 
-    $bandNow = $OverallLevel
+    $bandNow = $ScoreBand
     $scoreMatrixRows = foreach ($b in $ScoreBands) {
         $isActive = ($b.Level -eq $bandNow)
-        $cls = if ($isActive) { "matrix-row active sev-$($b.Level)" } else { "matrix-row sev-$($b.Level)" }
+        $cls = if ($isActive) { 'matrix-row active' } else { 'matrix-row' }
 @"
 <tr class="$cls">
-  <td><span class="pill sev-$($b.Level)">$($b.Level)</span></td>
+  <td><b>$($b.Label)</b>$(if ($isActive) { '<br><small>Current index</small>' })</td>
   <td class="mono">$($b.Range)</td>
   <td class="matrix-meaning">$(HtmlEncode $b.Meaning)</td>
 </tr>
@@ -3301,7 +3598,7 @@ $js
     # HTML output
     # ---------------------------
     $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
-    $computerName = Split-Path -Path $InputRoot -Leaf
+    $computerName = if ($runMetadata -and $runMetadata.ComputerName) { [string]$runMetadata.ComputerName } else { Split-Path -Path $InputRoot -Leaf }
 
     $domainInfoBlock = ''
     try {
@@ -3313,7 +3610,13 @@ $js
     $sortedFindings = $Findings | Sort-Object -Property @{Expression={ Get-SeverityRank $_.Severity };Descending=$true}, @{Expression='Score';Descending=$true}, @{Expression='Title';Descending=$false}
 
     $companionReports = Get-CompanionHtmlReports -Root $InputRoot -Exclude @($AuditHtml, $OutputHtml)
-    Write-AuditHtmlReport -Path $AuditHtml -Items $sortedFindings -Counts $sevCounts -ComputerName $computerName -GeneratedOn $now -ManagementReportPath $OutputHtml -CompanionReports $companionReports
+    Write-AuditHtmlReport -Path $AuditHtml -Items $sortedFindings -Counts $sevCounts -ComputerName $computerName -GeneratedOn $now -ManagementReportPath $OutputHtml -CompanionReports $companionReports -CoverageHtml $coverageHtml
+
+    $findingExport = @($sortedFindings | ForEach-Object { [pscustomobject]@{ ScoringVersion=$ScoringVersion; RuleId=$_.RuleId; Severity=$_.Severity; Category=(Get-FindingCategory $_.Title); Title=$_.Title; Evidence=$_.Evidence; Score=$_.Score; EvidenceFile=(Get-RelPath $_.Link) } })
+    $findingExportPath = Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'report_findings.csv'
+    if ($findingExport.Count -gt 0) { $findingExport | Export-Csv -LiteralPath $findingExportPath -NoTypeInformation -Encoding UTF8 }
+    else { '"ScoringVersion","RuleId","Severity","Category","Title","Evidence","Score","EvidenceFile"' | Set-Content -LiteralPath $findingExportPath -Encoding UTF8 }
+    [ordered]@{ ScoringVersion=$ScoringVersion; GeneratedUtc=(Get-Date).ToUniversalTime().ToString('o'); Run=$runMetadata; Coverage=$coverageLabel; SelectedChecks=$selectedStatuses.Count; CompletedChecks=$completedChecks; PartialChecks=$partialChecks; FailedChecks=$failedChecks; NotRunChecks=$notRunChecks; ReportEvidenceIssues=$ReportIssues.Count; FindingGroups=($Findings.Count - $sevCounts.Information); InformationEntries=$sevCounts.Information; SeverityCounts=$sevCounts; Score=$TotalScore; ScoreBand=$ScoreBand; IndexBand=$indexBandLabel; HighestFindingSeverity=$highestFindingSeverity; PriorityBasis=$priorityBasis; IndexCalibration='Script-defined thresholds; not empirically validated'; OverallLevel=$OverallLevel } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'report_summary.json') -Encoding UTF8
 
     $auditRel = [System.IO.Path]::GetFileName($AuditHtml)
     $tableRows = foreach ($f in $sortedFindings) {
@@ -3334,13 +3637,17 @@ $js
     }
 
     $meaning = switch ($OverallLevel) {
-        'Critical' { 'The overall score indicates significant gaps relative to the defined baselines. Prioritize remediation for the highest-severity items and confirm governance for privileged access and password controls.' }
-        'High'     { 'The overall score indicates material gaps relative to the defined baselines. Prioritize remediation and validate that controls are applied consistently across the environment.' }
-        'Medium'   { 'The overall score indicates moderate gaps relative to the defined baselines. Plan remediation in the next hardening cycle and track progress to closure.' }
-        Default    { 'The overall score indicates minor gaps relative to the defined baselines. Address as part of routine maintenance and continue monitoring.' }
+        'Not assessed' { 'No scored exposure was established from this evidence, but assessment coverage is incomplete or unknown. This is not a clean bill of health. Resolve the listed coverage gaps before drawing a security conclusion.' }
+        'No scored findings' { 'The selected checks completed without recorded gaps and produced no scored findings. Review informational observations and disabled-account hygiene. Unselected checks and out-of-scope systems are not covered.' }
+        'Critical' { 'The reported findings require Critical priority because of the highest scored finding severity or the accumulated index. Start with the specific highest-severity evidence below; a small numerical index does not reduce the urgency of a Critical finding.' }
+        'High'     { 'The reported findings require High priority because of the highest scored finding severity or the accumulated index. Prioritize the specific affected controls and validate their effective configuration across the assessed scope.' }
+        'Medium'   { 'The reported findings require Medium priority because of the highest scored finding severity or the accumulated index. Plan the identified configuration and hardening work, accounting for collection gaps shown above.' }
+        Default    { 'The scored findings have Low priority within the assessed scope. Review the identified hygiene and configuration items; incomplete or unknown coverage must be assessed separately.' }
     }
 
     $nextSteps = switch ($OverallLevel) {
+        'Not assessed' { @('Resolve collection and report evidence gaps listed in Assessment scope and coverage.', 'Re-run the affected checks with the required permissions and connectivity before concluding that the configuration is sound.') }
+        'No scored findings' { @('Review information and hygiene observations and confirm the selected scope meets the engagement requirements.', 'Retain this complete report and its scope and methodology record as the standalone audit deliverable.') }
         'Critical' { @(
             'Assign owners for Critical findings and define target dates for remediation.'
             'Review privileged group membership (Domain Admins / Schema Admins / built-in administrators) and ensure membership is justified, documented, and reviewed regularly.'
@@ -3691,19 +3998,19 @@ $primaryNav
     <div class="h-title">
       <div>
         <h1>Active Directory Audit - Risk Report</h1>
-        <div class="meta">Target: <span class="mono">$(HtmlEncode $computerName)</span> | Generated: $(HtmlEncode $now) | <a href="$(HtmlAttrEncode ([System.IO.Path]::GetFileName($AuditHtml)))">Detailed audit report</a></div>
+        <div class="meta">Domain: <span class="mono">$(HtmlEncode $scopeDomain)</span> | Audit host: <span class="mono">$(HtmlEncode $computerName)</span> | Generated: $(HtmlEncode $now) | <a href="$(HtmlAttrEncode ([System.IO.Path]::GetFileName($AuditHtml)))">Detailed audit report</a></div>
         <div class="meta" style="margin-top:4px">Script: <span class="mono">$versionnum</span> | Run by: <span class="mono">$(HtmlEncode "$env:USERDOMAIN\$env:USERNAME")</span> | Start: $(HtmlEncode "$starttime") | End: $(HtmlEncode "$endtime")</div>
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:10px">
         <button id="themeToggle" type="button" class="theme-toggle" aria-pressed="false">Toggle theme</button>
         <div class="badge $OverallLevel">
           <div>
-            <div class="grade">Overall Risk</div>
+            <div class="grade">Overall finding priority</div>
             <div class="value">$OverallLevel</div>
           </div>
           <div style="width:1px;height:28px;background:var(--line)"></div>
           <div>
-            <div class="grade">Score</div>
+            <div class="grade">Finding points</div>
             <div class="value">$TotalScore</div>
           </div>
         </div>
@@ -3722,18 +4029,22 @@ $primaryNav
     </div>
   </div>
 
+  $coverageHtml
+
   <div class="section">
     <h2>Interpretation</h2>
     <div class="callout">
       <p><b>What this means:</b> $(HtmlEncode $meaning)</p>
+      <p><b>Priority basis:</b> $(HtmlEncode $priorityBasis) Accumulated points: $TotalScore ($indexBandLabel). Coverage: $(HtmlEncode $coverageLabel).</p>
 
       <div class="matrix-wrap">
-        <p style="margin-top:12px"><b>Score matrix:</b> The total score is mapped to a risk level as follows (current score highlighted).</p><br>
+        <p style="margin-top:12px"><b>Scoring methodology ${ScoringVersion}:</b> The index sums per-rule severity weights (Critical 12, High 8, Medium 5, Low 2) with per-rule count or baseline adjustments. Information and disabled-account password hygiene contribute 0. The headline priority is the higher of the highest scored finding severity and the index threshold. The neutral bands below describe points, not independently measured risk levels.</p>
+        <p><b>Limits:</b> The weights and thresholds are script-defined and have not been empirically calibrated. Points are not a percentage, a probability of compromise, or unique affected accounts; related findings can overlap. Compare runs only with matching scope, coverage, tool and scoring versions, and environment context. Missing evidence can lower points without any improvement. This methodology is not directly comparable with earlier report versions.</p><br>
         <table class="matrix">
           <thead>
             <tr>
-              <th>Level</th>
-              <th>Score range</th>
+              <th>Index band</th>
+              <th>Point range</th>
               <th>Interpretation</th>
             </tr>
           </thead>
@@ -3748,7 +4059,7 @@ $primaryNav
         $nextStepsHtml
       </ul>
 
-      <div class="footer">Note: This score is an index based on the findings included in this report and the collected audit data embedded into the generated HTML reports. Validate scope and collection completeness.</div>
+      <div class="footer">This standalone report describes the selected scope and current evidence. Finding counts are grouped conditions, not unique affected objects or passed controls. For manual review, retain the <a href="$(HtmlAttrEncode (Get-RelativeHref -FromFile $OutputHtml -ToPath (Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'report_findings.csv')))">finding register</a> and <a href="$(HtmlAttrEncode (Get-RelativeHref -FromFile $OutputHtml -ToPath (Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'report_summary.json')))">scope and methodology summary</a>.</div>
     </div>
   </div>
 
@@ -3841,8 +4152,9 @@ $js
         $txt += "Active Directory Audit - Risk Report"
         $txt += "Target: $computerName"
         $txt += "Generated: $now"
-        $txt += "Overall risk level: $OverallLevel (Score=$TotalScore)"
-        $txt += "Score matrix: " + (($ScoreBands | ForEach-Object { "$($_.Level)=$($_.Range)" }) -join '; ')
+        $txt += "Overall finding priority: $OverallLevel (Finding points=$TotalScore)"
+        $txt += "Priority basis: $priorityBasis Coverage: $coverageLabel"
+        $txt += "Index bands (script-defined, not calibrated risk levels): " + (($ScoreBands | ForEach-Object { "$($_.Label)=$($_.Range)" }) -join '; ')
         if ($UsersCount)  { $txt += "Users: $UsersCount" }
         if ($GroupsCount) { $txt += "Groups: $GroupsCount" }
         if ($OUsCount)    { $txt += "OUs: $OUsCount" }
@@ -3952,6 +4264,19 @@ function Update-CompanionHtmlReports {
     if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return }
 
     $auditPath = Join-Path (Get-HtmlReportsDir -BaseRoot $Root) 'ADAudit-Results.html'
+    # Read the saved scope so rebuilding reports does not depend on runner state.
+    $wrapperCloneNotice = ''
+    foreach ($metadataPath in @((Join-Path $Root 'Raw Data/Source/audit_run.json'), (Join-Path $Root 'audit_run.json'))) {
+        if (-not (Test-Path -LiteralPath $metadataPath)) { continue }
+        try {
+            $metadata = Get-Content -LiteralPath $metadataPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($metadata.PSObject.Properties['AssessmentMode'] -and $metadata.AssessmentMode -eq 'IsolatedClone') {
+                $snapshot = if ($metadata.PSObject.Properties['SnapshotDate']) { [string]$metadata.SnapshotDate } else { '' }
+                $wrapperCloneNotice = Get-ADAuditCloneNotice -IsolatedClone $true -SnapshotDate $snapshot
+            }
+        } catch { Write-Warning "Could not read companion report scope from ${metadataPath}: $($_.Exception.Message)" }
+        break
+    }
 
     foreach ($file in (Get-CompanionHtmlShellCandidates -Root $Root)) {
         $targetPath = $file.FullName
@@ -3964,6 +4289,9 @@ function Update-CompanionHtmlReports {
         if ($rawHtml -match '(?is)<body[^>]*>(?<body>.*)</body>') {
             $bodyHtml = $matches['body']
         }
+        # The wrapper supplies the visible theme control for embedded reports.
+        $bodyHtml = [regex]::Replace($bodyHtml, '(?is)<button\b[^>]*id="sharedAuditThemeToggle"[^>]*>.*?</button>', '')
+        $companionCloneNotice = if ($bodyHtml -match 'class=["''][^"'']*clone-notice') { '' } else { $wrapperCloneNotice }
 
         $styleBlocks = @(
             [regex]::Matches($rawHtml, '(?is)<style[^>]*>.*?</style>') |
@@ -4129,6 +4457,9 @@ a:hover{text-decoration:underline}
 }
 .embedded-report summary{cursor:pointer;font-weight:700}
 .embedded-report h1,.embedded-report h2,.embedded-report h3,.embedded-report h4{margin-top:0;color:var(--text)}
+html[data-theme="dark"] .embedded-report :is(table,tbody,tr,td,div,p,span,font){background-color:var(--panel) !important;color:var(--text) !important;border-color:var(--line) !important}
+html[data-theme="dark"] .embedded-report th{background-color:var(--th-bg) !important;color:var(--text) !important}
+html[data-theme="dark"] .embedded-report a{color:var(--accent) !important}
 </style>
 <script>
 (function(){
@@ -4189,6 +4520,7 @@ a:hover{text-decoration:underline}
     </div>
   </section>
 
+  $companionCloneNotice
   <section class="panel">
     <div class="embedded-report">
       $bodyHtml
@@ -4360,9 +4692,12 @@ function Invoke-ADAuditFinalReports {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Root)
 
+    Write-ADAuditProgress -Activity 'Report assembly' -Status 'Phase 1 of 4: organizing evidence'
     Move-RootHtmlReports -Root $Root -Destination (Get-HtmlReportsDir -BaseRoot $Root)
     Move-LegacyAuditArtifacts -Root $Root -ArchiveRoot (Get-RawSourceDataDir -BaseRoot $Root)
+    Write-ADAuditProgress -Activity 'Report assembly' -Status 'Phase 2 of 4: generating audit and risk reports'
     Invoke-ManagementReport -InputRoot $Root -OutputHtml (Join-Path (Get-HtmlReportsDir -BaseRoot $Root) 'Risk-Report.html') -AuditHtml (Join-Path (Get-HtmlReportsDir -BaseRoot $Root) 'ADAudit-Results.html')
+    Write-ADAuditProgress -Activity 'Report assembly' -Status 'Phase 3 of 4: preparing companion reports'
     Update-CompanionHtmlReports -Root $Root
 
     # <<< add cleanup here (absolute last action) >>>
@@ -4370,6 +4705,7 @@ function Invoke-ADAuditFinalReports {
     # links to (its "Open Report" buttons and the companion list). Only genuinely orphaned
     # HTML (nothing links to it) is removed, and every '*.source.html' duplicate left by an
     # earlier version is deleted (the wrapper now contains the full original).
+    Write-ADAuditProgress -Activity 'Report assembly' -Status 'Phase 4 of 4: finalizing output layout'
     $__htmlReportsDir = Get-HtmlReportsDir -BaseRoot $Root
     $__keep = @(
         'overlapping_group_memberships.html'
@@ -4394,4 +4730,5 @@ function Invoke-ADAuditFinalReports {
     foreach ($f in (Get-ChildItem -Path $Root -Recurse -File -Filter '*.source.html' -ErrorAction SilentlyContinue)) {
         try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch { }
     }
+    Write-ADAuditProgress -Activity 'Report assembly' -Status 'All report phases finished' -PercentComplete 100 -Completed
 }

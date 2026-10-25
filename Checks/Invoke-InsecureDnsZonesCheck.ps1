@@ -32,7 +32,7 @@ Function Get-DNSZoneInsecure {
 
     # Get all domain controllers; we'll probe each one to see if DNS is installed
     try {
-        $dcList = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+        $dcList = @(Get-ADDomainController -Filter * -ErrorAction Stop | Select-Object -ExpandProperty HostName)
     }
     catch {
         Register-ADAuditNotAssessed -Name 'Get-DNSZoneInsecure' -Switch 'insecurednszone' -Reason "Failed to enumerate domain controllers from AD: $($_.Exception.Message)"
@@ -51,9 +51,17 @@ Function Get-DNSZoneInsecure {
 
     $totalcount = 0
     $assessed = 0
+    $coverage = [System.Collections.Generic.List[object]]::new()
+    $zoneRows = [System.Collections.Generic.List[object]]::new()
 
     foreach ($dnsServer in $dcList) {
-
+        if ($script:ADAuditIsolatedClone -and -not (Test-ADAuditLocalComputer -ComputerName $dnsServer)) {
+            $reason = 'Remote DNS server collection is outside isolated-clone scope.'
+            Register-ADAuditNotAssessed -Name 'DNS zone security' -Switch 'insecurednszone' -Target $dnsServer -Reason $reason
+            $coverage.Add([pscustomobject]@{Target=$dnsServer; Status='NotAssessed'; Detail=$reason})
+            continue
+        }
+        Write-ADAuditProgress -Activity 'DNS zone security' -Status "Reading $dnsServer"
         Write-Both "    [*] Checking potential DNS server: $dnsServer"
 
         # Optional: check remote OS version to skip 2008 if needed
@@ -70,18 +78,28 @@ Function Get-DNSZoneInsecure {
             Write-Both "        [!] Could not determine OS version for $dnsServer, continuing anyway. $_"
         }
 
-        if ($skipServer) { continue }
+        if ($skipServer) {
+            Register-ADAuditNotAssessed -Name 'DNS zone security' -Switch 'insecurednszone' -Target $dnsServer -Reason 'Legacy server skipped; dynamic update security was not assessed.'
+            $coverage.Add([pscustomobject]@{Target=$dnsServer; Status='NotAssessed'; Detail='Unsupported legacy server'})
+            continue
+        }
 
         # Try to query DNS zones; if DNS role is not installed, this will fail and we skip
         try {
-            $insecurezones = Get-DnsServerZone -ComputerName $dnsServer -ErrorAction Stop |
-                             Where-Object { $_.DynamicUpdate -like '*nonsecure*' }
+            $zones = @(Get-DnsServerZone -ComputerName $dnsServer -ErrorAction Stop)
+            $insecurezones = @($zones | Where-Object { $_.DynamicUpdate -like '*nonsecure*' })
+            foreach ($zone in $zones) {
+                $zoneRows.Add([pscustomobject]@{Target=$dnsServer; Zone=$zone.ZoneName; DynamicUpdate=$zone.DynamicUpdate; Status=$(if ($zone.DynamicUpdate -like '*nonsecure*') {'Finding'} else {'NoInsecureUpdatesDetected'})})
+            }
         }
         catch {
             Write-Both "        [-] $dnsServer does not appear to have the DNS role (or access failed), skipping. $_"
+            Register-ADAuditNotAssessed -Name 'DNS zone security' -Switch 'insecurednszone' -Target $dnsServer -Reason "DNS role absent or access failed; cannot distinguish from this query: $($_.Exception.Message)"
+            $coverage.Add([pscustomobject]@{Target=$dnsServer; Status='NotAssessed'; Detail=$_.Exception.Message})
             continue
         }
         $assessed++
+        $coverage.Add([pscustomobject]@{Target=$dnsServer; Status='Assessed'; Detail="$($zones.Count) zone instance(s) enumerated"})
 
         if ($insecurezones) {
             foreach ($insecurezone in $insecurezones) {
@@ -98,7 +116,7 @@ Function Get-DNSZoneInsecure {
     }
 
     if ($totalcount -gt 0) {
-        Write-Both "    [!] There were $totalcount DNS zones configured to allow insecure updates (KB842) across all DNS servers."
+        Write-Both "    [!] $totalcount DNS zone instance(s) allow insecure updates (KB842); replicated copies may refer to the same zone."
         Write-Nessus-Finding "InsecureDNSZone" "KB842" ([System.IO.File]::ReadAllText($globalInsecureZonesFile))
     }
     elseif ($assessed -eq 0) {
@@ -107,6 +125,9 @@ Function Get-DNSZoneInsecure {
     else {
         Write-Both "    [-] No insecure DNS zones found on any of the $assessed discovered DNS server(s)."
     }
+    $coverage | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'dns_security_coverage.csv')
+    $zoneRows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'dns_zone_security.csv')
+    Write-Both "    [*] DNS coverage: $assessed/$($dcList.Count) DC-hosted DNS candidates assessed. Non-DC DNS servers were not discovered by this check."
 }
 
 function Invoke-InsecureDnsZonesCheck {

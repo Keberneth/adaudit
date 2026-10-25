@@ -510,6 +510,14 @@ $y += 12
 Add-LabelBold "Advanced Options" $y | Out-Null
 $y += $rowHeight
 
+$chkIsolatedClone = Add-Check "Isolated DC clone" $y $false 250 $leftLabel
+$lblCloneDesc = Add-Label "Local collection; copied directory is not current production posture" ($y + 1) 620 ($leftLabel + 256)
+$y += $rowHeight
+Add-Label "Snapshot date (YYYY-MM-DD):" $y 300 | Out-Null
+$txtSnapshotDate = Add-TextBox $y
+$txtSnapshotDate.Enabled = $false
+$y += $rowHeight + 4
+
 $chkKeepLegacy = Add-Check "-KeepLegacyArtifacts" $y $false 250 $leftLabel
 $lblKeepLegacyDesc = Add-Label "Preserve raw data and evidence files" ($y + 1) 500 ($leftLabel + 256)
 $lblKeepLegacyDesc.ForeColor = [System.Drawing.Color]::DimGray
@@ -688,6 +696,10 @@ function Update-Preview {
     }
 
     # Advanced options
+    if ($script:chkIsolatedClone.Checked) {
+        $cmd += " -IsolatedClone"
+        if ($script:txtSnapshotDate.Text.Trim()) { $cmd += " -SnapshotDate '" + ($script:txtSnapshotDate.Text.Trim() -replace "'", "''") + "'" }
+    }
     if ($script:chkKeepLegacy.Checked)       { $cmd += " -KeepLegacyArtifacts" }
     if ($script:chkDnsRecordCounts.Checked)  { $cmd += " -DnsIncludeRecordCounts" }
     if ($script:chkDnsSystemZones.Checked)   { $cmd += " -DnsIncludeSystemZones" }
@@ -767,6 +779,8 @@ foreach ($key in $excludeCheckboxes.Keys) {
     $excludeCheckboxes[$key].Add_CheckedChanged({ Update-Preview })
 }
 $chkKeepLegacy.Add_CheckedChanged({ Update-Preview })
+$chkIsolatedClone.Add_CheckedChanged({ $script:txtSnapshotDate.Enabled = $script:chkIsolatedClone.Checked; Update-Preview })
+$txtSnapshotDate.Add_TextChanged({ Update-Preview })
 $chkDnsRecordCounts.Add_CheckedChanged({ Update-Preview })
 $chkDnsSystemZones.Add_CheckedChanged({ Update-Preview })
 $chkDelegSystem.Add_CheckedChanged({ Update-Preview })

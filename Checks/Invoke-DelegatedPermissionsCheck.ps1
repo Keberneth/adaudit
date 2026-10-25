@@ -24,6 +24,41 @@
 
 
 #region Delegated Permissions Report (merged)
+function Get-ADAuditLapsPermissionKind {
+    param([string]$PropertyName)
+    if ($PropertyName -in @('ms-Mcs-AdmPwdExpirationTime','msLAPS-PasswordExpirationTime')) { return 'ExpirationMetadata' }
+    if ($PropertyName -in @('ms-Mcs-AdmPwd','msLAPS-Password')) { return 'PlaintextPasswordAttribute' }
+    if ($PropertyName -in @('msLAPS-EncryptedPassword','msLAPS-EncryptedPasswordHistory','msLAPS-EncryptedDSRMPassword','msLAPS-EncryptedDSRMPasswordHistory','ms-LAPS-Encrypted-Password-Attributes')) { return 'EncryptedPasswordAttribute' }
+    return 'Other'
+}
+
+function Get-ADAuditReplicationDelegations {
+    param($Records, [string[]]$ExpectedTrusteeSids = @('S-1-5-18','S-1-5-9','S-1-5-32-544'))
+    $byTrustee = @{}
+    foreach ($record in $Records) {
+        if ($record.ScopeType -ne 'Domain' -or [string]$record.AccessControlType -ne 'Allow' -or [string]$record.PropagationFlags -match 'InheritOnly') { continue }
+        $rights = [string]$record.ActiveDirectoryRights
+        if ($rights -notmatch 'ExtendedRight|GenericAll') { continue }
+        $guid = [string]$record.ObjectTypeGuid
+        $all = ($rights -match 'GenericAll' -or -not $guid -or $guid -eq [guid]::Empty.ToString())
+        $changes = $all -or $guid -eq '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'
+        $secrets = $all -or $guid -eq '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+        if (-not $changes -and -not $secrets) { continue }
+        $key = if ($record.TrusteeSid) { [string]$record.TrusteeSid } else { [string]$record.Trustee }
+        if (-not $byTrustee.ContainsKey($key)) {
+            $byTrustee[$key] = [pscustomobject]@{Trustee=$record.Trustee; TrusteeSid=$record.TrusteeSid; ScopeDN=$record.ScopeDN; GetChanges=$false; GetChangesAll=$false; Status='Review'; Severity='Info'; Detail=''}
+        }
+        if ($changes) { $byTrustee[$key].GetChanges = $true }
+        if ($secrets) { $byTrustee[$key].GetChangesAll = $true }
+    }
+    foreach ($row in $byTrustee.Values) {
+        $expected = $row.TrusteeSid -in $ExpectedTrusteeSids
+        if ($row.GetChanges -and $row.GetChangesAll -and -not $expected) { $row.Status='PotentialExposure'; $row.Severity='Critical' }
+        $row.Detail = if ($expected) { 'Expected privileged/DC trustee; inventory retained. Verify current membership and business ownership.' } elseif ($row.GetChanges -and $row.GetChangesAll) { 'Same trustee has allow ACEs for Replicating Directory Changes and Changes All (or all extended/full control rights) on the domain root. Potential secret-replication capability; verify effective deny/group/token access and approved synchronization-service purpose. No secrets were replicated.' } else { 'Partial replication-right grant. Combined access through group memberships was not calculated; review the effective token. No secrets were replicated.' }
+        $row
+    }
+}
+
 function Invoke-DelegatedPermissionsReport {
     [CmdletBinding()]
     param(
@@ -172,9 +207,7 @@ function Invoke-DelegatedPermissionsReport {
     # Built-in trustees to optionally suppress
     $systemTrustees = @(
       'NT AUTHORITY\SELF',
-      'NT AUTHORITY\Authenticated Users',
       'NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS',
-      'NT AUTHORITY\Everyone',
       'BUILTIN\Administrators',
       'NT AUTHORITY\SYSTEM'
     )
@@ -201,6 +234,7 @@ function Invoke-DelegatedPermissionsReport {
 
     # Data store
     $records = New-Object System.Collections.Generic.List[object]
+    $scopeCoverage = [System.Collections.Generic.List[object]]::new()
 
     # Iterate scopes and collect ACEs
     foreach ($dn in $scopes) {
@@ -213,8 +247,11 @@ function Invoke-DelegatedPermissionsReport {
         $acl = Invoke-Retry { Get-AclForDn -Dn $dn -Server $Server }
       } catch {
         Write-Warning "ACL read failed: $dn. $_"
+        Register-ADAuditNotAssessed -Name 'Delegated permission ACL' -Switch 'delegatedpermissions' -Target $dn -Reason $_.Exception.Message
+        $scopeCoverage.Add([pscustomobject]@{ScopeDN=$dn; Status='NotAssessed'; Detail=$_.Exception.Message})
         continue
       }
+      $scopeCoverage.Add([pscustomobject]@{ScopeDN=$dn; Status='Assessed'; Detail='ACL enumerated; effective token access is not calculated'})
 
       foreach ($ace in $acl.Access) {
         if (-not $IncludeInherited -and $ace.IsInherited) { continue }
@@ -230,6 +267,7 @@ function Invoke-DelegatedPermissionsReport {
           CanonicalScope        = Get-Canonical $dn
           ScopeType             = $scopeType
           Trustee               = $trustee
+          TrusteeSid            = Get-ADAuditAceSid $ace
           TrusteeType           = Get-PrincipalType $trustee
           AccessControlType     = $ace.AccessControlType
           ActiveDirectoryRights = $ace.ActiveDirectoryRights
@@ -253,39 +291,62 @@ function Invoke-DelegatedPermissionsReport {
     # De-duplicate identical ACE rows to reduce noise
     $records = @($records |
       Sort-Object ScopeDN,Trustee,AccessControlType,ActiveDirectoryRights,AppliesToClass,AppliesToProperty,InheritanceType,IsInherited,ObjectTypeGuid,InheritedObjectGuid -Unique)
+    $scopeCoverage | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'delegated_permission_coverage.csv')
+    # Deny ACEs can be requested for inventory, but never become granting findings.
+    $allowRecords = @($records | Where-Object { [string]$_.AccessControlType -eq 'Allow' })
+    $expectedReplicationSids = @('S-1-5-18','S-1-5-9','S-1-5-32-544')
+    try {
+        $domainParams = @{Identity=$domainNC; ErrorAction='Stop'}
+        if ($Server) { $domainParams.Server=$Server }
+        $domainInfo = Get-ADDomain @domainParams
+        $expectedReplicationSids += "$($domainInfo.DomainSID.Value)-512", "$($domainInfo.DomainSID.Value)-516"
+        $rootDomain = (Get-ADForest -Identity $domainInfo.Forest -ErrorAction Stop).RootDomain
+        $rootSid = (Get-ADDomain -Identity $rootDomain -Server $rootDomain -ErrorAction Stop).DomainSID.Value
+        $expectedReplicationSids += "$rootSid-519"
+    } catch {
+        Register-ADAuditNotAssessed -Name 'Replication trustee baseline' -Switch 'delegatedpermissions' -Reason "Expected domain/forest administrator SID inventory incomplete: $($_.Exception.Message)"
+    }
+    $replicationInventory = @(Get-ADAuditReplicationDelegations -Records $allowRecords -ExpectedTrusteeSids $expectedReplicationSids)
+    Export-ADAuditSecurityCsv -Rows $replicationInventory -Columns @('Trustee','TrusteeSid','ScopeDN','GetChanges','GetChangesAll','Status','Severity','Detail') -Path (Get-EvidencePath 'replication_delegations.csv')
+    Export-ADAuditSecurityCsv -Rows $replicationInventory -Columns @('Trustee','TrusteeSid','ScopeDN','GetChanges','GetChangesAll','Status','Severity','Detail') -Path (Join-Path $allDir "ADAudit_Replication_$ts.csv")
+    $replicationExposures = @($replicationInventory | Where-Object Status -eq 'PotentialExposure')
+    $expectedAdminSids = @($expectedReplicationSids | Where-Object { $_ -ne 'S-1-5-9' -and $_ -notmatch '-516$' })
 
     # ------- Analytics and risk outputs (always generated) -------
 
     # Windows LAPS + legacy LAPS attributes
-    $lapsAttributes = @('ms-Mcs-AdmPwd','ms-Mcs-AdmPwdExpirationTime','msLAPS-Password','msLAPS-PasswordExpirationTime','msLAPS-EncryptedPassword','msLAPS-EncryptedPasswordHistory','msLAPS-EncryptedDSRMPassword','msLAPS-EncryptedDSRMPasswordHistory')
+    $lapsAttributes = @('ms-Mcs-AdmPwd','msLAPS-Password')
+    $lapsInventory = @($allowRecords | Where-Object { (Get-ADAuditLapsPermissionKind $_.AppliesToProperty) -ne 'Other' } | Select-Object *,@{Name='LapsPermissionKind';Expression={Get-ADAuditLapsPermissionKind $_.AppliesToProperty}})
+    $lapsInventory | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Get-EvidencePath 'laps_delegation_inventory.csv')
 
-    $overDelegations = $records | Where-Object {
-      $_.ActiveDirectoryRights.ToString() -match 'GenericAll|WriteDacl|DeleteTree'
+    $overDelegations = $allowRecords | Where-Object {
+      $_.TrusteeSid -notin $expectedAdminSids -and $_.ActiveDirectoryRights.ToString() -match 'GenericAll|WriteDacl|WriteOwner'
     }
-    $accountOperators = $records | Where-Object { $_.Trustee -eq 'BUILTIN\Account Operators' }
-    $printOperators   = $records | Where-Object { $_.Trustee -eq 'BUILTIN\Print Operators' }
+    $accountOperators = $allowRecords | Where-Object { $_.TrusteeSid -eq 'S-1-5-32-548' }
+    $printOperators   = $allowRecords | Where-Object { $_.TrusteeSid -eq 'S-1-5-32-550' }
     # Trustee values carry a 'DOMAIN\' or 'BUILTIN\' prefix, so compare the name part
     # after the last backslash - otherwise these matches never fire (e.g. the real value
     # is 'CONTOSO\Exchange Trusted Subsystem', not the bare name).
     $exchangePattern  = 'Exchange Trusted Subsystem','Organization Management','Exchange Windows Permissions'
-    $exchangeDelegations = $records | Where-Object { (($_.Trustee -split '\\')[-1]) -in $exchangePattern }
-    $serviceAcctDelegations = $records | Where-Object {
+    $exchangeDelegations = $allowRecords | Where-Object { (($_.Trustee -split '\\')[-1]) -in $exchangePattern }
+    $serviceAcctDelegations = $allowRecords | Where-Object {
       $name = ($_.Trustee -split '\\')[-1]
-      ($name -match '^(svc|sa)[\-_]') -or ($_.Trustee -match 'DomainJoin') -or ($name -match '\bDJ\b')
+      (($name -match '^(svc|sa)[\-_]') -or ($_.Trustee -match 'DomainJoin') -or ($name -match '\bDJ\b')) -and
+      ($_.ActiveDirectoryRights.ToString() -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty|CreateChild|DeleteChild|ExtendedRight')
     }
     $unknownSids = @($records | Where-Object { $_.TrusteeType -eq 'SID' } | Select-Object -Expand Trustee | Sort-Object -Unique)
-    $membershipControl = $records | Where-Object {
-      $_.ActiveDirectoryRights.ToString() -match 'WriteProperty' -and $_.AppliesToProperty -eq 'member'
+    $membershipControl = $allowRecords | Where-Object {
+      $_.TrusteeSid -notin $expectedAdminSids -and $_.ActiveDirectoryRights.ToString() -match 'WriteProperty' -and $_.AppliesToProperty -eq 'member'
     }
-    $preWin2k  = $records | Where-Object { (($_.Trustee -split '\\')[-1]) -eq 'Pre-Windows 2000 Compatible Access' }
-    $lapsRead  = $records | Where-Object {
-      $_.AppliesToProperty -in $lapsAttributes -and $_.ActiveDirectoryRights.ToString() -match 'ReadProperty|ExtendedRight'
+    $preWin2k  = $allowRecords | Where-Object { $_.TrusteeSid -eq 'S-1-5-32-554' }
+    $lapsRead  = $allowRecords | Where-Object {
+      $_.AppliesToProperty -in $lapsAttributes -and $_.ActiveDirectoryRights.ToString() -match 'ExtendedRight'
     }
     # The child-object type a CreateChild ACE may create is in ObjectType (AppliesToProperty),
     # NOT the inheritance-scope class InheritedObjectType (AppliesToClass). A "Create Computer
     # objects" delegation therefore shows up as AppliesToProperty='computer'; a blanket
     # CreateChild (empty ObjectType) also permits creating computers.
-    $computerCreate = $records | Where-Object {
+    $computerCreate = $allowRecords | Where-Object {
       $_.ActiveDirectoryRights.ToString() -match 'CreateChild' -and
       (($_.AppliesToProperty -match 'computer') -or (-not $_.ObjectTypeGuid))
     }
@@ -303,9 +364,10 @@ function Invoke-DelegatedPermissionsReport {
     $cntComputerCreate  = ($computerCreate       | Measure-Object).Count
 
     # High-risk CSV
-    $highRisk = $records | Where-Object {
-      $_.ActiveDirectoryRights.ToString() -match 'GenericAll|WriteDacl|DeleteTree' -or
-      ($_.AppliesToProperty -in ($lapsAttributes + 'member') -and $_.ActiveDirectoryRights.ToString() -match 'WriteProperty|ReadProperty|ExtendedRight')
+    $highRisk = $allowRecords | Where-Object {
+      $_.TrusteeSid -notin $expectedAdminSids -and ($_.ActiveDirectoryRights.ToString() -match 'GenericAll|WriteDacl|WriteOwner' -or
+      ($_.AppliesToProperty -eq 'member' -and $_.ActiveDirectoryRights.ToString() -match 'WriteProperty') -or
+      ($_.AppliesToProperty -in $lapsAttributes -and $_.ActiveDirectoryRights.ToString() -match 'ExtendedRight'))
     }
     $highCsv = Join-Path -Path $allDir -ChildPath "ADAudit_HighRisk_$ts.csv"
     $highRisk | Export-Csv -NoTypeInformation -Path $highCsv -Encoding UTF8
@@ -340,16 +402,23 @@ function Invoke-DelegatedPermissionsReport {
         }) | Out-Null
     }
 
+    if ($replicationExposures.Count -gt 0) {
+        _Add-Finding -Severity 'CRITICAL' -Title 'Potential secret-replication delegation (DCSync rights)' -Count $replicationExposures.Count `
+            -Why 'Domain-root allow ACEs grant both Replicating Directory Changes and Changes All to trustees outside the expected administrator/DC baseline. This can permit secret replication; group and deny applicability must be reviewed before concluding effective access. No DCSync operation was performed.' `
+            -Fix 'Validate the synchronization-service business need, effective group membership and deny ACEs. Remove unapproved replication delegations; retain and monitor explicitly approved identity synchronization services.' `
+            -Samples @($replicationExposures | Select-Object -ExpandProperty Trustee)
+        Write-Nessus-Finding 'Potential AD secret-replication delegation' 'KB1206' (($replicationExposures | ForEach-Object { "$($_.Trustee) [$($_.TrusteeSid)] on $($_.ScopeDN): $($_.Detail)" }) -join "`n") 'Critical'
+    }
     if ($cntOver -gt 0) {
-        $sev = if ($cntOver -gt 50) { 'CRITICAL' } elseif ($cntOver -gt 10) { 'HIGH' } else { 'MEDIUM' }
+        $sev = if (@($overDelegations | Where-Object { $_.ScopeType -in @('Domain','AdminSDHolder') }).Count -gt 0) { 'CRITICAL' } else { 'HIGH' }
         $samples = @($overDelegations | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
-        _Add-Finding -Severity $sev -Title 'Over-delegation: GenericAll / WriteDacl / DeleteTree' -Count $cntOver `
-            -Why 'These rights let the trustee fully control or take ownership of the affected OU, which is equivalent to administrative access on every object below it. A single account or group with GenericAll on a Tier0 OU is a domain-takeover path.' `
+        _Add-Finding -Severity $sev -Title 'Potential control delegation: GenericAll / WriteDacl / WriteOwner' -Count $cntOver `
+            -Why 'These allow ACEs can grant object or ACL control. Impact depends on the target, object/property GUIDs, inheritance scope, protected objects and effective deny/group access. Domain-root and AdminSDHolder delegations warrant highest priority; an OU ACE does not automatically grant every right on every descendant.' `
             -Fix 'Replace these delegations with task-specific rights (e.g. ResetPassword, ReadPwdLastSet) scoped to the smallest necessary container. Document the business justification for any remaining GenericAll delegation.' `
             -Samples $samples
     }
     if ($cntMemberCtrl -gt 0) {
-        $sev = if ($cntMemberCtrl -gt 40) { 'CRITICAL' } elseif ($cntMemberCtrl -gt 5) { 'HIGH' } else { 'MEDIUM' }
+        $sev = if (@($membershipControl | Where-Object { $_.ScopeType -eq 'AdminSDHolder' }).Count -gt 0) { 'CRITICAL' } else { 'HIGH' }
         $samples = @($membershipControl | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
         _Add-Finding -Severity $sev -Title 'Group membership modification rights (WriteProperty on member)' -Count $cntMemberCtrl `
             -Why 'Allows the trustee to add/remove accounts from arbitrary groups - a direct privilege-escalation vector if it leads to Tier0 groups (Domain/Enterprise Admins) via nested membership.' `
@@ -358,8 +427,8 @@ function Invoke-DelegatedPermissionsReport {
     }
     if ($cntLaps -gt 0) {
         $samples = @($lapsRead | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
-        _Add-Finding -Severity 'HIGH' -Title 'LAPS password read delegations' -Count $cntLaps `
-            -Why 'Trustees with read access to ms-Mcs-AdmPwd / msLAPS-Password can recover the local-administrator password of every computer covered by the delegation. This is full local-admin on those endpoints.' `
+        _Add-Finding -Severity 'HIGH' -Title 'Potential LAPS plaintext password access' -Count $cntLaps `
+            -Why 'These allow ACEs grant control access on a plaintext LAPS password attribute. Confirm effective read/control access on the target computers. Expiration metadata is not a password; encrypted-attribute access alone does not grant decryption. Those rights are inventory only in laps_delegation_inventory.csv.' `
             -Fix 'Limit LAPS read to a small, monitored helpdesk/Tier1 group. Audit each existing reader and remove anything outside that group. Monitor all reads.' `
             -Samples $samples
     }
@@ -377,7 +446,7 @@ function Invoke-DelegatedPermissionsReport {
             -Samples @()
     }
     if ($cntSvc -gt 0) {
-        $sev = if ($cntSvc -gt 30) { 'HIGH' } else { 'MEDIUM' }
+        $sev = 'MEDIUM'
         $samples = @($serviceAcctDelegations | Select-Object -ExpandProperty Trustee | Sort-Object -Unique | Select-Object -First 10)
         _Add-Finding -Severity $sev -Title 'Service account elevated delegations' -Count $cntSvc `
             -Why 'Service accounts (svc-*, DJ-*, DomainJoin*) holding write/create rights are an attractive target - if compromised they can be used for SPN-based attacks (Kerberoasting), RBCD, and lateral movement.' `
@@ -422,14 +491,16 @@ function Invoke-DelegatedPermissionsReport {
                    elseif ($highCount -gt 0) { 'HIGH' }
                    elseif ($medCount  -gt 0) { 'MEDIUM' }
                    elseif ($lowCount  -gt 0) { 'LOW' }
-                   else { 'CLEAN' }
+                   elseif (@($scopeCoverage | Where-Object Status -eq 'NotAssessed').Count -gt 0) { 'INCOMPLETE' }
+                   else { 'NO MATCHING FINDINGS IN ASSESSED SCOPE' }
 
     $riskSb = New-Object System.Text.StringBuilder
     [void]$riskSb.AppendLine('=====================================================================')
     [void]$riskSb.AppendLine(' DELEGATED PERMISSIONS RISK ASSESSMENT')
     [void]$riskSb.AppendLine('=====================================================================')
     [void]$riskSb.AppendLine(" Generated         : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-    [void]$riskSb.AppendLine(" Scopes analysed   : $(@($scopes).Count)")
+    [void]$riskSb.AppendLine(" Scopes analysed   : $(@($scopeCoverage | Where-Object Status -eq 'Assessed').Count) / $(@($scopes).Count)")
+    [void]$riskSb.AppendLine(' Findings describe potential allow-ACE exposure, not full effective access. Deny ACEs, inheritance, protected objects and nested trustees require validation.')
     [void]$riskSb.AppendLine(" ACE records       : $($records.Count)")
     [void]$riskSb.AppendLine(" Overall risk      : $overallRisk")
     [void]$riskSb.AppendLine(" Findings (CRITICAL/HIGH/MEDIUM/LOW): $criticalCount / $highCount / $medCount / $lowCount")
@@ -452,7 +523,7 @@ function Invoke-DelegatedPermissionsReport {
         foreach ($f in $findings) {
             $idx++
             [void]$riskSb.AppendLine(("[{0}/{1}] [{2}] {3}" -f $idx, $findings.Count, $f.Severity, $f.Title))
-            [void]$riskSb.AppendLine("    Count : $($f.Count) ACE records")
+            [void]$riskSb.AppendLine("    Count : $($f.Count) observations")
             [void]$riskSb.AppendLine("    Why   : $($f.Why)")
             [void]$riskSb.AppendLine("    Fix   : $($f.Fix)")
             if ($f.Samples -and $f.Samples.Count -gt 0) {
@@ -474,7 +545,7 @@ function Invoke-DelegatedPermissionsReport {
     $rec += "Delegated Permissions Recommendations"
     $rec += ('=' * 80)
     $rec += "Prioritized Actions:"
-    $rec += " 1. Remove unnecessary GenericAll / WriteDacl / DeleteTree delegations."
+    $rec += " 1. Review effective GenericAll / WriteDacl / WriteOwner and replication delegations; remove unapproved access."
     $rec += " 2. Remove BUILTIN\Account Operators and Print Operators from OUs unless explicitly required."
     $rec += " 3. Review Exchange-related ACLs; align with Microsoft minimums; eliminate GenericAll."
     $rec += " 4. Resolve unknown SIDs; remove orphaned entries."
@@ -509,7 +580,7 @@ function Invoke-DelegatedPermissionsReport {
     [void]$perScopeSb.AppendLine(' DELEGATED PERMISSIONS - PER-SCOPE SUMMARY (HUMAN READABLE)')
     [void]$perScopeSb.AppendLine('=====================================================================')
     [void]$perScopeSb.AppendLine(" Generated  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-    [void]$perScopeSb.AppendLine(" Scopes     : $(@($scopes).Count)")
+    [void]$perScopeSb.AppendLine(" Scopes read: $(@($scopeCoverage | Where-Object Status -eq 'Assessed').Count) / $(@($scopes).Count)")
     [void]$perScopeSb.AppendLine(" ACE records: $($records.Count)")
     [void]$perScopeSb.AppendLine('---------------------------------------------------------------------')
     [void]$perScopeSb.AppendLine(' For machine-readable output use OUs\ADAudit_*.csv (one per scope) or')
@@ -578,7 +649,7 @@ function Invoke-DelegatedPermissionsReport {
     $index.Add("<div class='meta'>Generated: $(Get-Date -Format 'u') &mdash; Overall risk: <strong>$overallRisk</strong></div></div>")
 
     $index.Add("<div class='stats'>")
-    $index.Add("<div class='stat'><div class='val'>$($scopes.Count)</div><div class='lbl'>Scopes Analyzed</div></div>")
+    $index.Add("<div class='stat'><div class='val'>$(@($scopeCoverage | Where-Object Status -eq 'Assessed').Count)/$($scopes.Count)</div><div class='lbl'>Scopes Analyzed</div></div>")
     $index.Add("<div class='stat'><div class='val'>$($records.Count)</div><div class='lbl'>Total ACEs</div></div>")
     $index.Add("<div class='stat'><div class='val' style='color:var(--critical)'>$criticalCount</div><div class='lbl'>Critical</div></div>")
     $index.Add("<div class='stat'><div class='val' style='color:var(--high)'>$highCount</div><div class='lbl'>High</div></div>")
@@ -587,7 +658,8 @@ function Invoke-DelegatedPermissionsReport {
     $index.Add("</div>")
 
     $index.Add('<h2>How to read this report</h2>')
-    $index.Add('<p>Findings are sorted by severity. Each finding tells you <strong>what is wrong</strong>, <strong>why it matters</strong> (the actual security impact), and the <strong>recommended fix</strong>. Use the per-scope CSV files at the bottom to drill into specific OUs.</p>')
+    $index.Add('<p>Findings are sorted by severity and describe potential permission exposure. Confirm effective deny/group access, object and inheritance scope before remediation. Expected administrator grants remain in inventory. Missing ACLs are unknown. Use per-scope CSV files to inspect specific objects.</p>')
+    $index.Add("<p>Unassessed scopes: $(@($scopeCoverage | Where-Object Status -eq 'NotAssessed').Count). Inherited ACEs included: $([bool]$IncludeInherited). This is a domain-root/OU/container review, not every object ACL.</p>")
 
     $index.Add('<h2>Findings</h2>')
     if ($findings.Count -eq 0) {
@@ -606,7 +678,7 @@ function Invoke-DelegatedPermissionsReport {
             } else { '' }
             $index.Add(@"
 <details>
-<summary><span class="badge $badge">$($f.Severity)</span> &nbsp; $titleEnc &nbsp;&mdash;&nbsp; <strong>$($f.Count) ACE records</strong></summary>
+<summary><span class="badge $badge">$($f.Severity)</span> &nbsp; $titleEnc &nbsp;&mdash;&nbsp; <strong>$($f.Count) observations</strong></summary>
 <div class="detail-body">
 <p><strong>Why this matters:</strong> $whyEnc</p>
 <p><strong>How to fix:</strong> $fixEnc</p>
@@ -625,6 +697,7 @@ $sampleBlock
     $index.Add("<li><a href='ADAudit_PerScopeSummary.txt'>Per-Scope Summary (one human-readable file, all scopes)</a></li>")
     $index.Add("<li><a href='All/ADAudit_AllScopes_$ts.csv'>Master CSV - all ACEs across all scopes</a></li>")
     $index.Add("<li><a href='All/ADAudit_HighRisk_$ts.csv'>High-Risk CSV - flagged ACEs only</a></li>")
+    $index.Add("<li><a href='All/ADAudit_Replication_$ts.csv'>Replication-right inventory and potential DCSync delegations</a></li>")
     $index.Add('</ul>')
 
     $index.Add('<h2>Per-Scope CSV (drill-down)</h2>')
