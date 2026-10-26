@@ -299,9 +299,14 @@ function Export-ADAuditDataExtract {
             $w.Write(($userHeader -join $delimiter) + $eol)
 
             $searchResults = $ds.FindAll()
+            # Materialise the results once. Reading .Count on the live
+            # SearchResultCollection while foreach is enumerating it starts a
+            # second enumerator over the same LDAP search handle and drains it,
+            # so the loop stopped after the first user (v9.3.0 regression).
+            $userRows = @($searchResults)
             $userIndex = 0
-            foreach ($r in $searchResults) {
-                Write-ADAuditProgress -Activity 'Data extract: users' -Status "$userIndex/$($searchResults.Count) users written" -PercentComplete ($userIndex / [math]::Max(1,$searchResults.Count) * 100)
+            foreach ($r in $userRows) {
+                Write-ADAuditProgress -Activity 'Data extract: users' -Status "$userIndex/$($userRows.Count) users written" -PercentComplete ($userIndex / [math]::Max(1,$userRows.Count) * 100)
                 $userIndex++
                 $p = $r.Properties
 

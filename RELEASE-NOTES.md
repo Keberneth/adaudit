@@ -18,6 +18,7 @@
 
 ### Report presentation
 
+- Data extract: the user export wrote only the first user (the Administrator row) since the v9.3.0 progress reporting read `.Count` on the live LDAP result collection inside the export loop, which drains the shared search handle. The results are now materialised once before the loop; groups, computers and OUs were never affected. Re-run the extract to get the full `<domain>-Users.csv`.
 - Risk-Report.html: the Interpretation score matrix again shows the colored Low/Medium/High/Critical level pills with the 0-49/50-99/100-149/150+ ranges and the earlier level descriptions, replacing the neutral Band 1-4 labels introduced with scoring methodology v2.1. The Priority basis line and the methodology and limits text stay. `report_summary.json` keeps the `IndexBand` key, now holding the matrix level, and the TXT summary prints the `Score matrix:` line again.
 
 ### Scope and deployment
