@@ -160,6 +160,27 @@ Function Get-DomainAdminReviewAssessment {
     [pscustomobject]@{Severity=$severity;Reason=($reasons -join ' ')}
 }
 
+Function Get-ADAuditRid500PasswordAge {
+    param([Nullable[datetime]]$PasswordLastSet, [switch]$IsolatedClone, [string]$SnapshotDate)
+    $reference = (Get-Date).Date
+    $assessment = 'Observed at audit date'
+    $detail = ''
+    if ($IsolatedClone) {
+        $parsed = [datetime]::MinValue
+        if (-not $SnapshotDate -or -not [datetime]::TryParseExact($SnapshotDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            return [pscustomobject]@{Days=$null;ReferenceDate=$null;Assessment='Not assessed';IsFinding=$false;Detail='The copy date is unknown. The stored password timestamp is inventory; elapsed time since the copy must not increase risk.'}
+        }
+        $reference = $parsed.Date
+        $assessment = 'Observed at snapshot date'
+        $detail = 'This age describes the copied directory at the supplied snapshot date, not current production.'
+    }
+    if ($null -eq $PasswordLastSet -or $PasswordLastSet.Date -gt $reference) {
+        return [pscustomobject]@{Days=$null;ReferenceDate=$reference.ToString('yyyy-MM-dd');Assessment='Not assessed';IsFinding=$false;Detail='The password timestamp is missing or later than the assessment reference date; age cannot be established.'}
+    }
+    $days = [int]($reference - $PasswordLastSet.Date).TotalDays
+    [pscustomobject]@{Days=$days;ReferenceDate=$reference.ToString('yyyy-MM-dd');Assessment=$assessment;IsFinding=($days -gt 180);Detail=$detail}
+}
+
 Function Get-DomainAdminScaledRisk {
     <#
     .SYNOPSIS
@@ -450,24 +471,33 @@ Function Get-DomainAdminScaledRisk {
     $nessusSev = if ($severity -eq 'Information') { 'Info' } else { $severity }
     Write-Nessus-Finding "DomainAdminsSizeAdjustedReview" "KB427" ([System.IO.File]::ReadAllText((Get-EvidencePath 'domain_admins_scaled.txt'))) $nessusSev
 
+    Get-DomainRid500Hygiene -DomainSid $domainSid -DomainDns $domainDns
+}
+
+Function Get-DomainRid500Hygiene {
+    param([string]$DomainSid, [string]$DomainDns)
     # ---- RID-500 hygiene as a separate finding ----
     $rid500Sev = 'Information'
-    $rid500Reason = 'Built-in domain Administrator (RID-500) is present and looks healthy. Continue to use it only as a documented break-glass / disaster-recovery account.'
+    $rid500Reason = 'No assessed RID-500 configuration issue was identified. Password-age coverage is reported separately. Reserve this domain account for approved break-glass / disaster recovery.'
     $rid500Lines = New-Object System.Text.StringBuilder
     [void]$rid500Lines.AppendLine('=========================================')
     [void]$rid500Lines.AppendLine('  BUILT-IN DOMAIN ADMINISTRATOR (RID-500) HYGIENE')
     [void]$rid500Lines.AppendLine('=========================================')
     try {
         $rid500 = Get-ADUser -Identity "$domainSid-500" -Properties PasswordLastSet, LastLogonDate, servicePrincipalName, Enabled, 'msDS-SupportedEncryptionTypes', AccountNotDelegated, MemberOf -ErrorAction Stop
-        $pwdAgeDays = if ($rid500.PasswordLastSet) { [int]((Get-Date) - $rid500.PasswordLastSet).TotalDays } else { -1 }
+        $age = Get-ADAuditRid500PasswordAge -PasswordLastSet $rid500.PasswordLastSet -IsolatedClone:$script:ADAuditIsolatedClone -SnapshotDate $script:ADAuditSnapshotDate
+        $pwdAgeDays = $age.Days
+        if ($age.Assessment -eq 'Not assessed') {
+            Register-ADAuditNotAssessed -Name 'RID-500 password age' -Switch 'accounts' -Target "$domainSid-500" -Reason $age.Detail
+        }
         $hasSpn     = ($rid500.servicePrincipalName -and $rid500.servicePrincipalName.Count -gt 0)
 
         $issues = @()
         # A DISABLED built-in Administrator is the recommended hardened posture, not a
         # finding - do not flag it. (The account's enabled state is still recorded in the
         # evidence file below for context.)
-        if ($pwdAgeDays -ge 0 -and $pwdAgeDays -gt 180) { $issues += "password age $pwdAgeDays days (>180d) - rotate" }
-        if ($hasSpn) { $issues += 'has SPN(s) - is being used as a service account' }
+        if ($age.IsFinding) { $issues += "password age $pwdAgeDays days at $($age.ReferenceDate) (>180d) - review rotation" }
+        if ($hasSpn) { $issues += 'has SPN(s) - investigate service-account use and ticket exposure' }
         try {
             $protectedUsersGroup = Get-ADGroup -Identity ("$domainSid-525") -ErrorAction SilentlyContinue
             if ($protectedUsersGroup -and $rid500.MemberOf -and ($rid500.MemberOf -notcontains $protectedUsersGroup.DistinguishedName)) {
@@ -476,7 +506,7 @@ Function Get-DomainAdminScaledRisk {
         } catch { }
 
         if ($issues.Count -gt 0) {
-            $rid500Sev = if ($issues -match 'SPN' -or $issues -match 'rotate') { 'High' } else { 'Medium' }
+            $rid500Sev = if ($hasSpn -or $age.IsFinding) { 'High' } else { 'Medium' }
             $rid500Reason = "Issues with built-in RID-500 account: " + ($issues -join '; ')
         }
 
@@ -489,7 +519,12 @@ Function Get-DomainAdminScaledRisk {
         [void]$rid500EvSb.AppendLine("Account: $($rid500.SamAccountName)  ($($rid500.DistinguishedName))")
         [void]$rid500EvSb.AppendLine("SID: $($rid500.SID)")
         [void]$rid500EvSb.AppendLine("Enabled: $($rid500.Enabled)")
-        [void]$rid500EvSb.AppendLine("PasswordLastSet: $(if ($rid500.PasswordLastSet) { $rid500.PasswordLastSet } else { 'never' }) (age: $pwdAgeDays days)")
+        [void]$rid500EvSb.AppendLine('Account scope: domain SID-500; this is not the separate Directory Services Restore Mode (DSRM) account.')
+        [void]$rid500EvSb.AppendLine("PasswordLastSet: $(if ($rid500.PasswordLastSet) { $rid500.PasswordLastSet } else { 'unavailable' })")
+        [void]$rid500EvSb.AppendLine("PasswordAgeAssessment: $($age.Assessment)")
+        [void]$rid500EvSb.AppendLine("PasswordAgeReferenceDate: $($age.ReferenceDate)")
+        [void]$rid500EvSb.AppendLine("PasswordAgeDays: $(if ($null -ne $pwdAgeDays) { $pwdAgeDays } else { 'unknown' })")
+        if ($age.Detail) { [void]$rid500EvSb.AppendLine("PasswordAgeContext: $($age.Detail)") }
         [void]$rid500EvSb.AppendLine("LastLogonDate: $(if ($rid500.LastLogonDate) { $rid500.LastLogonDate } else { 'never' })")
         [void]$rid500EvSb.AppendLine("Has SPN(s): $hasSpn")
         if ($issues.Count -gt 0) {
@@ -507,7 +542,7 @@ Function Get-DomainAdminScaledRisk {
         [void]$rid500EvSb.AppendLine('')
         [void]$rid500EvSb.AppendLine('----- HOW TO FIX -----')
         [void]$rid500EvSb.AppendLine(' - Reserve this account for initial build and break-glass / disaster recovery only. Do NOT use for daily admin work.')
-        [void]$rid500EvSb.AppendLine(' - Rotate the password on a defined schedule (180 days max recommended) and store it in a sealed/escrowed location.')
+        [void]$rid500EvSb.AppendLine(' - Validate age against the relevant environment, follow the approved rotation procedure and escrow the credential for recovery.')
         [void]$rid500EvSb.AppendLine(' - Set "Account is sensitive and cannot be delegated" (UAC bit 0x100000).')
         [void]$rid500EvSb.AppendLine(' - Remove any SPNs - this account must not be used as a service account or scheduled task account.')
         [void]$rid500EvSb.AppendLine(' - Restrict interactive logon (e.g. deny logon from workstations / member servers via GPO).')
@@ -522,6 +557,7 @@ Function Get-DomainAdminScaledRisk {
         }
     } catch {
         Write-Both "    [!] Could not inspect RID-500 account: $($_.Exception.Message)"
+        Register-ADAuditNotAssessed -Name 'Domain RID-500 hygiene' -Switch 'accounts' -Target "$domainSid-500" -Reason $_.Exception.Message
     }
 }
 
@@ -644,6 +680,9 @@ Function Get-NULLSessions {
     # server, not the DCs. So we read each DC's Lsa values via remote registry and
     # mark a DC NotAssessed (not a finding) when it cannot be reached.
     $subKey = 'SYSTEM\CurrentControlSet\Control\Lsa'
+    $rows = [Collections.Generic.List[object]]::new()
+    $evidencePath = Get-EvidencePath 'dc_anonymous_policy.csv'
+    '"Target","Control","Value","Status","Severity","Detail"' | Set-Content -LiteralPath $evidencePath -Encoding UTF8
     $dcList = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
     if (-not $dcList -or $dcList.Count -eq 0) {
         Register-ADAuditNotAssessed -Name 'Get-NULLSessions' -Switch 'accounts' -Reason "No domain controllers enumerated; cannot assess anonymous-access (null session) registry settings."
@@ -655,24 +694,27 @@ Function Get-NULLSessions {
         $ras = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $subKey -ValueName 'RestrictAnonymousSam'
         $eia = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey $subKey -ValueName 'everyoneincludesanonymous'
 
-        if (-not ($ra.Success -or $ras.Success -or $eia.Success)) {
-            Register-ADAuditNotAssessed -Name 'Get-NULLSessions' -Switch 'accounts' -Target $dc -RequiresRemotePS -Reason "Could not read HKLM\...\Lsa anonymous-access values on $dc (remote registry over CIM/DCOM/WinRM unavailable): $($ra.Error)"
-            continue
+        # Microsoft documents both SAM enumeration policies as having no impact
+        # on DCs. Their registry values are inventory, not proof of null-session
+        # exposure. https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/network-access-do-not-allow-anonymous-enumeration-of-sam-accounts-and-shares
+        foreach ($item in @(@{Name='RestrictAnonymous';Result=$ra},@{Name='RestrictAnonymousSAM';Result=$ras})) {
+            $rows.Add([pscustomobject]@{Target=$dc;Control=$item.Name;Value=$(if($item.Result.Success){$item.Result.Value}else{$null});Status='NotApplicable';Severity='Information';Detail='This SAM enumeration policy has no effect on domain controllers. The registry value alone does not establish anonymous access.'})
         }
-
-        if ($ra.Success -and $ra.Value -eq 0) {
-            Write-Both "    [!] RestrictAnonymous is set to 0 on $dc! (KB81)"
-            Write-Nessus-Finding "NullSessions" "KB81" "RestrictAnonymous is set to 0 on $dc"
+        $status='NotAssessed'; $severity='Information'; $detail=''
+        if (-not $eia.Success) { $detail="EveryoneIncludesAnonymous could not be read: $($eia.Error)" }
+        elseif ($null -eq $eia.Value) { $detail='EveryoneIncludesAnonymous is not explicitly configured; effective defaults were not established.' }
+        elseif ($eia.Value -eq 1) {
+            $status='Finding'; $severity='High'
+            $detail='Everyone permissions explicitly apply to anonymous users. Review affected resource ACLs; this setting does not prove that a specific resource is accessible.'
+            Write-Both "    [!] Everyone permissions apply to anonymous users on $dc (KB81). Review resource ACLs."
+            Write-Nessus-Finding 'NullSessions' 'KB81' "$dc : $detail" 'High'
         }
-        if ($ras.Success -and $ras.Value -eq 0) {
-            Write-Both "    [!] RestrictAnonymousSam is set to 0 on $dc! (KB81)"
-            Write-Nessus-Finding "NullSessions" "KB81" "RestrictAnonymousSam is set to 0 on $dc"
-        }
-        if ($eia.Success -and $eia.Value -eq 1) {
-            Write-Both "    [!] EveryoneIncludesAnonymous is set to 1 on $dc! (KB81)"
-            Write-Nessus-Finding "NullSessions" "KB81" "EveryoneIncludesAnonymous is set to 1 on $dc"
-        }
+        elseif ($eia.Value -eq 0) { $status='Pass'; $detail='Everyone permissions explicitly exclude anonymous users. Explicit ANONYMOUS LOGON permissions and other protocols require separate review.' }
+        else { $detail="Unexpected EveryoneIncludesAnonymous value '$($eia.Value)'; effective behavior is unknown." }
+        if ($status -eq 'NotAssessed') { Register-ADAuditNotAssessed -Name 'Get-NULLSessions' -Switch 'accounts' -Target $dc -Reason $detail }
+        $rows.Add([pscustomobject]@{Target=$dc;Control='EveryoneIncludesAnonymous';Value=$eia.Value;Status=$status;Severity=$severity;Detail=$detail})
     }
+    if ($rows.Count) { $rows | Export-Csv -LiteralPath $evidencePath -NoTypeInformation -Encoding UTF8 }
 }
 
 Function Get-InactiveAccounts {
@@ -772,31 +814,21 @@ Function Get-InactiveAccounts {
 }
 
 Function Get-AdminAccountChecks {
-    #Checks if Administrator account has been renamed, replaced and is no longer used.
+    # Domain RID-500 name/logon inventory. DSRM uses a separate local credential.
     $AdministratorSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-500"
-    # One lookup of the RID-500 account instead of three identical queries.
-    $Administrator500 = Get-ADUser -Filter { SID -eq $AdministratorSID } -Properties SamAccountName, Name, LastLogonDate
+    try { $Administrator500 = Get-ADUser -Identity $AdministratorSID -Properties SamAccountName, Name, LastLogonDate -ErrorAction Stop }
+    catch { Register-ADAuditNotAssessed -Name 'Domain RID-500 context' -Switch 'accounts' -Target $AdministratorSID -Reason $_.Exception.Message; return }
     $AdministratorSAMAccountName = $Administrator500.SamAccountName
-    $AdministratorName = $Administrator500.Name
-    if ($AdministratorTranslation -contains $AdministratorSAMAccountName) {
-        Write-Both "    [!] Built-in domain Administrator account (RID 500) has not been renamed (KB309)"
-        Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Built-in domain Administrator account (RID 500) has not been renamed"
-    }
-    else {
-        $count = 0
-        foreach ($AdminName in $AdministratorTranslation) {
-            if ((Get-ADUser -Filter { SamAccountName -eq $AdminName })) { $count++ }
-        }
-        if ($count -eq 0) {
-            Write-Both "    [!] Built-in domain Administrator account (RID 500) renamed to $AdministratorSAMAccountName ($($AdministratorName)), but no decoy 'Administrator' account was created in its place! (KB309)"
-            Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Built-in domain Administrator account (RID 500) renamed to $AdministratorSAMAccountName ($($AdministratorName)), but no decoy 'Administrator' account was created in its place"
-        }
-    }
+    $defaultName = $AdministratorTranslation -contains $AdministratorSAMAccountName
+    $nameDetail = if ($defaultName) { 'The domain RID-500 account retains a standard name. Renaming is optional defense in depth; the well-known SID remains discoverable. No decoy account is required.' } else { 'The domain RID-500 account uses a different name. Renaming does not remove its well-known SID or privileges. No decoy account is required.' }
+    if ($defaultName) { Write-Nessus-Finding 'AdminAccountRenamed' 'KB309' $nameDetail 'Low' }
     $AdministratorLastLogonDate = $Administrator500.LastLogonDate
-    if ($AdministratorLastLogonDate -gt (Get-Date).AddDays(-180)) {
-        Write-Both "    [!] Built-in domain Administrator account (RID 500) is still in use, last used $AdministratorLastLogonDate! (KB309)"
-        Write-Nessus-Finding "AdminAccountRenamed" "KB309" "Built-in domain Administrator account (RID 500) is still in use, last used $AdministratorLastLogonDate"
-    }
+    $logonDetail = 'Replicated logon timestamp is inventory, not proof of routine misuse. Correlate authentication events and approved recovery activity; copied-directory timestamps do not establish current production use. DSRM is a separate account and is not assessed here.'
+    @(
+        [pscustomobject]@{Target=$AdministratorSID;Scope='Domain RID-500';SamAccountName=$AdministratorSAMAccountName;Control='AccountName';Status=$(if($defaultName){'Finding'}else{'Information'});Severity=$(if($defaultName){'Low'}else{'Information'});Detail=$nameDetail;LastLogonDate=$AdministratorLastLogonDate;IsolatedHost=[bool]$script:ADAuditIsolatedClone}
+        [pscustomobject]@{Target=$AdministratorSID;Scope='Domain RID-500';SamAccountName=$AdministratorSAMAccountName;Control='LogonTimestamp';Status='Information';Severity='Information';Detail=$logonDetail;LastLogonDate=$AdministratorLastLogonDate;IsolatedHost=[bool]$script:ADAuditIsolatedClone}
+    ) | Export-Csv -LiteralPath (Get-EvidencePath 'administrator_account_context.csv') -NoTypeInformation -Encoding UTF8
+    Write-Both "    [*] Domain RID-500 account context recorded; DSRM is separate. $nameDetail"
 }
 
 Function Get-DomainAdminsGroupOverlap {

@@ -55,24 +55,26 @@ function Invoke-DnsZonePostureReport {
             Error   = ($Err.Exception.Message)
             Type    = ($Err.Exception.GetType().FullName)
         }
+        Register-ADAuditNotAssessed -Name 'DNS zone report' -Switch 'dnszone' -Target $Context -Reason $Err.Exception.Message
     }
 
     function Safe-Get {
         param(
             [Parameter(Mandatory)] [scriptblock]$Script,
             [object]$Default = $null,
-            [string]$Context = $null
+            [string]$Context = $null,
+            [switch]$OptionalProbe
         )
         try { & $Script }
         catch {
-            if ($Context) { Add-Err -Context $Context -Err $_ }
+            if ($Context -and -not $OptionalProbe) { Add-Err -Context $Context -Err $_ }
             $Default
         }
     }
 
     function Get-Prop {
         param(
-            [Parameter(Mandatory)] [object]$Obj,
+            [Parameter(Mandatory)] [AllowNull()] [object]$Obj,
             [Parameter(Mandatory)] [string]$Name,
             [object]$Default = $null
         )
@@ -133,7 +135,7 @@ function New-ReportsFolder {
     # Detect target DNS server (no args)
     # ----------------------------
     function Get-TargetDnsServer {
-        $localOk = Safe-Get -Context "Detect: Get-DnsServer local" -Default $false -Script {
+        $localOk = Safe-Get -Context "Detect: Get-DnsServer local" -Default $false -OptionalProbe -Script {
             Import-ADAuditModule -Name DnsServer -Required | Out-Null
             $null = Get-DnsServer -ComputerName $env:COMPUTERNAME -ErrorAction Stop
             $true
@@ -155,7 +157,7 @@ function New-ReportsFolder {
         }
 
         foreach ($ip in $dnsIps) {
-            $ok = Safe-Get -Context "Detect: Test-NetConnection $ip:53" -Default $false -Script {
+            $ok = Safe-Get -Context "Detect: Test-NetConnection ${ip}:53" -Default $false -OptionalProbe -Script {
                 (Test-NetConnection -ComputerName $ip -Port 53 -InformationLevel Quiet -WarningAction SilentlyContinue)
             }
             if ($ok) { return $ip }
@@ -243,10 +245,12 @@ function New-ReportsFolder {
         Recursion              = Get-Prop $serverSettings 'EnableRecursion' (Get-Prop $serverInfo 'EnableRecursion' $null)
 
         Forwarders             = Convert-ServerListToString (Get-Prop $serverForwarders 'IPAddress' (Get-Prop $serverForwarders 'IPAddresses' $null))
+        ForwardersStatus       = $(if ($null -ne $serverForwarders) { 'Observed' } else { 'NotAssessed' })
         ForwarderTimeoutSec    = Get-Prop $serverForwarders 'Timeout' $null
         ForwarderUseRootHints  = Get-Prop $serverForwarders 'UseRootHint' $null
 
         ScavengingEnabled      = Get-Prop $serverScavenging 'ScavengingState' $null
+        ScavengingStatus       = $(if ($null -ne (Get-Prop $serverScavenging 'ScavengingState' $null)) { 'Observed' } else { 'NotAssessed' })
         ScavRefreshInterval    = Safe-Get -Context "Server: Scav RefreshInterval stringify" -Default $null -Script { [string](Get-Prop $serverScavenging 'RefreshInterval' $null) }
         ScavNoRefreshInterval  = Safe-Get -Context "Server: Scav NoRefreshInterval stringify" -Default $null -Script { [string](Get-Prop $serverScavenging 'NoRefreshInterval' $null) }
 
@@ -268,13 +272,13 @@ function New-ReportsFolder {
             $reco   += "Confirm the server is not exposed to untrusted networks. Restrict access via firewall/interface binding/allow-lists."
             $riskScore += 2
         }
-        if (-not $Posture.Forwarders) {
+        if ($Posture.ForwardersStatus -eq 'Observed' -and -not $Posture.Forwarders) {
             $issues += "Forwarders: none detected."
             $reco   += "If external resolution is required, configure forwarders to approved resolvers; otherwise document intent."
             $riskScore += 1
         }
-        if ($Posture.ScavengingEnabled -ne $true) {
-            $issues += "Server scavenging: disabled or unknown."
+        if ($Posture.ScavengingEnabled -eq $false) {
+            $issues += "Server scavenging: disabled."
             $reco   += "If using dynamic zones, enable scavenging at server level and validate zone aging intervals."
             $riskScore += 1
         }
@@ -293,30 +297,46 @@ function New-ReportsFolder {
     # Zone helpers
     # ----------------------------
     function Get-ZoneAgingSummary {
-        param([string]$ZoneName)
+        param([string]$ZoneName, [string]$ZoneType)
 
+        # Aging/scavenging is maintained on writable primary zone data, not on
+        # conditional forwarders, stub records or a secondary's transferred copy.
+        if ($ZoneType -in @('Forwarder','Stub','Secondary')) {
+            return [pscustomobject]@{AgingEnabled=$null;RefreshInterval=$null;NoRefreshInterval=$null;AvailForScavengeTime=$null;ScavengeServers=$null;AgingStatus='NotApplicable';AgingNote="Aging is not configured on this $ZoneType zone; review the authoritative primary when applicable."}
+        }
+        if ($ZoneType -ne 'Primary') {
+            Register-ADAuditNotAssessed -Name 'DNS zone aging' -Switch 'dnszone' -Target $ZoneName -Reason 'Zone type is missing or unsupported; aging applicability cannot be established.'
+            return [pscustomobject]@{AgingEnabled=$null;RefreshInterval=$null;NoRefreshInterval=$null;AvailForScavengeTime=$null;ScavengeServers=$null;AgingStatus='NotAssessed';AgingNote='Zone type is unknown; aging was not queried.'}
+        }
+
+        $errorsBefore = $script:CollectionErrors.Count
         $aging = Safe-Get -Context "Zone '$ZoneName': Get-DnsServerZoneAging" -Default $null -Script {
             Get-DnsServerZoneAging -ComputerName $ComputerName -ZoneName $ZoneName -ErrorAction Stop
         }
 
         if (-not $aging) {
+            if ($script:CollectionErrors.Count -eq $errorsBefore) { Register-ADAuditNotAssessed -Name 'DNS zone aging' -Switch 'dnszone' -Target $ZoneName -Reason 'The aging query returned no data; enabled/disabled state is unknown.' }
             return [pscustomobject]@{
                 AgingEnabled         = $null
                 RefreshInterval      = $null
                 NoRefreshInterval    = $null
                 AvailForScavengeTime = $null
                 ScavengeServers      = $null
+                AgingStatus          = 'NotAssessed'
                 AgingNote            = "Aging/Scavenging info not available."
             }
         }
+
+        if ($null -eq (Get-Prop $aging 'AgingEnabled' $null)) { Register-ADAuditNotAssessed -Name 'DNS zone aging' -Switch 'dnszone' -Target $ZoneName -Reason 'The aging response has no AgingEnabled value; enabled/disabled state is unknown.' }
 
         [pscustomobject]@{
             AgingEnabled         = Get-Prop $aging 'AgingEnabled' $null
             RefreshInterval      = Format-TimeSpan (Get-Prop $aging 'RefreshInterval' $null)
             NoRefreshInterval    = Format-TimeSpan (Get-Prop $aging 'NoRefreshInterval' $null)
-            AvailForScavengeTime = Safe-Get -Context "Zone '$ZoneName': AvailForScavengeTime stringify" -Default $null -Script { (Get-Prop $aging 'AvailForScavengeTime' $null).ToString() }
+            AvailForScavengeTime = $(if ($null -ne (Get-Prop $aging 'AvailForScavengeTime' $null)) { [string](Get-Prop $aging 'AvailForScavengeTime' $null) } else { $null })
             ScavengeServers      = Convert-ServerListToString (Get-Prop $aging 'ScavengeServers' $null)
-            AgingNote            = $null
+            AgingStatus          = $(if ($null -ne (Get-Prop $aging 'AgingEnabled' $null)) { 'Observed' } else { 'NotAssessed' })
+            AgingNote            = $(if ($null -eq (Get-Prop $aging 'AgingEnabled' $null)) { 'Aging state unknown; no enabled/disabled verdict.' } else { $null })
         }
     }
 
@@ -335,7 +355,11 @@ function New-ReportsFolder {
     }
 
     function Get-ZoneRecordCounts {
-        param([string]$ZoneName)
+        param([string]$ZoneName, [string]$ZoneType)
+
+        if ($ZoneType -eq 'Forwarder') {
+            return [pscustomobject]@{TotalRecords=$null;A=$null;AAAA=$null;CNAME=$null;MX=$null;NS=$null;SRV=$null;TXT=$null;PTR=$null;RecordCountNote='Not applicable: a conditional forwarder does not host authoritative zone records.'}
+        }
 
         if (-not $script:IncludeRecordCounts) {
             return [pscustomobject]@{
@@ -346,7 +370,7 @@ function New-ReportsFolder {
         }
 
         if ($script:PreferZoneStatistics) {
-            $zs = Safe-Get -Context "Zone '$ZoneName': Get-DnsServerZoneStatistics" -Default $null -Script {
+            $zs = Safe-Get -Context "Zone '$ZoneName': Get-DnsServerZoneStatistics" -Default $null -OptionalProbe -Script {
                 Get-DnsServerZoneStatistics -ComputerName $ComputerName -ZoneName $ZoneName -ErrorAction Stop
             }
             if ($zs) {
@@ -413,35 +437,37 @@ function New-ReportsFolder {
         $riskScore = 0
         $factors = @()
 
-        if ($null -eq $ZoneRow.DynamicUpdate) {
+        if ($ZoneRow.ZoneType -in @('Forwarder','Stub')) {
+            return [pscustomobject]@{RiskScore=0;RiskLevel='Information';Issues=@();Recommendations=@();RiskFactors=@('WritablePrimaryControls=NotApplicable')}
+        }
+
+        if ($ZoneRow.ZoneType -ne 'Primary') { $factors += 'DU=NotApplicable' }
+        elseif ($null -eq $ZoneRow.DynamicUpdate) {
             $issues += "Dynamic updates: unknown (property not available)."
             $reco   += "Verify zone dynamic update setting in DNS Manager (Zone Properties -> General)."
-            $riskScore += 1
             $factors += "DU=Unknown"
         } else {
             switch ([string]$ZoneRow.DynamicUpdate) {
                 'Secure' { $factors += "DU=Secure" }
                 'None'   {
-                    $issues += "Dynamic updates: disabled."
-                    $reco   += "If this zone must accept registrations, enable Secure dynamic updates (AD-integrated recommended)."
-                    $riskScore += 1
                     $factors += "DU=None"
                 }
-                default  {
+                'NonsecureAndSecure' {
                     $issues += "Dynamic updates: non-secure updates allowed."
                     $reco   += "Set dynamic updates to Secure (especially on AD-integrated zones)."
                     $riskScore += 5
                     $factors += "DU=NonSecure"
                 }
+                default { $factors += 'DU=Unknown'; $issues += 'Dynamic updates: unknown (property not available).' }
             }
         }
 
-        if ($ZoneRow.IsDsIntegrated -ne $true) {
+        if ($ZoneRow.ZoneType -eq 'Primary' -and $ZoneRow.IsDsIntegrated -eq $false) {
             $issues += "Zone is not AD-integrated."
             $reco   += "If this is an internal zone, consider AD-integrated for secure updates and replication benefits."
             $riskScore += 2
             $factors += "ADI=No"
-        } else {
+        } elseif ($ZoneRow.IsDsIntegrated -eq $true) {
             $factors += "ADI=Yes"
         }
 
@@ -462,14 +488,14 @@ function New-ReportsFolder {
             $reco   += "Enable aging where appropriate and validate refresh/no-refresh intervals."
             $riskScore += 2
             $factors += "Aging=Off"
-        } elseif ($ZoneRow.AgingEnabled -eq $true -and $ServerPosture.ScavengingEnabled -ne $true) {
-            $issues += "Zone aging enabled but server scavenging appears disabled/unknown."
+        } elseif ($ZoneRow.AgingEnabled -eq $true -and $ServerPosture.ScavengingEnabled -eq $false) {
+            $issues += "Zone aging enabled but server scavenging is disabled."
             $reco   += "Enable scavenging at server level or validate intended posture."
             $riskScore += 1
             $factors += "Scav=Mismatch"
         }
 
-        $riskLevel = if ($riskScore -ge 7) { 'High' } elseif ($riskScore -ge 3) { 'Medium' } else { 'Low' }
+        $riskLevel = if ($riskScore -ge 7) { 'High' } elseif ($riskScore -ge 3) { 'Medium' } elseif ($riskScore -gt 0) { 'Low' } else { 'Information' }
 
         [pscustomobject]@{
             RiskScore       = $riskScore
@@ -513,7 +539,7 @@ before implementing any changes.
             }) | Out-Null
         }
 
-        if (-not $ServerPosture.Forwarders) {
+        if ($ServerPosture.ForwardersStatus -eq 'Observed' -and -not $ServerPosture.Forwarders) {
             $items.Add([pscustomobject]@{
                 Priority = "Low"
                 Area = "Server"
@@ -523,7 +549,7 @@ before implementing any changes.
             }) | Out-Null
         }
 
-        if ($ServerPosture.ScavengingEnabled -ne $true) {
+        if ($ServerPosture.ScavengingEnabled -eq $false) {
             $items.Add([pscustomobject]@{
                 Priority = "Low"
                 Area = "Server"
@@ -606,9 +632,12 @@ before implementing any changes.
                 Get-DnsServerZone -ComputerName $ComputerName -Name $zn -ErrorAction Stop
             }
 
-            $aging  = Get-ZoneAgingSummary -ZoneName $zn
+            $zoneType = [string](Get-Prop $zoneDetails 'ZoneType' $null)
+            $aging  = Get-ZoneAgingSummary -ZoneName $zn -ZoneType $zoneType
             $xfr    = Get-ZoneTransferEvidence -ZoneDetails $zoneDetails
-            $counts = Get-ZoneRecordCounts -ZoneName $zn
+            $counts = Get-ZoneRecordCounts -ZoneName $zn -ZoneType $zoneType
+            $dynamicStatus = if ($zoneType -in @('Forwarder','Stub','Secondary')) { 'NotApplicable' } elseif ($zoneType -eq 'Primary' -and [string](Get-Prop $zoneDetails 'DynamicUpdate' $null) -in @('Secure','None','NonsecureAndSecure')) { 'Observed' } else { 'NotAssessed' }
+            if ($dynamicStatus -eq 'NotAssessed') { Register-ADAuditNotAssessed -Name 'DNS dynamic updates' -Switch 'dnszone' -Target $zn -Reason 'Dynamic-update applicability or setting could not be established; no insecure state is inferred.' }
 
             $baseRow = [pscustomobject]@{
                 Server              = $ComputerName
@@ -619,6 +648,7 @@ before implementing any changes.
                 IsReverseLookupZone = Get-Prop $zoneDetails 'IsReverseLookupZone' $null
                 IsAutoCreated       = Get-Prop $zoneDetails 'IsAutoCreated' $null
                 DynamicUpdate       = Get-Prop $zoneDetails 'DynamicUpdate' $null
+                DynamicUpdateStatus = $dynamicStatus
 
                 ZoneTransferType    = $xfr.ZoneTransferType
                 SecureSecondaries   = $xfr.SecureSecondaries
@@ -628,6 +658,7 @@ before implementing any changes.
                 MasterServers       = $xfr.MasterServers
 
                 AgingEnabled        = $aging.AgingEnabled
+                AgingStatus         = $aging.AgingStatus
                 NoRefreshInterval   = $aging.NoRefreshInterval
                 RefreshInterval     = $aging.RefreshInterval
                 AvailForScavengeTime= $aging.AvailForScavengeTime
@@ -656,6 +687,7 @@ before implementing any changes.
                 ReplicationScope    = $baseRow.ReplicationScope
                 IsReverseLookupZone = $baseRow.IsReverseLookupZone
                 DynamicUpdate       = $baseRow.DynamicUpdate
+                DynamicUpdateStatus = $baseRow.DynamicUpdateStatus
 
                 ZoneTransferType    = $baseRow.ZoneTransferType
                 SecureSecondaries   = $baseRow.SecureSecondaries
@@ -665,6 +697,7 @@ before implementing any changes.
                 MasterServers       = $baseRow.MasterServers
 
                 AgingEnabled        = $baseRow.AgingEnabled
+                AgingStatus         = $baseRow.AgingStatus
                 NoRefreshInterval   = $baseRow.NoRefreshInterval
                 RefreshInterval     = $baseRow.RefreshInterval
                 AvailForScavengeTime= $baseRow.AvailForScavengeTime
@@ -698,6 +731,7 @@ before implementing any changes.
                 Error    = $_.Exception.Message
                 Type     = $_.Exception.GetType().FullName
             }
+            Register-ADAuditNotAssessed -Name 'DNS zone report' -Switch 'dnszone' -Target $zn -Reason "Zone collection failed: $($_.Exception.Message)"
             if (-not $script:FailSoft) { throw }
         }
     }
@@ -779,9 +813,9 @@ $(Get-ADAuditReportFooter)
     # ----------------------------
     $rows |
         Sort-Object -Property @{Expression="RiskScore";Descending=$true}, @{Expression="ZoneName";Descending=$false} |
-        Select-Object Server,ZoneName,ZoneType,IsDsIntegrated,ReplicationScope,IsReverseLookupZone,DynamicUpdate,
+        Select-Object Server,ZoneName,ZoneType,IsDsIntegrated,ReplicationScope,IsReverseLookupZone,DynamicUpdate,DynamicUpdateStatus,
                       ZoneTransferType,SecureSecondaries,Notify,NotifyServers,SecondaryServers,MasterServers,
-                      AgingEnabled,NoRefreshInterval,RefreshInterval,AvailForScavengeTime,ScavengeServers,
+                      AgingEnabled,AgingStatus,NoRefreshInterval,RefreshInterval,AvailForScavengeTime,ScavengeServers,
                       TotalRecords,A,AAAA,CNAME,MX,NS,SRV,TXT,PTR,
                       RiskLevel,RiskScore,RiskFactors,Issues,Recommendations,Notes |
         Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csvPath
@@ -794,7 +828,9 @@ $(Get-ADAuditReportFooter)
             HighRiskZones   = $high
             MediumRiskZones = $medium
             LowRiskZones    = $low
+            InformationZones = @($rows | Where-Object RiskLevel -eq 'Information').Count
             ZoneFailures    = ($script:ZoneFailures | Measure-Object).Count
+            CollectionErrors = $script:CollectionErrors.Count
         }
         TopFindings   = @($topFindings | Select-Object Name, Count)
         Zones         = @(
@@ -807,6 +843,7 @@ $(Get-ADAuditReportFooter)
                     ReplicationScope    = $_.ReplicationScope
                     IsReverseLookupZone = $_.IsReverseLookupZone
                     DynamicUpdate       = $_.DynamicUpdate
+                    DynamicUpdateStatus = $_.DynamicUpdateStatus
                     ZoneTransferType    = $_.ZoneTransferType
                     SecureSecondaries   = $_.SecureSecondaries
                     Notify              = $_.Notify
@@ -814,6 +851,7 @@ $(Get-ADAuditReportFooter)
                     SecondaryServers    = $_.SecondaryServers
                     MasterServers       = $_.MasterServers
                     AgingEnabled        = $_.AgingEnabled
+                    AgingStatus         = $_.AgingStatus
                     NoRefreshInterval   = $_.NoRefreshInterval
                     RefreshInterval     = $_.RefreshInterval
                     AvailForScavengeTime= $_.AvailForScavengeTime
@@ -867,15 +905,17 @@ $(Get-ADAuditReportFooter)
 <tr><td>DnsServerModuleVersion</td><td>$($serverPosture.DnsServerModuleVersion)</td></tr>
 <tr><td>Recursion</td><td>$($serverPosture.Recursion)</td></tr>
 <tr><td>Forwarders</td><td>$($serverPosture.Forwarders)</td></tr>
+<tr><td>ForwardersStatus</td><td>$($serverPosture.ForwardersStatus)</td></tr>
 <tr><td>ScavengingEnabled</td><td>$($serverPosture.ScavengingEnabled)</td></tr>
+<tr><td>ScavengingStatus</td><td>$($serverPosture.ScavengingStatus)</td></tr>
 </tbody></table>
 "@
 
     $zonesTable = $rows |
         Sort-Object -Property @{Expression="RiskScore";Descending=$true}, @{Expression="ZoneName";Descending=$false} |
-        Select-Object ZoneName, ZoneType, IsDsIntegrated, ReplicationScope, DynamicUpdate,
+        Select-Object ZoneName, ZoneType, IsDsIntegrated, ReplicationScope, DynamicUpdate, DynamicUpdateStatus,
                       ZoneTransferType, SecureSecondaries, Notify, NotifyServers, SecondaryServers,
-                      AgingEnabled, NoRefreshInterval, RefreshInterval,
+                      AgingEnabled, AgingStatus, NoRefreshInterval, RefreshInterval,
                       TotalRecords, RiskLevel, RiskScore, RiskFactors, Issues, Recommendations, Notes
 
     $zonesHtml = ($zonesTable | ConvertTo-Html -Fragment) `
@@ -922,7 +962,7 @@ $(Get-ADAuditReportFooter)
             Why      = 'Stale dynamic records accumulate over time, which causes name-resolution drift, leaks decommissioned host names to attackers, and inflates zone size.'
             Fix      = 'Enable aging on the zone and ensure server-level scavenging is on (No-Refresh + Refresh intervals typically 7 days each). Validate operational impact in a maintenance window first.'
         }
-        'Zone aging enabled but server scavenging appears disabled/unknown.' = @{
+        'Zone aging enabled but server scavenging is disabled.' = @{
             Severity = 'Low'
             Why      = 'Per-zone aging is on, but no server is actually deleting expired records, so the aging timestamps build up without effect.'
             Fix      = 'Enable scavenging at the DNS server level (DNS Manager: Server Properties > Advanced > Enable automatic scavenging of stale records).'
@@ -933,9 +973,9 @@ $(Get-ADAuditReportFooter)
             Fix      = 'No action if intentional. If the zone is expected to accept registrations, switch to Secure dynamic updates (AD-integrated zones only).'
         }
         'Dynamic updates: unknown (property not available).' = @{
-            Severity = 'Low'
-            Why      = 'The DNS module did not expose the dynamic-update property for this zone (typical for Forwarder/Stub zones, which do not register records). Worth confirming in DNS Manager for completeness.'
-            Fix      = 'Open DNS Manager > Zone Properties > General and confirm the Dynamic updates setting matches policy. Forwarder zones can be ignored.'
+            Severity = 'Information'
+            Why      = 'The applicable dynamic-update setting was not available. Missing evidence does not establish an insecure configuration.'
+            Fix      = 'Confirm the setting and collection access before making a security decision.'
         }
     }
 
@@ -1019,6 +1059,7 @@ Zones: Total=$totalZones, High=$high, Medium=$medium, Low=$low &mdash;
 </div>
 
 <h2>How to read this report</h2>
+<p>Collection errors: $($script:CollectionErrors.Count); failed zones: $($script:ZoneFailures.Count). True collection failures are included in the main audit coverage. NotAssessed means unknown; NotApplicable means the control does not apply to that zone type. Neither state is treated as a disabled or insecure setting.</p>
 <p>This report has three sections:</p>
 <ol>
   <li><strong>Server Posture</strong> - configuration of the DNS server itself (recursion, forwarders, scavenging).</li>

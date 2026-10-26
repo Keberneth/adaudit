@@ -18,6 +18,8 @@
         The check functions were moved verbatim from AdAudit-PS7.ps1 v9.0 when the toolkit was
         split into Library / Checks files. Required modules: ActiveDirectory, GroupPolicy.
 #>
+. (Join-Path $PSScriptRoot 'Invoke-DcShareSecurityCheck.ps1')
+
 Function Get-MachineAccountQuota {
     #Get number of machines a user can add to a domain
     $MachineAccountQuota = (Get-ADDomain | select -ExpandProperty DistinguishedName | Get-ADObject -Property 'ms-DS-MachineAccountQuota' | select -ExpandProperty ms-DS-MachineAccountQuota)
@@ -35,10 +37,14 @@ Function Get-MachineAccountQuota {
 function Get-ADAuditSmbServerConfiguration {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ComputerName)
+    if (-not (Get-Variable -Name ADAuditSmbServerConfigCache -Scope Script -ErrorAction SilentlyContinue)) { $script:ADAuditSmbServerConfigCache=@{} }
+    $key=Get-ADAuditTargetKey $ComputerName
+    if ($script:ADAuditSmbServerConfigCache.ContainsKey($key)) { return $script:ADAuditSmbServerConfigCache[$key] }
     # The SMB provider exposes the same effective configuration as the cmdlet,
     # using local CIM or a DCOM session before considering a WSMan fallback.
     $response = Invoke-ADAuditCimMethod -ComputerName $ComputerName -Namespace 'root/Microsoft/Windows/SMB' -ClassName MSFT_SmbServerConfiguration -MethodName GetConfiguration -UseWsmanFallback -ErrorAction Stop
     if ($response.ReturnValue -ne 0 -or $null -eq $response.Output) { throw 'The SMB provider did not return its effective configuration.' }
+    $script:ADAuditSmbServerConfigCache[$key]=$response.Output
     $response.Output
 }
 
@@ -54,11 +60,12 @@ Function Get-SMB1Support {
 
     foreach ($dc in $dcList) {
         $enabled = $null
+        $source = 'Effective SMB CIM provider (SMB1 check)'
         # Effective configuration through local CIM or DCOM; no remote script.
         try {
             $config = Get-ADAuditSmbServerConfiguration -ComputerName $dc
-            if ($null -eq $config.EnableSMB1Protocol) { throw 'SMB1 state was not returned.' }
-            $enabled = [bool]$config.EnableSMB1Protocol
+            $enabled = Get-ADAuditDcBoolean $config 'EnableSMB1Protocol'
+            if ($null -eq $enabled) { throw 'SMB1 state was not returned as a recognized Boolean.' }
         }
         catch {
             # Fallback: SMB1 REG_DWORD (0 = disabled). Absent is ambiguous on modern OS.
@@ -72,8 +79,10 @@ Function Get-SMB1Support {
                 continue
             }
             $enabled = ($reg.Value -ne 0)
+            $source = "Explicit LanmanServer SMB1 REG_DWORD=$($reg.Value) (SMB1 check)"
         }
 
+        Set-ADAuditDcSmbObservation -Target $dc -Control SMB1 -Value $enabled -Source $source
         if ($enabled) {
             Write-Both "    [!] SMBv1 is enabled on $dc! (KB290)"
             Write-Nessus-Finding "SMBv1Support" "KB290" "SMBv1 is enabled on $dc"
@@ -664,12 +673,19 @@ Function Get-RODC {
 
 Function Check-Shares {
     #Check SYSVOL and NETLOGON share exists
-    $dcList = @(Get-ADDomainController -Filter * | ForEach-Object { $_.Name })
+    $dcList = @(Get-ADDomainController -Filter * | ForEach-Object { $_.HostName })
     Write-Both "    [+] Checking SYSVOL and NETLOGON shares on all DCs"
     $assessed = 0
-    $results = Invoke-ADAuditParallelTargets -Targets $dcList -Operation 'share enumeration' -Activity 'SYSVOL and NETLOGON shares' -UnitName 'DC' -ScriptBlock {
+    $pending=@($dcList | Where-Object { -not $script:ADAuditDcShareInventory -or -not $script:ADAuditDcShareInventory.ContainsKey((Get-ADAuditTargetKey $_)) })
+    $results = @(Invoke-ADAuditParallelTargets -Targets $pending -Operation 'share enumeration' -Activity 'SYSVOL and NETLOGON shares' -UnitName 'DC' -ScriptBlock {
         param($Target, $Context)
         ,@(Get-ADAuditCimInstance -ClassName Win32_Share -ComputerName $Target -Property Name -UseWsmanFallback -ErrorAction Stop)
+    })
+    foreach ($dc in $dcList) {
+        if ($script:ADAuditDcShareInventory -and $script:ADAuditDcShareInventory.ContainsKey((Get-ADAuditTargetKey $dc))) {
+            $cached=$script:ADAuditDcShareInventory[(Get-ADAuditTargetKey $dc)]
+            $results += [pscustomobject]@{Target=$dc;Outcome=$(if ($cached.Complete) {'Success'} else {'Unavailable'});Result=$cached.Shares;Error=$cached.Reason}
+        }
     }
     foreach ($result in $results) {
         $DC = $result.Target
@@ -804,23 +820,23 @@ Function Get-SMBSigningStatus {
     $assessed = 0
 
     foreach ($dc in $dcList) {
-        # Primary: read the DC's registry via StdRegProv, DCOM first then WSMan/WinRM.
-        $reg = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -ValueName 'RequireSecuritySignature'
         $requireSigning = $null
-
-        if ($reg.Success -and $null -ne $reg.Value) {
-            $requireSigning = $reg.Value   # $null here means the value is not set on the DC
+        $source = 'Effective SMB CIM provider (server signing check)'
+        # Reuse the effective provider evidence already collected for the matrix.
+        try {
+            $value=Get-ADAuditDcBoolean (Get-ADAuditSmbServerConfiguration -ComputerName $dc) 'RequireSecuritySignature'
+            if ($null -eq $value) { throw 'SMB signing property was not returned.' }
+            $requireSigning=if ($value) {1} else {0}
             $assessed++
         }
-        else {
-            # Effective SMB provider fallback via local CIM or DCOM first.
-            try {
-                $smbConfig = (Get-ADAuditSmbServerConfiguration -ComputerName $dc).RequireSecuritySignature
-                if ($null -eq $smbConfig) { throw 'SMB server configuration returned no value.' }
-                $requireSigning = if ($smbConfig) { 1 } else { 0 }
+        catch {
+            $reg = Get-ADAuditRemoteRegistryDword -ComputerName $dc -SubKey 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -ValueName 'RequireSecuritySignature'
+            if ($reg.Success -and $null -ne $reg.Value) {
+                $requireSigning=$reg.Value
+                $source="Explicit LanmanServer RequireSecuritySignature REG_DWORD=$($reg.Value) (server signing check)"
                 $assessed++
             }
-            catch {
+            else {
                 Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Target $dc -Reason "SMB signing registry and effective configuration were unavailable through local/CIM collection: $($reg.Error)"
                 continue
             }
@@ -832,10 +848,12 @@ Function Get-SMBSigningStatus {
             Register-ADAuditNotAssessed -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Target $dc -Reason "RequireSecuritySignature is not set in the registry on $dc; the effective value depends on OS default/policy and could not be confirmed."
         }
         elseif ($requireSigning -ne 1) {
+            Set-ADAuditDcSmbObservation -Target $dc -Control ServerSigning -Value $false -Source $source
             Add-Content -Path $evidencePath -Value "SMB signing is NOT required on DC: $dc (RequireSecuritySignature = $requireSigning)"
             $count++
         }
         else {
+            Set-ADAuditDcSmbObservation -Target $dc -Control ServerSigning -Value $true -Source $source
             Write-Both "    [+] SMB signing is required on DC: $dc"
         }
     }
@@ -853,6 +871,10 @@ Function Get-SMBSigningStatus {
 }
 
 function Invoke-DomainAuditCheck {
+    # Evidence caches are scoped to this invocation, never reused across audits.
+    $script:ADAuditSmbServerConfigCache=@{}
+    $script:ADAuditDcShareInventory=@{}
+    $script:ADAuditDcSmbObservations=@{}
     Invoke-AuditStep -Name 'Get-LastWUDate' -Switch 'domainaudit' -Body { Get-LastWUDate }
     Invoke-AuditStep -Name 'Get-DCEval' -Switch 'domainaudit' -Body { Get-DCEval }
     Invoke-AuditStep -Name 'Get-TimeSource' -Switch 'domainaudit' -Body { Get-TimeSource }
@@ -860,6 +882,7 @@ function Invoke-DomainAuditCheck {
     Invoke-AuditStep -Name 'Get-MachineAccountQuota' -Switch 'domainaudit' -Body { Get-MachineAccountQuota }
     Invoke-AuditStep -Name 'Get-DefaultDomainControllersPolicy' -Switch 'domainaudit' -Body { Get-DefaultDomainControllersPolicy }
     Invoke-AuditStep -Name 'Get-SMB1Support' -Switch 'domainaudit' -Body { Get-SMB1Support }
+    Invoke-AuditStep -Name 'Get-DcShareSecurity' -Switch 'domainaudit' -Body { Get-DcShareSecurity }
     Invoke-AuditStep -Name 'Get-FunctionalLevel' -Switch 'domainaudit' -Body { Get-FunctionalLevel }
     Invoke-AuditStep -Name 'Get-DCsNotOwnedByDA' -Switch 'domainaudit' -Body { Get-DCsNotOwnedByDA }
     Invoke-AuditStep -Name 'Get-ReplicationType' -Switch 'domainaudit' -Body { Get-ReplicationType }
@@ -871,6 +894,7 @@ function Invoke-DomainAuditCheck {
     Invoke-AuditStep -Name 'Get-TombstoneLifetime' -Switch 'domainaudit' -Body { Get-TombstoneLifetime }
     Invoke-AuditStep -Name 'Get-PrintSpoolerOnDCs' -Switch 'domainaudit' -Body { Get-PrintSpoolerOnDCs }
     Invoke-AuditStep -Name 'Get-SMBSigningStatus' -Switch 'domainaudit' -Body { Get-SMBSigningStatus }
+    Invoke-AuditStep -Name 'Finalize DC SMB evidence' -Switch 'domainaudit' -Body { Merge-ADAuditDcSmbObservations }
 }
 
 # ---- Standalone launch --------------------------------------------------------------------

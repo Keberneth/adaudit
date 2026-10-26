@@ -36,6 +36,12 @@ function Invoke-ManagementReport {
     if ($outputHtmlDir -and -not (Test-Path -LiteralPath $outputHtmlDir)) { New-Item -ItemType Directory -Path $outputHtmlDir -Force | Out-Null }
     $auditHtmlDir = Split-Path -Path $AuditHtml -Parent
     if ($auditHtmlDir -and -not (Test-Path -LiteralPath $auditHtmlDir)) { New-Item -ItemType Directory -Path $auditHtmlDir -Force | Out-Null }
+    # Both main reports are planned outputs of this call; the remaining reports
+    # must already exist. Final assembly refreshes other collectors' navigation.
+    $availablePrimaryReports = @('ADAudit-Results.html','Risk-Report.html') + @(
+        Get-ChildItem -LiteralPath (Get-HtmlReportsDir -BaseRoot $InputRoot) -File -Filter '*.html' -ErrorAction SilentlyContinue | ForEach-Object Name
+    )
+    $presentationAssets = Get-ADAuditReportPresentationAssets
     if (-not $PSBoundParameters.ContainsKey('OutputTxt') -or [string]::IsNullOrWhiteSpace($OutputTxt)) { $OutputTxt = $null }
 
     $ErrorActionPreference = 'Stop'
@@ -485,6 +491,9 @@ function Invoke-ManagementReport {
 
     function Get-FindingCategory([string]$Title) {
         switch -Regex ($Title) {
+            '^DC share permissions' { return 'Access control' }
+            '^DC SMB protection|^DC anonymous-access policy|^LDAP protection' { return 'Identity hardening' }
+            '^Built-in domain Administrator:' { return 'Privileged access' }
             '^AD CS' { return 'Certificate services' }
             '^Directory ACL' { return 'Access control' }
             '^Directory replication permissions' { return 'Privileged access' }
@@ -507,6 +516,11 @@ function Invoke-ManagementReport {
 
     function Get-FindingWhyItMatters([string]$Title) {
         switch -Regex ($Title) {
+            '^LDAP protection' { return 'LDAP signing protects integrity; TLS or SASL sealing protects confidentiality. Port 389 can be protected, and an open LDAPS port alone does not prove signing or channel-binding enforcement. This finding describes the specific recorded configuration or tested read, not every LDAP client connection.' }
+            '^DC SMB protection' { return 'Domain controllers distribute Group Policy and logon content over SMB. Signing protects integrity, encryption adds confidentiality, and unauthenticated guest connections weaken identity assurance. Configuration, observed sessions and unavailable evidence are reported separately.' }
+            '^DC share permissions' { return 'Unexpected write or permission-control rights on SYSVOL or NETLOGON can affect Group Policy and logon content. Broad authenticated read is normal. Static share and filesystem ACEs require validation of deny entries, inheritance, group membership and both authorization layers before concluding effective access.' }
+            '^DC anonymous-access policy' { return 'Only controls applicable to domain controllers are assessed. Registry configuration and exception names do not by themselves demonstrate a successful anonymous connection or disclosure.' }
+            '^Built-in domain Administrator:' { return 'This is the domain SID-500 account, not the separate per-DC DSRM recovery account. Renaming provides limited defense in depth because its SID remains identifiable. A recent logon may be legitimate recovery activity and does not establish misuse.' }
             '\(disabled\)$' { return 'The affected accounts are disabled. This is a hygiene and reactivation review, not evidence of an enabled account exposure. Account disablement does not erase stored credential material.' }
             'unknown|unconfirmed password material|Password material requires verification' { return 'The evidence does not establish the account state or a usable empty password. Missing password material can reflect the authentication design. Resolve the uncertainty before deciding on a credential change.' }
             'confirmed empty passwords' { return 'The collector identified the known empty-password NT hash on an enabled account. This is stronger evidence than PASSWD_NOTREQD or an absent hash, and requires prompt validation and remediation.' }
@@ -658,6 +672,11 @@ function Invoke-ManagementReport {
 
     function Get-FindingRecommendation([string]$Title) {
         switch -Regex ($Title) {
+            '^LDAP protection' { return 'Review the named DC and control. Pilot required signing and channel binding with supported clients; validate certificate trust, name and validity for LDAPS/StartTLS. Verify enforcement separately with an approved test. Do not disable port 389 solely because it is available.' }
+            '^DC SMB protection' { return 'Disable SMB1, require supported SMB signing on both server and client, and disable insecure guest access. Review encryption requirements per share and test supported clients before enforcement. An encryption review row is not proof that observed sessions were unencrypted; do not apply newer-OS dialect settings to unsupported servers.' }
+            '^DC share permissions' { return 'Review the share and NTFS ACE evidence with the AD owner. Verify effective permissions, inherited and deny entries and trustee membership. Remove unauthorized write/control permissions through a tested change while retaining required SYSVOL/NETLOGON read access. Confirm the owner and purpose of additional shares before changing them.' }
+            '^DC anonymous-access policy' { return 'Review applicable anonymous-access settings and explicitly named exceptions with the AD owner. Preserve required domain behavior; do not treat member-server-only policies or the presence of a named pipe as proof of anonymous access.' }
+            '^Built-in domain Administrator:' { return 'Reserve domain SID-500 for approved recovery or administration, protect its credentials and investigate logons in context. Rename under an approved naming policy if appropriate; a decoy account is optional. Manage the separate DSRM credential through its own recovery procedure.' }
             '\(disabled\)$' { return 'Keep the account disabled. Confirm whether it is retained for a mailbox, application or recovery requirement; review memberships and retention. Before any approved reactivation, set appropriate credentials and remove unnecessary password-policy exceptions. Do not re-enable accounts merely to clear this finding.' }
             'unknown|unconfirmed password material|Password material requires verification' { return 'Check the account enablement state and intended authentication method, then recollect structured evidence with appropriate permissions. An absent NT hash alone is not a reason to reset a password or change a smart-card account.' }
             'confirmed empty passwords' { return 'Validate the account and its dependencies, then set a strong password or disable the account through the approved change process. Independently review PASSWD_NOTREQD; clearing that flag does not itself replace an existing empty password.' }
@@ -1646,7 +1665,7 @@ function Invoke-ManagementReport {
             $downloadPath = Join-Path $DownloadRoot ((New-Slug $Finding.Title) + '.csv')
             Ensure-DirectoryPath (Split-Path -Path $downloadPath -Parent)
             $Finding.EvidenceRows | Export-Csv -LiteralPath $downloadPath -NoTypeInformation -Encoding UTF8
-            $importantColumns = @('Category','SamAccountName','AccountStatus','PasswordEvidence','EvidenceDetail','Name','Assessment','Reason','Template','Rule','Status','Severity','Detail','ObjectType','ObjectName','IdentityReference','Capability','ActiveDirectoryRights','DistinguishedName','Trustee','TrusteeSid','ScopeDN','Target','Setting','Endpoint','Account','Enabled')
+            $importantColumns = @('Target','Control','ShareName','Status','Severity','Observed','Detail','EvidenceType','Outcome','Category','SamAccountName','AccountStatus','PasswordEvidence','EvidenceDetail','Name','Assessment','Reason','Template','Rule','ObjectType','ObjectName','IdentityReference','Capability','ActiveDirectoryRights','DistinguishedName','Trustee','TrusteeSid','ScopeDN','Setting','Endpoint','Account','Enabled')
             $availableColumns = @($Finding.EvidenceRows[0].PSObject.Properties.Name)
             $previewColumns = @($importantColumns | Where-Object { $_ -in $availableColumns } | Select-Object -First 10)
             return [pscustomobject]@{
@@ -2366,7 +2385,7 @@ body[data-theme="dark"] .result-table th{background:#0b1220}
 </script>
 "@
 
-        $primaryNav = Get-ADAuditPrimaryNav -Active 'audit'
+        $primaryNav = Get-ADAuditPrimaryNav -Active 'audit' -AvailableReports $availablePrimaryReports
 
         $html = @"
 <!doctype html>
@@ -2376,6 +2395,7 @@ body[data-theme="dark"] .result-table th{background:#0b1220}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ADAudit - Audit Results</title>
 $css
+$presentationAssets
 </head>
 <body data-theme="light">
 <div class="container">
@@ -3115,8 +3135,30 @@ $js
         }
     }
 
+    # Structured DC controls retain successful, review, excluded and unavailable rows.
+    # Only explicit findings contribute risk points; inventories and permission candidates
+    # remain visible in the evidence section without being promoted to vulnerabilities.
+    $dcControlEvidence = [System.Collections.Generic.List[object]]::new()
+    foreach ($spec in @(
+        @{ File='ldap_security.csv'; Label='LDAP protection'; Prefix='LDAP protection'; Columns=@('Target','Control','Status','Severity','EvidenceType','Detail') },
+        @{ File='dc_smb_security.csv'; Label='DC SMB protection'; Prefix='DC SMB protection'; Columns=@('Target','Control','Status','Severity','Observed','Detail','Source') },
+        @{ File='dc_share_security.csv'; Label='SYSVOL, NETLOGON and additional shares'; Prefix='DC share permissions'; Columns=@('Target','ShareName','Path','Control','Status','Severity','Observed','Detail') },
+        @{ File='dc_anonymous_policy.csv'; Label='DC anonymous-access policy'; Prefix='DC anonymous-access policy'; Columns=@('Target','Control','Value','Status','Severity','Detail') },
+        @{ File='administrator_account_context.csv'; Label='Domain Administrator account context'; Prefix='Built-in domain Administrator'; Columns=@('Target','Control','Status','Severity','Detail') }
+    )) {
+        $controlPath = Resolve-AuditArtifactPath (Join-Path $InputRoot $spec.File)
+        if (-not $controlPath -or -not (Test-Path -LiteralPath $controlPath)) { continue }
+        $controlRows = @(Get-CsvSafe $controlPath @('Target','Control','Status','Severity','Detail'))
+        $dcControlEvidence.Add([pscustomobject]@{ Path=$controlPath; Label=$spec.Label; Rows=$controlRows; Columns=$spec.Columns })
+        foreach ($group in @($controlRows | Where-Object Status -eq 'Finding' | Group-Object Control)) {
+            $severity = Normalize-Severity (($group.Group | Sort-Object { Get-SeverityRank $_.Severity } -Descending | Select-Object -First 1).Severity)
+            $controlLabel = [regex]::Replace($group.Name,'(?<=[a-z])(?=[A-Z])',' ')
+            Add-FindingOnce -Severity $severity -Title "$($spec.Prefix): $controlLabel" -Evidence "Observations: $($group.Count). $($group.Group[0].Detail) Review the full per-target evidence and collection limitations below." -Path $controlPath -Rows $group.Group -ScoreOverride (Score-Scaled $severity $group.Count) -RuleId "$($spec.File.Replace('.csv',''))-$($group.Name)"
+        }
+    }
     $ldapSecPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'LDAPSecurity.txt')
-    if ((Get-NonHeaderLines $ldapSecPath).Count -gt 0) {
+    $ldapStructuredPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'ldap_security.csv')
+    if (-not (Test-Path -LiteralPath $ldapStructuredPath) -and (Get-NonHeaderLines $ldapSecPath).Count -gt 0) {
         Add-FindingOnce 'High' 'LDAP security misconfiguration detected' 'See LDAPSecurity.txt for details' $ldapSecPath $SeverityScore.High
     }
 
@@ -3163,7 +3205,8 @@ $js
     # SMB signing on DCs
     $smbSignPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dc_smb_signing.txt')
     $smbSignLines = Get-NonHeaderLines $smbSignPath
-    if ($smbSignLines.Count -gt 0) {
+    $smbStructuredPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'dc_smb_security.csv')
+    if (-not (Test-Path -LiteralPath $smbStructuredPath) -and $smbSignLines.Count -gt 0) {
         Add-FindingOnce 'High' 'SMB signing not enforced on domain controllers' "DCs affected: $($smbSignLines.Count)" $smbSignPath (Score-Scaled 'High' $smbSignLines.Count)
     }
 
@@ -3462,6 +3505,55 @@ $js
         Add-FindingOnce 'Information' 'DNS recommendations report available' 'Supplementary DNS recommendations HTML report generated.' $dnsRecoHtmlPath.FullName $SeverityScore.Information
     }
 
+    foreach ($inventory in @(
+        @{ File='dc_share_aces.csv'; Label='Share and NTFS permission evidence'; Columns=@('Target','ShareName','Layer','TrusteeSid','Identity','AccessControlType','Rights','AccessMask','IsInherited','AceFlags') },
+        @{ File='dc_smb_sessions.csv'; Label='Observed SMB sessions'; Columns=@('Target','Direction','Dialect','Encrypted','Signed','ObservationCount','Status','Detail') }
+    )) {
+        $inventoryPath = Resolve-AuditArtifactPath (Join-Path $InputRoot $inventory.File)
+        if ($inventoryPath -and (Test-Path -LiteralPath $inventoryPath)) {
+            $inventoryRows = @(Get-CsvSafe $inventoryPath @('Target'))
+            $dcControlEvidence.Add([pscustomobject]@{Path=$inventoryPath; Label=$inventory.Label; Rows=$inventoryRows; Columns=$inventory.Columns})
+        }
+    }
+    $dcEvidenceHtml = ''
+    if ($dcControlEvidence.Count -gt 0) {
+        $sections = foreach ($dataset in $dcControlEvidence) {
+            $href = HtmlEncode (Get-RelativeHref -FromFile $AuditHtml -ToPath $dataset.Path)
+            $table = New-PreviewTableHtml -Rows $dataset.Rows -Columns $dataset.Columns -MaxRows 100
+            $counts = (@($dataset.Rows | Where-Object { $_.PSObject.Properties['Status'] } | Group-Object Status | Sort-Object Name | ForEach-Object { "$($_.Name): $($_.Count)" })) -join '; '
+            "<details><summary>$(HtmlEncode $dataset.Label) — $($dataset.Rows.Count) observations</summary><p>$(HtmlEncode $counts)</p><p><a href='$href' download>Download complete evidence CSV</a></p>$table</details>"
+        }
+        $dcEvidenceHtml = @"
+<section class="section hero" id="dc-security-evidence">
+  <h2>Domain controller security evidence</h2>
+  <p>These observations cover AD-related protection only. Pass describes the named setting or tested operation, not the entire DC. Review and PotentialExposure require expert validation and do not add points here. NotAssessed and Excluded are not passes. Missing session observations do not prove protocol protection.</p>
+  <p>LDAP 389 can use StartTLS or SASL protection; LDAPS availability alone does not establish enforcement. SMB signing protects integrity and encryption protects confidentiality. Broad authenticated read on SYSVOL/NETLOGON is expected; write/control rights and additional shares require purpose and permission review. Filesystem evidence covers the share root; child-file overrides and full token-based effective access are outside this collection.</p>
+  $($sections -join "`n")
+</section>
+"@
+    }
+
+    $timingHtml = ''
+    $timingsPath = Resolve-AuditArtifactPath (Join-Path $InputRoot 'audit_step_timings.csv')
+    if ($timingsPath -and (Test-Path -LiteralPath $timingsPath)) {
+        $timings = @(Get-CsvSafe $timingsPath @('Switch','Step','DurationSeconds','Status'))
+        $slowest = @($timings | Sort-Object {
+            $duration = 0.0
+            $durationText = [string]$_.DurationSeconds
+            # New evidence uses invariant decimals. Older CSVs may contain a local
+            # decimal comma, never a thousands separator. Avoid casting 9,501 to 9501.
+            if ($durationText -match '^\d+,\d+$') { $durationText = $durationText.Replace(',','.') }
+            if (-not [double]::TryParse($durationText,[Globalization.NumberStyles]::Float,[cultureinfo]::InvariantCulture,[ref]$duration) -or $duration -lt 0 -or [double]::IsNaN($duration) -or [double]::IsInfinity($duration)) {
+                Add-ReportIssue $timingsPath "Invalid duration for operation '$($_.Step)'."
+                $duration = 0
+            }
+            $duration
+        } -Descending | Select-Object -First 10)
+        $timingTable = New-PreviewTableHtml -Rows $slowest -Columns @('Switch','Step','DurationSeconds','Status','FailureCount','NotAssessedCount')
+        $timingHref = HtmlEncode (Get-RelativeHref -FromFile $AuditHtml -ToPath $timingsPath)
+        $timingHtml = "<details><summary>Slowest operations in this run</summary><p>Measured elapsed seconds include collection and waiting. Nested operations can overlap; do not sum these rows as total audit duration. <a href='$timingHref' download>Download all operation timings</a></p>$timingTable</details>"
+    }
+
     # ---------------------------
     # Prepare report download artifacts and in-report result previews
     # ---------------------------
@@ -3514,7 +3606,7 @@ $js
         $transportFailures = @($collectionSettings.TransportFailures)
         if ($transportFailures.Count -gt 0) { $collectionNote += ' Transport failures recorded: ' + (($transportFailures | ForEach-Object { "$($_.Target)/$($_.Protocol) $($_.Outcome)" }) -join ', ') + '.' }
     }
-    $statusTableHtml = if ($selectedStatuses.Count -gt 0) { New-PreviewTableHtml -Rows $selectedStatuses -Columns @('CheckName','Status','Reason','NotAssessedCount','FailureCount') -MaxRows 250 } else { '<p>No execution manifest was available. Missing evidence cannot be treated as a pass.</p>' }
+    $statusTableHtml = if ($selectedStatuses.Count -gt 0) { New-PreviewTableHtml -Rows $selectedStatuses -Columns @('CheckName','Status','DurationSeconds','Reason','NotAssessedCount','FailureCount') -MaxRows 250 } else { '<p>No execution manifest was available. Missing evidence cannot be treated as a pass.</p>' }
     $scopeDomain = if ($runMetadata -and $runMetadata.Domain) { [string]$runMetadata.Domain } else { 'Not recorded' }
     $scopeForest = if ($runMetadata -and $runMetadata.Forest) { [string]$runMetadata.Forest } else { 'Not recorded' }
     $scopeSelected = if ($runMetadata) { @($runMetadata.SelectedChecks) -join ', ' } else { 'Not recorded' }
@@ -3530,7 +3622,9 @@ $js
   $(if ($collectionNote) { "<p>$(HtmlEncode $collectionNote)</p>" })
   <p>Each finding group represents one reported condition and can contain multiple affected objects. Information entries and disabled-account hygiene with score 0 do not add active-exposure points. A score of 0 is not a certification that the environment is secure.</p>
   <details><summary>Check execution and coverage details</summary>$statusTableHtml<ul>$coverageDetailHtml</ul></details>
+  $timingHtml
 </section>
+$dcEvidenceHtml
 "@
 
     # ---------------------------
@@ -3994,7 +4088,7 @@ table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-l
 </script>
 "@
 
-    $primaryNav = Get-ADAuditPrimaryNav -Active 'risk'
+    $primaryNav = Get-ADAuditPrimaryNav -Active 'risk' -AvailableReports $availablePrimaryReports
 
     $html = @"
 <!doctype html>
@@ -4004,6 +4098,7 @@ table.matrix th:nth-child(3), table.matrix td:nth-child(3){ width:64%; padding-l
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AD Audit - Risk Report</title>
 $css
+$presentationAssets
 </head>
 <body>
 <div class="container">
@@ -4278,6 +4373,7 @@ function Update-CompanionHtmlReports {
     if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root)) { return }
 
     $auditPath = Join-Path (Get-HtmlReportsDir -BaseRoot $Root) 'ADAudit-Results.html'
+    $presentationAssets = Get-ADAuditReportPresentationAssets
     # Read the saved scope so rebuilding reports does not depend on runner state.
     $wrapperCloneNotice = ''
     foreach ($metadataPath in @((Join-Path $Root 'Raw Data/Source/audit_run.json'), (Join-Path $Root 'audit_run.json'))) {
@@ -4515,6 +4611,7 @@ html[data-theme="dark"] .embedded-report a{color:var(--accent) !important}
   });
 })();
 </script>
+$presentationAssets
 </head>
 <body>
 <div class="container">
@@ -4697,6 +4794,27 @@ function Move-RootHtmlReports {
     }
 }
 
+function Update-ADAuditReportNavigation {
+    # Run after all outputs are assembled, so early collector reports can link to
+    # later reports and scoped runs never retain links to absent report files.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Root)
+    $htmlRoot = Get-HtmlReportsDir -BaseRoot $Root
+    $reports = @(Get-ChildItem -LiteralPath $htmlRoot -File -Filter '*.html' -ErrorAction SilentlyContinue)
+    $available = @($reports | ForEach-Object Name)
+    $activeByFile = @{'ADAudit-Results.html'='audit';'Risk-Report.html'='risk';'AD_Health.html'='health';'overlapping_group_memberships.html'='overlap';'Lateral-Movement.html'='lateral'}
+    $navPattern = '(?is)<nav\b[^>]*class=["''][^"'']*\bprimary-nav\b[^"'']*["''][^>]*>.*?</nav>'
+    foreach ($report in $reports) {
+        $html = Get-Content -LiteralPath $report.FullName -Raw -ErrorAction Stop
+        if ($html -notmatch $navPattern) { continue }
+        $active = if ($activeByFile.ContainsKey($report.Name)) { $activeByFile[$report.Name] } else { 'none' }
+        $markup = Get-ADAuditPrimaryNav -Active $active -AvailableReports $available
+        $nav = [regex]::Match($markup, $navPattern).Value
+        $updated = [regex]::Replace($html, $navPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($match) $nav })
+        if ($updated -ne $html) { Set-Content -LiteralPath $report.FullName -Value $updated -Encoding UTF8 }
+    }
+}
+
 function Invoke-ADAuditFinalReports {
     <#
     .SYNOPSIS
@@ -4744,5 +4862,6 @@ function Invoke-ADAuditFinalReports {
     foreach ($f in (Get-ChildItem -Path $Root -Recurse -File -Filter '*.source.html' -ErrorAction SilentlyContinue)) {
         try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch { }
     }
+    Update-ADAuditReportNavigation -Root $Root
     Write-ADAuditProgress -Activity 'Report assembly' -Status 'All report phases finished' -PercentComplete 100 -Completed
 }

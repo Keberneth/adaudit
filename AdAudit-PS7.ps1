@@ -18,6 +18,18 @@
             * DSInternals and NuGet PowerShell module, installed by script if -installdeps switch is used)
               Offline installation help using ADAudit-run.ps1 script
         o Changelog :
+            [X] Version 9.4.0 - 26/10/2026
+                Added focused DC SMB/share protection evidence and share-root ACL review.
+                Separated LDAP configuration, validated TLS endpoints and observed reads.
+                Corrected DNS coverage, SID-500 clone aging and DC policy applicability.
+                Added per-operation timings and successful/unknown control evidence to reports.
+            [X] Version 9.3.1 - 26/10/2026
+                Transport preflight tries all resolved IPv4/IPv6 addresses within one
+                    shared connect deadline and closes every attempted socket.
+                CIM provider/query timeouts no longer mark a connection unavailable or
+                    suppress unrelated queries; timed-out methods are not retried.
+                Clarified GUI isolated-host options and fixed selected-report navigation,
+                    narrow-screen report layout and light, expanded-evidence printing.
             [X] Version 9.3.0 - 25/10/2026
                 Renamed the isolation option to -IsolateHost (alias -IsolatedClone kept).
                 Bounded remote collection: every remote operation runs as a cancellable
@@ -596,7 +608,7 @@ if ($select) { $selectedChecks = @($select -split '[,\s]+' | ForEach-Object { $_
 # defeats the match (e.g. ' dnszone' -notin the check names).
 $exclude = @($exclude | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-$versionnum = "v9.3.0"
+$versionnum = "v9.4.0"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 $script:ADAuditIsWindows = ($env:OS -eq 'Windows_NT')

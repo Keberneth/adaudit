@@ -1,5 +1,59 @@
 # ADAudit release notes
 
+## v9.4.0 (26 October 2026)
+
+### Focused AD security evidence
+
+- Domain Audit now includes DC SMB client signing, insecure guest access, anonymous SMB restrictions/exception lists, available dialect configuration, and aggregated session protection evidence. Existing SMB1/server-signing findings are preserved without duplicate scoring. Missing properties remain unknown.
+- SYSVOL, NETLOGON and additional disk-share inventory includes effective encryption requirements and both share/NTFS root ACE evidence. Broad authenticated read is expected. Extra shares, encryption exceptions and broad write/control ACE candidates require review and are unscored; static ACL observations do not prove effective access. Child-file overrides and full access-token evaluation are outside scope.
+- LDAP now distinguishes configured signing/channel binding from certificate-validated LDAPS/StartTLS and the observed anonymous domain-object read. The StartTLS probe sends no credentials. Alternate resolved addresses share bounded probe budgets; endpoint success does not claim rejection of unprotected binds or effective CBT enforcement. A precise AD bind-required diagnostic is classified as rejection of the tested read, while generic operations errors remain unknown. Remote DCs in isolated-host mode are consistently Excluded.
+- Both main reports retain positive, review, unavailable and excluded DC security observations with full CSV downloads. Structured LDAP severity replaces the earlier blanket High text-file interpretation; older evidence keeps its legacy fallback when no structured file exists.
+
+### Clone pilot corrections
+
+- Domain SID-500 password age uses the supplied snapshot date on an isolated host. Without that date, age remains unknown and does not gain severity merely because the clone aged; independent account risks remain. Renaming is Low-priority defense in depth, decoy accounts are optional, and recent logon evidence no longer automatically means misuse. The separate DSRM recovery account is clearly distinguished.
+- DC-inapplicable SAM enumeration policies no longer produce anonymous-access findings. Applicable anonymous-permission settings retain explicit evidence and coverage.
+- DNS zone aging is queried only where applicable, null timestamps are handled safely, and unknown values are distinguished from disabled settings. Real DNS collection errors now mark the check Partial and appear in coverage instead of leaving a misleading Completed result.
+- Dependency imports remain visible after the module helper returns. Every wrapped operation records measured timing, status and coverage counts in `audit_step_timings.csv`; both main reports show the slowest operations. These measurements enable investigation of the Accounts delay without guessing its cause.
+
+### Scope and deployment
+
+All additions are read-only and remain focused on AD/DC security. No server baseline comparison or general server audit has been imported. The separate server-audit script and customer evidence are unchanged. Deploy the entire package because Domain Audit loads the new `Checks\Invoke-DcShareSecurityCheck.ps1` helper. No new GUI option is needed: the additions run with Domain Audit and `-all`.
+
+The previously supplied isolated-host run (v9.3.1) completed 26 checks in about 11m15s, with 16 Completed, 10 Partial and no worker timeouts or orphaned workers. This is evidence for the previous build, not a live validation of these additions. Repeat the clone pilot with v9.4.0; connected multi-DC and real permission-restriction validation still require an authorized connected environment.
+
+### Validation performed
+
+- 619 regression checks passed across 23 suites: 253 Pester cases and 366 standalone assertions. All 57 PowerShell source/test files parsed successfully. Tests cover snapshot-aware account age, DNS applicability and coverage, LDAP diagnostics/TLS framing and deadlines, SMB tri-state values, share/NTFS evidence boundaries, snapshot-timeout evidence preservation, module visibility and Swedish decimal timing values.
+- Nine generated report pages passed 99 headless-browser checks, including expanded DC evidence, theme controls, CSV downloads, local links, 390-pixel layout and light/expanded print behavior. The new dark-mode evidence section was visually inspected. These reports use synthetic fixtures.
+- No live AD query or credential replication was performed by this validation. Existing runtime fixtures use synthetic workers/processes, local host metadata and loopback sockets. Customer evidence and the separate server audit script were not modified.
+
+## v9.3.1 (26 October 2026)
+
+### Connection-cache corrections
+
+- TCP transport preflight attempts every distinct resolved IPv4/IPv6 address concurrently within one shared connect budget. A failed or slow first address no longer hides a reachable alternate; every socket is closed on success, failure or timeout. DNS retains its separate bounded resolver budget.
+- A CIM query/provider timeout discards its session and remains a `Timeout` coverage result, without marking that transport unavailable or suppressing unrelated queries. Timed-out queries and methods are not retried through a fresh session or another transport. Connection-stage timeouts and explicit connection failures retain their existing caching and fallback behavior.
+- New regression harnesses cover multi-address reachability, IPv4/IPv6 loopback sockets, shared deadlines, session/query timeout classification, and serial/parallel service-collection scenarios.
+
+### GUI and report review fixes
+
+- The GUI exposes **Advanced Options > Isolated host (-IsolateHost)** and passes the switch through the displayed command to the runner. The snapshot-date field now clearly states that it is optional; the description explains that remote DC operational checks are skipped. Dynamic tests verify the actual GUI command generation and date validation without opening a window or starting an audit.
+- Report navigation is reconciled after final assembly so selected-check runs do not link to missing reports, while early-generated reports gain links to later outputs.
+- Narrow-screen report tables scroll within the page. Printing uses a light background, hides interactive controls and exposes evidence sections; after printing, the prior disclosure state is restored without changing the selected theme.
+
+### Pilot scope
+
+The available customer pilot is one isolated DC clone, to be run by its owner. The clone commands and acceptance checks are in README.md under *Single-server clone pilot*. Offline validation and synthetic report review do not establish current live AD behavior. Connected multi-DC collection, actual remote permission restrictions and production performance still require a connected test environment. Earlier v9.3.0 measurements below are historical evidence, not measurements of this patch.
+
+### Validation performed on 26 October
+
+- 488 checks passed across 18 suites: 171 Pester cases plus 317 standalone assertions. All 51 PowerShell source/test files parsed successfully.
+- The actual service collector and worker coordinator were exercised with synthetic directory/CIM responses for successful collection, unreachable DCs, denied access, provider timeouts, empty responses and isolated-host exclusions. Serial and parallel runs produced equivalent substantive results and coverage; worker cleanup passed.
+- TCP tests include real IPv4/IPv6 loopback sockets plus deterministic pending/refused-address fixtures. No live AD queries or credential replication were performed. The worker runner fixture reads local host information only.
+- Fresh Connected-complete, Connected-partial and IsolatedHost report fixtures passed 54 assertions (included in the total above): coverage/outcome labels, isolation banners, full CSV downloads, correct navigation after final assembly and unchanged source hashes/finding totals after rerendering.
+- Headless Chrome passed 93 browser checks across nine generated pages (Audit Results, Risk Report and wrapped GPO report in each fixture mode): no broken local links, JavaScript errors or document overflow at 390 px; theme controls and CSV downloads work; print is light and expanded, and restores prior state afterward. Generated A4 PDFs were also inspected. This is synthetic report validation, not a review of new live clone output.
+
 ## v9.3.0 (25 October 2026)
 
 Scope: progress visibility, bounded remote collection and performance (developer handoff Tasks 1 to 4), plus the regression coverage for them. Task 5 (authorized pilot and report review) is pending; see *Pilot checklist* below.

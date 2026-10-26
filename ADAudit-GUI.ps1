@@ -512,12 +512,14 @@ Add-LabelBold "Advanced Options" $y | Out-Null
 $y += $rowHeight
 
 $chkIsolateHost = Add-Check "Isolated host (-IsolateHost)" $y $false 250 $leftLabel
-$lblIsolateDesc = Add-Label "Audit an isolated copy of a DC: local collection only; the copied directory is not current production posture" ($y + 1) 680 ($leftLabel + 256)
+$lblIsolateDesc = Add-Label "Skip remote DC operational checks; audit the local host and copied directory" ($y + 1) 680 ($leftLabel + 256)
 $lblIsolateDesc.ForeColor = [System.Drawing.Color]::DimGray
 $y += $rowHeight
-Add-Label "Snapshot date (YYYY-MM-DD):" $y 300 | Out-Null
-$txtSnapshotDate = Add-TextBox $y
+Add-Label "Snapshot date (optional):" $y 240 | Out-Null
+$txtSnapshotDate = Add-TextBox $y -Width 160
 $txtSnapshotDate.Enabled = $false
+$lblSnapshotDesc = Add-Label "YYYY-MM-DD; leave empty if the clone date is unknown" ($y + 1) 500 ($leftInput + 170)
+$lblSnapshotDesc.ForeColor = [System.Drawing.Color]::DimGray
 $y += $rowHeight + 4
 
 Add-LabelBold "Remote Collection" $y 300 | Out-Null

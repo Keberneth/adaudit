@@ -11,7 +11,8 @@ AdAudit-PS7.ps1              Command-line runner: parameters, check table, run l
 README.md
 Library\ADAudit.Common.ps1   Shared helpers and run state (output folders, logging, failure / not-assessed tracking, Nessus export, report CSS and navigation, module import, -installdeps)
 Library\ADAudit.Report.ps1   Management report (ADAudit-Results.html, Risk-Report.html), companion-report wrapping, end-of-run cleanup
-Checks\Invoke-<Name>Check.ps1  One file per audit check (25 files, one per switch in the table below)
+Checks\Invoke-<Name>Check.ps1  Audit collectors, plus shared helpers loaded by their parent check
+Checks\Invoke-DcShareSecurityCheck.ps1  DC SMB/share helper included in Domain Audit (no additional selection required)
 Checks\Invoke-LateralMovementCheck.ps1  Lateral movement analysis (self-contained, also runs on its own)
 Password Audit\             Invoke-PwnedPasswordCheck.ps1, Invoke-SamePasswordCheck.ps1, PasswordAuditCommon.psm1 (separate from the audit run)
 ```
@@ -49,6 +50,23 @@ This runs every available audit check and produces a full security report. It is
 
 The console shows how many checks were selected out of the available checks, how many were skipped, and the current check number. Overall progress counts completed checks; it is not an estimate of remaining time. Within a check, phases with known totals show counts and percentages. Directory requests and other operations without a known total show their current stage instead of a made-up percentage. While a remote call is waiting for an answer, both progress bars repeat the check number, phase, target and elapsed time about every five seconds (console lines are throttled); the percentage shown is the measured completed work and never advances just because time passes. Progress is cleared on success, failure or cancellation, and report generation has its own stages.
 
+Each wrapped operation also records measured elapsed seconds and its completion/coverage status in `Raw Data\Source\audit_step_timings.csv`. Both main reports show the ten slowest operations and link to the complete CSV. Timings include waiting and nested work, so do not sum them to calculate total audit duration. Use them to identify the actual Accounts bottleneck before changing concurrency or queries.
+
+### Focused domain controller security
+
+`-domainaudit` (also in `-all` and the GUI's Domain Audit selection) includes DC SMB and share security. This is an AD security assessment, not the separate Windows Server audit or a Microsoft baseline/GPO comparison.
+
+- `dc_smb_security.csv` records SMB1, server/client signing, insecure guest access, anonymous SMB restrictions/exception lists and available dialect configuration. Missing properties stay unknown; newer-server settings are not required on unsupported versions.
+- `dc_share_security.csv` inventories SYSVOL, NETLOGON and additional disk shares, their encryption requirements and permission-review candidates. The encryption requirement combines server/share `EncryptData` with `RejectUnencryptedAccess`; a missing requirement is a review observation, not proof that all connections are unencrypted. An additional share alone is not a vulnerability.
+- `dc_share_aces.csv` preserves share and NTFS root ACL evidence, including SIDs, allow/deny masks and inheritance. Broad authenticated read on SYSVOL/NETLOGON is normal. Unexpected broad write/control ACEs are unscored review candidates: confirm both authorization layers, deny/inheritance rules and trustee membership before remediation. Child-folder/file overrides and full effective-access token evaluation are outside this collection.
+- `dc_smb_sessions.csv` summarizes observed session dialect/protection fields without client/account identities. No sessions is not proof that weak dialects are prohibited. Blank fields are unavailable evidence, not false values.
+- `-ldapsecurity` records signing/channel-binding configuration separately from certificate-validated LDAPS/StartTLS and the bounded anonymous domain-object read. LDAP 389 may be protected; an open LDAPS port alone does not establish enforcement. Active unsigned/CBT enforcement, all directory subtrees, certificate revocation and GC TLS are not certified by these checks.
+- `-accounts` preserves domain SID-500 naming/logon context. Renaming is limited defense in depth; a decoy is optional and a recent logon is not automatically misuse. The per-DC DSRM recovery account is separate. On an isolated host, SID-500 password age uses a supplied snapshot date; without one its age assessment remains unknown while independent risks are retained.
+
+Both main HTML reports include a **Domain controller security evidence** section with positive, review, unavailable and excluded observations plus complete CSV downloads. Only explicit findings add risk points. Local/CIM/DCOM collection is preferred with the existing permitted WinRM fallback; missing access remains a coverage gap. Isolated-host mode excludes remote DCs before collection.
+
+Reference guidance: [Microsoft LDAP protections](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/ldap-channel-binding), [SMB security](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-security), and [default AD accounts](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-default-user-accounts).
+
 ### Remote collection: deadlines, connection cache and parallel targets
 
 Every remote operation against a domain controller (CIM over DCOM with optional WinRM fallback, remote event logs, remote PowerShell, SYSVOL access, replication metadata and the native `dcdiag`, `repadmin` and `w32tm` tools) runs as a cancellable worker with an end-to-end deadline that includes name resolution, connection setup, the operation and any transport fallback:
@@ -62,6 +80,8 @@ Every remote operation against a domain controller (CIM over DCOM with optional 
 Every target is resolved once per run (5 s bound; the answer, a missing record, or "resolver did not answer" is cached) and probes connect to the resolved address. Before the first attempt on a transport, a 3-second TCP probe of the port that transport needs (135 for DCOM, RPC and event logs, 389 for dcdiag, 5985 for WinRM, 445 for SYSVOL, 9389 for replication metadata, 80/443 for AD CS web enrollment) replaces the protocol's own timeout: a host that is down is recorded as unreachable within seconds instead of after 15 to 40 s, and a DC whose LDAP port does not answer skips all ten dcdiag tests with one recorded reason. Short DC names and their domain FQDNs share one cache entry.
 
 Coverage records (`not_assessed.csv`, the report's *Assessment scope and coverage* section) carry a collection outcome: `Timeout`, `Unreachable`, `AccessDenied`, `Unsupported`, `Excluded` (isolated-host scope) or `Unavailable`. Success means the collection succeeded, not that a control passed. CIM sessions are reused within a run and disposed at the end; the connection cache is reset between runs. `audit_run.json` records the settings, worker counts and transport failures of the run.
+
+Transport preflight attempts all resolved IPv4/IPv6 addresses within one shared connect budget. One failed address cannot suppress a reachable alternate. A CIM provider/query timeout is recorded as `Timeout` and its session is discarded, but unrelated queries remain eligible. Only a connection-stage timeout or an explicit connection failure can create a negative CIM transport-cache entry; a timed-out query or method is not automatically retried.
 
 Known limits: the DNS zone posture report (`-dnszone`) still uses the DnsServer module's own timeouts; a worker that ignores cancellation (rare, native RPC blocked inside a cmdlet) is abandoned after a five-second grace period, reported in the run metadata and console, and never reused.
 
@@ -291,32 +311,46 @@ Computer activity is assessed using multiple AD timestamps. A recent machine-pas
 Regression fixtures exercise account classification, ACL and AD CS interpretation, coverage handling, and generated reports without contacting a domain or replicating credentials. From PowerShell 7 with Pester installed:
 
 ```powershell
-$testFiles = Get-ChildItem .\Tests\*.Tests.ps1 | Where-Object Name -notin @('Report.Tests.ps1','PasswordLookup.Tests.ps1','ProgressChecks.Tests.ps1','LateralSeverity.Tests.ps1','WorkerRuntime.Tests.ps1')
+$standalone = @('Report.Tests.ps1','ReportReview.Tests.ps1','DcSecurityReport.Tests.ps1','PasswordLookup.Tests.ps1','ProgressChecks.Tests.ps1','LateralSeverity.Tests.ps1','WorkerRuntime.Tests.ps1','TcpPreflight.Tests.ps1','CimTimeout.Tests.ps1','PilotScenarios.Tests.ps1')
+$testFiles = Get-ChildItem .\Tests\*.Tests.ps1 | Where-Object Name -notin $standalone
 $result = Invoke-Pester -Script $testFiles.FullName -PassThru
 if ($result.FailedCount -gt 0) { throw 'Offline regression tests failed.' }
-pwsh -NoProfile -File .\Tests\Report.Tests.ps1
-if ($LASTEXITCODE -ne 0) { throw 'Report integration tests failed.' }
-pwsh -NoProfile -File .\Tests\PasswordLookup.Tests.ps1
-if ($LASTEXITCODE -ne 0) { throw 'Password lookup tests failed.' }
-pwsh -NoProfile -File .\Tests\ProgressChecks.Tests.ps1
-if ($LASTEXITCODE -ne 0) { throw 'Check progress tests failed.' }
-pwsh -NoProfile -File .\Tests\LateralSeverity.Tests.ps1
-if ($LASTEXITCODE -ne 0) { throw 'Lateral severity tests failed.' }
-pwsh -NoProfile -File .\Tests\WorkerRuntime.Tests.ps1
-if ($LASTEXITCODE -ne 0) { throw 'Worker runtime tests failed.' }
+foreach ($suite in $standalone) {
+    pwsh -NoProfile -File (Join-Path .\Tests $suite)
+    if ($LASTEXITCODE -ne 0) { throw "Regression suite failed: $suite" }
+}
 ```
 
-The Pester suites use the in-process seam (`ADAuditWorkerMode = 'InProcess'`) so command mocks apply; `WorkerRuntime.Tests.ps1` exercises real worker runspaces, child processes, deadlines, cancellation cleanup and the runner's pre-collection validation without any AD or network call. Validated with Pester 3.4.0 under PowerShell 7. These tests do not replace a pilot audit in a representative AD environment.
+The Pester suites use the in-process seam (`ADAuditWorkerMode = 'InProcess'`) so command mocks apply. `WorkerRuntime.Tests.ps1` exercises real runspaces, child processes, deadlines, cancellation cleanup and runner validation; its host-details run reads local machine information. `TcpPreflight.Tests.ps1` uses synthetic sockets and real loopback listeners, without DNS or remote network access. `CimTimeout.Tests.ps1` distinguishes connection failures from provider timeouts. `PilotScenarios.Tests.ps1` runs the service collector with real workers and synthetic directory/CIM boundaries to compare serial and parallel results, excluded peers, inaccessible targets and partial coverage. Validated with Pester 3.4.0 under PowerShell 7. These tests do not replace a pilot audit in a representative AD environment.
 
 The `Tests\` folder is developer tooling and is excluded from the synced repository (`.gitignore`); it lives only in the development working copy. Run output folders (`<COMPUTERNAME>\<yyyy-MM-dd_HH-mm-ss>\`) are excluded as well.
+
+### Single-server clone pilot
+
+Extract the entire deployment package to a new folder on the clone. In the GUI, open **Advanced Options**, enable **Isolated host (-IsolateHost)** and optionally enter the known snapshot date. The command preview must contain `-IsolateHost`; **Run Audit** launches that same command. Set **Parallel target workers** to `1` or `2` for the comparison runs.
+
+For the equivalent command-line pilot in PowerShell 7, first compare the affected checks with one and two workers:
+
+```powershell
+.\AdAudit-PS7.ps1 -select domainaudit,adhealth,portconnectivity -IsolateHost -MaxConcurrency 1
+.\AdAudit-PS7.ps1 -select domainaudit,adhealth,portconnectivity -IsolateHost -MaxConcurrency 2
+# Exercise the revised evidence and pilot corrections:
+.\AdAudit-PS7.ps1 -select domainaudit,ldapsecurity,accounts,dnszone -IsolateHost
+# Then review the complete audit and all reports:
+.\AdAudit-PS7.ps1 -all -IsolateHost
+```
+
+If the actual clone date is known, add the same `-SnapshotDate yyyy-MM-dd` to each command using that date; otherwise omit it. Keep the identity, selected checks and data unchanged between the first two runs. On a one-server clone most remote work is intentionally excluded, so a speedup is not an acceptance requirement. Findings and coverage should agree apart from timestamps, elapsed times and genuinely changing local service/event data. Verify that remote DCs are excluded, local collection remains available, collection failures stay visible, the isolated-host banner appears, and `Collection.Workers.OrphansRemaining` is zero in `Raw Data\Source\audit_run.json`.
+
+Review the HTML reports in light/dark mode, a narrow window and print preview; open evidence links and CSV downloads. Retain the complete run folders for review. A single isolated clone cannot establish successful collection across production DCs, real remote permission failures, or the speedup of parallel collection across multiple reachable DCs. Those live scenarios remain pending until a connected test environment is available; offline fixtures cover their control flow only.
 
 ## Releases
 
 Releases are built by the GitHub Actions workflow in `.github/workflows/release.yml`. To cut one: set `$versionnum` in `AdAudit-PS7.ps1`, add the matching section to `RELEASE-NOTES.md`, commit, then tag and push:
 
 ```powershell
-git tag v9.3.0
-git push origin v9.3.0
+git tag v9.4.0
+git push origin v9.4.0
 ```
 
 The workflow checks that the tag matches the declared version, verifies every script parses, assembles the deployment folder (runner, GUI, `Library\`, `Checks\`, `Password Audit\`, README, release notes), writes a SHA-256 manifest and publishes a GitHub Release with `ADAudit-<version>.zip` attached. Deploy the whole zip; copying only the runner is insufficient.

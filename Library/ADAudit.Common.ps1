@@ -58,7 +58,9 @@ function Import-ADAuditModule {
     $lastError = $null
     foreach ($attempt in $attempts) {
         try {
-            Import-Module -Name $Name @attempt -ErrorAction Stop | Out-Null
+            # This helper runs in a function scope. Keep the imported commands visible
+            # to later checks instead of losing the import when the helper returns.
+            Import-Module -Name $Name @attempt -Global -ErrorAction Stop | Out-Null
             return (Get-Module -Name $Name | Sort-Object Version -Descending | Select-Object -First 1)
         }
         catch {
@@ -196,23 +198,57 @@ function Get-ADAuditShortMessage {
 }
 
 function Test-ADAuditTcpPort {
-    # Bounded TCP connect used as a transport preflight. Resolves through the run cache and
-    # connects to the address, so a slow resolver is paid once per target. Never throws.
+    # Resolve once, then race every returned address within one shared connect budget.
+    # A failed or slow first IPv4 address must not hide a reachable IPv6/alternate address.
+    # All sockets (including still-pending attempts) are closed before returning.
     param([Parameter(Mandatory)][string]$ComputerName, [Parameter(Mandatory)][int]$Port, [int]$TimeoutMs = $script:ADAuditPreflightTimeoutMs)
     $resolution = Resolve-ADAuditTargetAddresses -ComputerName $ComputerName
-    if ($resolution.Status -eq 'Unresolvable') { return [pscustomobject]@{ Open = $false; Error = $resolution.Detail } }
-    $target = if ($resolution.Status -eq 'Resolved') { [string]@($resolution.Addresses)[0] } else { $ComputerName }
-    $client = $null
+    if ($resolution.Status -ne 'Resolved' -or @($resolution.Addresses).Count -eq 0) {
+        return [pscustomobject]@{ Open = $false; Error = $resolution.Detail }
+    }
+    $attempts = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $async = $client.BeginConnect($target, $Port, $null, $null)
-        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return [pscustomobject]@{ Open = $false; Error = "no answer within $TimeoutMs ms" } }
-        $client.EndConnect($async)
-        [pscustomobject]@{ Open = $true; Error = $null }
+        foreach ($target in @($resolution.Addresses | Select-Object -Unique)) {
+            $client = $null
+            try {
+                $address = [System.Net.IPAddress]::Parse([string]$target)
+                $client = New-Object System.Net.Sockets.TcpClient -ArgumentList $address.AddressFamily
+                $async = $client.BeginConnect($address, $Port, $null, $null)
+                $attempts.Add([pscustomobject]@{ Address = [string]$target; Client = $client; Async = $async; Completed = $false })
+            } catch {
+                $failures.Add("${target}: $($_.Exception.Message)")
+                if ($client) { try { $client.Close() } catch { } }
+            }
+        }
+        while ($true) {
+            $pending = 0
+            foreach ($attempt in $attempts) {
+                if ($attempt.Completed) { continue }
+                if (-not $attempt.Async.IsCompleted) { $pending++; continue }
+                $attempt.Completed = $true
+                try {
+                    $attempt.Client.EndConnect($attempt.Async)
+                    return [pscustomobject]@{ Open = $true; Error = $null }
+                } catch {
+                    $failures.Add("$($attempt.Address): $($_.Exception.Message)")
+                }
+            }
+            if ($pending -eq 0) { break }
+            $remaining = [long]$TimeoutMs - $timer.ElapsedMilliseconds
+            if ($remaining -le 0) {
+                $failures.Add("$pending address attempt(s) had no answer within the shared $TimeoutMs ms connect budget")
+                break
+            }
+            [System.Threading.Thread]::Sleep([int][Math]::Min(25, $remaining))
+        }
+        [pscustomobject]@{ Open = $false; Error = "No resolved address accepted a connection. $($failures -join '; ')" }
     } catch {
         [pscustomobject]@{ Open = $false; Error = $_.Exception.Message }
     } finally {
-        if ($client) { try { $client.Close() } catch { } }
+        $timer.Stop()
+        foreach ($attempt in $attempts) { try { $attempt.Client.Close() } catch { } }
     }
 }
 
@@ -1019,6 +1055,7 @@ function Invoke-ADAuditCimRequest {
     # resolution check, DCOM first, optional WSMan fallback, per-protocol reachability
     # cache, pooled session reuse with one fresh-session retry. Never contacts a
     # protocol whose connection failure was recorded within the cache lifetime.
+    # An operation timeout is not proof of a failed transport and is not retried.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidateSet('Instance','Method')][string]$Kind,
@@ -1070,6 +1107,7 @@ function Invoke-ADAuditCimRequest {
             $lease = Get-ADAuditCimSessionLease -ComputerName $ComputerName -Protocol $protocol
             $pooled = $null -ne $lease
             $session = $null
+            $operationStarted = $false
             try {
                 if ($pooled) { $session = $lease.Session }
                 else {
@@ -1077,6 +1115,7 @@ function Invoke-ADAuditCimRequest {
                     $session = New-CimSession -ComputerName $ComputerName -SessionOption $option -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop
                     $lease = Add-ADAuditCimSession -ComputerName $ComputerName -Protocol $protocol -Session $session
                 }
+                $operationStarted = $true
                 $output = if ($Kind -eq 'Instance') { Get-CimInstance @Parameters -CimSession $session } else { Invoke-CimMethod @Parameters -CimSession $session }
                 [void](Set-ADAuditTransportResult -ComputerName $ComputerName -Protocol $protocol -Outcome 'Reachable')
                 Complete-ADAuditCimSessionLease -Lease $lease
@@ -1086,6 +1125,13 @@ function Invoke-ADAuditCimRequest {
                 $outcome = Get-ADAuditOperationOutcome -ErrorRecord $_
                 if ($lease) { Remove-ADAuditCimSession -Lease $lease }
                 elseif ($session) { try { $session | Remove-CimSession -ErrorAction SilentlyContinue } catch { } }
+                if ($operationStarted -and $outcome -eq 'Timeout') {
+                    # A slow provider/query can time out on a healthy connection. Discard
+                    # the suspect session, preserve Timeout, and leave unrelated queries
+                    # eligible. Retrying (including another transport) could repeat a
+                    # method whose completion is unknown.
+                    throw
+                }
                 if ($pooled -and $outcome -notin @('AccessDenied','Unsupported')) { continue }
                 if ($outcome -in @('Unreachable','Timeout')) { [void](Set-ADAuditTransportResult -ComputerName $ComputerName -Protocol $protocol -Outcome $outcome -Message $_.Exception.Message) }
                 $moveToNextProtocol = $true
@@ -1626,6 +1672,7 @@ Function Get-ADAuditReportHeader {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>$Title</title>
 $css
+$(Get-ADAuditReportPresentationAssets)
 </head>
 <body>
 <div class="container">
@@ -1647,6 +1694,62 @@ Function Get-ADAuditReportFooter {
 "@
 }
 
+function Get-ADAuditReportPresentationAssets {
+    # Shared screen/print behavior. Printing temporarily opens evidence sections;
+    # afterprint restores the reader's open/closed state without changing theme.
+    return @'
+<style id="adaudit-presentation">
+.result-scroll{max-width:100%;overflow-x:auto}
+.container,.section,.panel,.callout,.finding-body{min-width:0}
+@media screen and (max-width:980px){
+  .meta,.mono,th,td{overflow-wrap:anywhere}
+  table,#findings,.embedded-report table{display:block;max-width:100%;overflow-x:auto}
+}
+@media screen and (max-width:640px){
+  .grid>.span-3,.grid>.span-4{grid-column:span 6}
+  .card{min-width:0;overflow-wrap:anywhere}
+}
+@media print{
+  @page{margin:12mm}
+  html,body{background:#fff!important;color:#111!important;color-scheme:light!important}
+  html,html[data-theme],body,body[data-theme]{--bg:#fff!important;--panel:#fff!important;--panel-soft:#fff!important;--panel-softer:#fff!important;--th-bg:#f2f2f2!important;--text:#111!important;--muted:#333!important;--line:#bbb!important;--accent:#111!important;--link:#111!important}
+  body *{color:#111!important;background:transparent!important;box-shadow:none!important;text-shadow:none!important;border-color:#bbb!important}
+  .primary-nav,.theme-toggle,.audit-theme-toggle,.toolbar,.filters,.sidebar,.actions,button,input,select{display:none!important}
+  .container{width:100%!important;max-width:none!important;margin:0!important;padding:0!important}
+  .layout,.finding-grid{display:block!important}
+  .result-scroll{overflow:visible!important;max-height:none!important}
+  table,#findings,.embedded-report table{display:table!important;table-layout:fixed;width:100%!important;max-width:100%!important;overflow:visible!important}
+  th,td,.mono,.meta,pre{overflow-wrap:anywhere!important;word-break:break-word!important}
+  th,td{padding:5px!important}
+  pre{white-space:pre-wrap!important;max-height:none!important;overflow:visible!important}
+  details,.finding{display:block!important;break-inside:auto}
+  details::details-content{content-visibility:visible!important}
+  details:not([open])>:not(summary){display:block!important}
+  #findings-body tr{display:table-row!important}
+  tr{break-inside:avoid}
+  h1,h2,h3,h4,summary{break-after:avoid}
+  a{text-decoration:underline}
+}
+</style>
+<script>
+(function(){
+  if(window.__adauditPrintReady)return;
+  window.__adauditPrintReady=true;
+  var savedDetails=null;
+  window.addEventListener('beforeprint',function(){
+    if(savedDetails!==null)return;
+    savedDetails=Array.prototype.map.call(document.querySelectorAll('details'),function(detail){var state={element:detail,open:detail.open};detail.open=true;return state;});
+  });
+  window.addEventListener('afterprint',function(){
+    if(savedDetails===null)return;
+    savedDetails.forEach(function(state){state.element.open=state.open;});
+    savedDetails=null;
+  });
+})();
+</script>
+'@
+}
+
 Function Get-ADAuditPrimaryNav {
     <#
     .SYNOPSIS
@@ -1656,7 +1759,8 @@ Function Get-ADAuditPrimaryNav {
     [CmdletBinding()]
     param(
         [ValidateSet('audit','risk','health','overlap','lateral','none')]
-        [string]$Active = 'none'
+        [string]$Active = 'none',
+        [string[]]$AvailableReports
     )
     $links = @(
         [pscustomobject]@{ Key='audit';   Href='ADAudit-Results.html';            Label='Audit Results' }
@@ -1665,6 +1769,9 @@ Function Get-ADAuditPrimaryNav {
         [pscustomobject]@{ Key='overlap'; Href='overlapping_group_memberships.html'; Label='Overlapping Groups' }
         [pscustomobject]@{ Key='lateral'; Href='Lateral-Movement.html';            Label='Lateral Movement' }
     )
+    if ($PSBoundParameters.ContainsKey('AvailableReports')) {
+        $links = @($links | Where-Object { $_.Href -in $AvailableReports })
+    }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine(@'
 <style>
@@ -1712,6 +1819,7 @@ $script:CheckFailures = New-Object System.Collections.Generic.List[object]
 # ---------------------------------------------------------------------------
 $script:NotAssessed = New-Object System.Collections.Generic.List[object]
 $script:ADAuditCheckStatus = New-Object System.Collections.Generic.List[object]
+$script:ADAuditStepTimings = New-Object System.Collections.Generic.List[object]
 $script:ADAuditCurrentCheckSwitch = $null
 $script:ADAuditIsolatedClone = $false
 $script:ADAuditSnapshotDate = $null
@@ -1777,6 +1885,7 @@ function Write-ADAuditProgress {
 function Initialize-ADAuditCheckStatus {
     param([object[]]$Checks, [string[]]$SelectedSwitches)
     $script:ADAuditCheckStatus.Clear()
+    $script:ADAuditStepTimings.Clear()
     foreach ($check in $Checks) {
         $selected = $check.Switch -in $SelectedSwitches
         $script:ADAuditCheckStatus.Add([pscustomobject]@{
@@ -1792,6 +1901,11 @@ function Write-ADAuditRunMetadata {
     param([hashtable]$Metadata)
     $rawDir = Get-RawSourceDataDir
     $script:ADAuditCheckStatus | Export-Csv -LiteralPath (Join-Path $rawDir 'audit_check_status.csv') -NoTypeInformation -Encoding UTF8
+    if ($script:ADAuditStepTimings.Count -gt 0) {
+        $script:ADAuditStepTimings |
+            Select-Object Switch,Step,StartedUtc,FinishedUtc,@{Name='DurationSeconds';Expression={ ([double]$_.DurationSeconds).ToString('0.000',[cultureinfo]::InvariantCulture) }},Status,FailureCount,NotAssessedCount |
+            Export-Csv -LiteralPath (Join-Path $rawDir 'audit_step_timings.csv') -NoTypeInformation -Encoding UTF8
+    }
     $Metadata | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $rawDir 'audit_run.json') -Encoding UTF8
 }
 
@@ -2002,12 +2116,29 @@ Function Invoke-AuditStep {
         [string]$Switch
     )
 
+    if (-not $Switch) { $Switch = $script:ADAuditCurrentCheckSwitch }
+    $stepStarted = [datetime]::UtcNow
+    $stepTimer = [Diagnostics.Stopwatch]::StartNew()
+    $failuresBefore = $script:CheckFailures.Count
+    $unknownBefore = $script:NotAssessed.Count
+    $stepFailed = $false
     Write-ADAuditProgress -Activity $Name -Status 'Collecting; this operation does not expose a total'
     try {
         & $Body
     } catch {
+        $stepFailed = $true
         Register-AuditFailure -ErrorRecord $_ -Name $Name -Switch $Switch -Prefix '    [!] STEP FAILED'
     } finally {
+        $stepTimer.Stop()
+        $failureCount = $script:CheckFailures.Count - $failuresBefore
+        $unknownCount = $script:NotAssessed.Count - $unknownBefore
+        $stepStatus = if ($stepFailed) { 'Failed' } elseif ($failureCount -gt 0 -or $unknownCount -gt 0) { 'Partial' } else { 'Completed' }
+        $script:ADAuditStepTimings.Add([pscustomobject]@{
+            Switch=$Switch; Step=$Name; StartedUtc=$stepStarted.ToString('o')
+            FinishedUtc=[datetime]::UtcNow.ToString('o'); DurationSeconds=[math]::Round($stepTimer.Elapsed.TotalSeconds,3)
+            Status=$stepStatus; FailureCount=$failureCount; NotAssessedCount=$unknownCount
+        })
+        Write-Both ('    [+] {0}: {1} in {2:0.00} s' -f $Name,$stepStatus,$stepTimer.Elapsed.TotalSeconds)
         Write-Progress -Id 1 -Activity $Name -Completed
         $script:ADAuditProgressLastActivity = ''
     }
