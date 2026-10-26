@@ -3647,27 +3647,23 @@ $dcEvidenceHtml
     $ScoreBands = @(
         [PSCustomObject]@{
             Level   = 'Low'
-            Label   = 'Band 1'
             Range   = '0 - 49'
-            Meaning = 'Lower accumulated points. Even one Critical finding can fall in this range; use finding severity to set urgency.'
+            Meaning = 'Minor control gaps or baseline drift. Address during routine maintenance and continue monitoring.'
         }
         [PSCustomObject]@{
             Level   = 'Medium'
-            Label   = 'Band 2'
             Range   = '50 - 99'
-            Meaning = 'More accumulated points. The v2 calculation sets at least Medium priority; this boundary is a script-defined heuristic.'
+            Meaning = 'Noticeable control gaps. Plan remediation in the next hardening cycle and track to closure.'
         }
         [PSCustomObject]@{
             Level   = 'High'
-            Label   = 'Band 3'
             Range   = '100 - 149'
-            Meaning = 'Higher accumulated points. The v2 calculation sets at least High priority; inspect the contributing findings and coverage.'
+            Meaning = 'Major control gaps. Prioritize remediation and validate that administrative controls are applied consistently.'
         }
         [PSCustomObject]@{
             Level   = 'Critical'
-            Label   = 'Band 4'
             Range   = '150+'
-            Meaning = 'Highest index range. The v2 calculation sets Critical priority; this does not establish compromise or a measured probability of attack.'
+            Meaning = 'Significant control gaps or privileged configuration drift. Treat as a priority workstream with defined owners and timelines.'
         }
     )
 
@@ -3684,18 +3680,17 @@ $dcEvidenceHtml
     if ($highestFinding -and (Get-SeverityRank $highestFinding.Severity) -gt (Get-SeverityRank $OverallLevel)) { $OverallLevel = $highestFinding.Severity }
     if (-not $highestFinding) { $OverallLevel = if ($coverageComplete) { 'No scored findings' } else { 'Not assessed' } }
     $highestFindingSeverity = if ($highestFinding) { [string]$highestFinding.Severity } else { 'None' }
-    $indexBandLabel = ($ScoreBands | Where-Object Level -eq $ScoreBand).Label
     $priorityBasis = if (-not $highestFinding) { 'No scored finding; coverage determines the conclusion.' }
         elseif ((Get-SeverityRank $highestFinding.Severity) -ge (Get-SeverityRank $ScoreBand)) { "Highest scored finding: $($highestFinding.Severity)." }
-        else { "Accumulated index threshold ($indexBandLabel); highest individual finding: $($highestFinding.Severity)." }
+        else { "Accumulated points in the $ScoreBand score band; highest individual finding: $($highestFinding.Severity)." }
 
     $bandNow = $ScoreBand
     $scoreMatrixRows = foreach ($b in $ScoreBands) {
         $isActive = ($b.Level -eq $bandNow)
-        $cls = if ($isActive) { 'matrix-row active' } else { 'matrix-row' }
+        $cls = if ($isActive) { "matrix-row active sev-$($b.Level)" } else { "matrix-row sev-$($b.Level)" }
 @"
 <tr class="$cls">
-  <td><b>$($b.Label)</b>$(if ($isActive) { '<br><small>Current index</small>' })</td>
+  <td><span class="pill sev-$($b.Level)">$($b.Level)</span></td>
   <td class="mono">$($b.Range)</td>
   <td class="matrix-meaning">$(HtmlEncode $b.Meaning)</td>
 </tr>
@@ -3724,7 +3719,7 @@ $dcEvidenceHtml
     $findingExportPath = Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'report_findings.csv'
     if ($findingExport.Count -gt 0) { $findingExport | Export-Csv -LiteralPath $findingExportPath -NoTypeInformation -Encoding UTF8 }
     else { '"ScoringVersion","RuleId","Severity","Category","Title","Evidence","Score","EvidenceFile"' | Set-Content -LiteralPath $findingExportPath -Encoding UTF8 }
-    [ordered]@{ ScoringVersion=$ScoringVersion; GeneratedUtc=(Get-Date).ToUniversalTime().ToString('o'); Run=$runMetadata; Coverage=$coverageLabel; SelectedChecks=$selectedStatuses.Count; CompletedChecks=$completedChecks; PartialChecks=$partialChecks; FailedChecks=$failedChecks; NotRunChecks=$notRunChecks; ReportEvidenceIssues=$ReportIssues.Count; FindingGroups=($Findings.Count - $sevCounts.Information); InformationEntries=$sevCounts.Information; SeverityCounts=$sevCounts; Score=$TotalScore; ScoreBand=$ScoreBand; IndexBand=$indexBandLabel; HighestFindingSeverity=$highestFindingSeverity; PriorityBasis=$priorityBasis; IndexCalibration='Script-defined thresholds; not empirically validated'; OverallLevel=$OverallLevel } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'report_summary.json') -Encoding UTF8
+    [ordered]@{ ScoringVersion=$ScoringVersion; GeneratedUtc=(Get-Date).ToUniversalTime().ToString('o'); Run=$runMetadata; Coverage=$coverageLabel; SelectedChecks=$selectedStatuses.Count; CompletedChecks=$completedChecks; PartialChecks=$partialChecks; FailedChecks=$failedChecks; NotRunChecks=$notRunChecks; ReportEvidenceIssues=$ReportIssues.Count; FindingGroups=($Findings.Count - $sevCounts.Information); InformationEntries=$sevCounts.Information; SeverityCounts=$sevCounts; Score=$TotalScore; ScoreBand=$ScoreBand; IndexBand=$ScoreBand; HighestFindingSeverity=$highestFindingSeverity; PriorityBasis=$priorityBasis; IndexCalibration='Script-defined thresholds; not empirically validated'; OverallLevel=$OverallLevel } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path (Get-RawDataDir -BaseRoot $InputRoot) 'report_summary.json') -Encoding UTF8
 
     $auditRel = [System.IO.Path]::GetFileName($AuditHtml)
     $tableRows = foreach ($f in $sortedFindings) {
@@ -4144,16 +4139,17 @@ $primaryNav
     <h2>Interpretation</h2>
     <div class="callout">
       <p><b>What this means:</b> $(HtmlEncode $meaning)</p>
-      <p><b>Priority basis:</b> $(HtmlEncode $priorityBasis) Accumulated points: $TotalScore ($indexBandLabel). Coverage: $(HtmlEncode $coverageLabel).</p>
+      <p><b>Priority basis:</b> $(HtmlEncode $priorityBasis) Accumulated points: $TotalScore ($ScoreBand score band). Coverage: $(HtmlEncode $coverageLabel).</p>
 
       <div class="matrix-wrap">
-        <p style="margin-top:12px"><b>Scoring methodology ${ScoringVersion}:</b> The index sums per-rule severity weights (Critical 12, High 8, Medium 5, Low 2) with per-rule count or baseline adjustments. Information and disabled-account password hygiene contribute 0. The headline priority is the higher of the highest scored finding severity and the index threshold. The neutral bands below describe points, not independently measured risk levels.</p>
-        <p><b>Limits:</b> The weights and thresholds are script-defined and have not been empirically calibrated. Points are not a percentage, a probability of compromise, or unique affected accounts; related findings can overlap. Compare runs only with matching scope, coverage, tool and scoring versions, and environment context. Missing evidence can lower points without any improvement. This methodology is not directly comparable with earlier report versions.</p><br>
+        <p style="margin-top:12px"><b>Scoring methodology ${ScoringVersion}:</b> The index sums per-rule severity weights (Critical 12, High 8, Medium 5, Low 2) with per-rule count or baseline adjustments. Information and disabled-account password hygiene contribute 0. The headline priority is the higher of the highest scored finding severity and the score band below.</p>
+        <p><b>Limits:</b> The weights and thresholds are script-defined and have not been empirically calibrated. Points are not a percentage, a probability of compromise, or unique affected accounts; related findings can overlap. Compare runs only with matching scope, coverage, tool and scoring versions, and environment context. Missing evidence can lower points without any improvement. This methodology is not directly comparable with earlier report versions.</p>
+        <p style="margin-top:12px"><b>Score matrix:</b> The total score is mapped to a risk level as follows (current score highlighted).</p><br>
         <table class="matrix">
           <thead>
             <tr>
-              <th>Index band</th>
-              <th>Point range</th>
+              <th>Level</th>
+              <th>Score range</th>
               <th>Interpretation</th>
             </tr>
           </thead>
@@ -4263,7 +4259,7 @@ $js
         $txt += "Generated: $now"
         $txt += "Overall finding priority: $OverallLevel (Finding points=$TotalScore)"
         $txt += "Priority basis: $priorityBasis Coverage: $coverageLabel"
-        $txt += "Index bands (script-defined, not calibrated risk levels): " + (($ScoreBands | ForEach-Object { "$($_.Label)=$($_.Range)" }) -join '; ')
+        $txt += "Score matrix: " + (($ScoreBands | ForEach-Object { "$($_.Level)=$($_.Range)" }) -join '; ')
         if ($UsersCount)  { $txt += "Users: $UsersCount" }
         if ($GroupsCount) { $txt += "Groups: $GroupsCount" }
         if ($OUsCount)    { $txt += "OUs: $OUsCount" }

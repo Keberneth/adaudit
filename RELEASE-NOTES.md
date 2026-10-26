@@ -16,6 +16,10 @@
 - DNS zone aging is queried only where applicable, null timestamps are handled safely, and unknown values are distinguished from disabled settings. Real DNS collection errors now mark the check Partial and appear in coverage instead of leaving a misleading Completed result.
 - Dependency imports remain visible after the module helper returns. Every wrapped operation records measured timing, status and coverage counts in `audit_step_timings.csv`; both main reports show the slowest operations. These measurements enable investigation of the Accounts delay without guessing its cause.
 
+### Report presentation
+
+- Risk-Report.html: the Interpretation score matrix again shows the colored Low/Medium/High/Critical level pills with the 0-49/50-99/100-149/150+ ranges and the earlier level descriptions, replacing the neutral Band 1-4 labels introduced with scoring methodology v2.1. The Priority basis line and the methodology and limits text stay. `report_summary.json` keeps the `IndexBand` key, now holding the matrix level, and the TXT summary prints the `Score matrix:` line again.
+
 ### Scope and deployment
 
 All additions are read-only and remain focused on AD/DC security. No server baseline comparison or general server audit has been imported. The separate server-audit script and customer evidence are unchanged. Deploy the entire package because Domain Audit loads the new `Checks\Invoke-DcShareSecurityCheck.ps1` helper. No new GUI option is needed: the additions run with Domain Audit and `-all`.
